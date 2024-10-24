@@ -2958,6 +2958,7 @@ inspect_ary(VALUE ary, VALUE dummy, int recur)
 /*
  *  call-seq:
  *    inspect -> new_string
+ *    to_s -> new_string
  *
  *  Returns the new string formed by calling method <tt>#inspect</tt>
  *  on each array element:
@@ -2965,7 +2966,7 @@ inspect_ary(VALUE ary, VALUE dummy, int recur)
  *    a = [:foo, 'bar', 2]
  *    a.inspect # => "[:foo, \"bar\", 2]"
  *
- *  Related: see {Methods for Querying}[rdoc-ref:Array@Methods+for+Querying].
+ *  Related: see {Methods for Converting}[rdoc-ref:Array@Methods+for+Converting].
  */
 
 static VALUE
@@ -3011,27 +3012,27 @@ rb_ary_to_a(VALUE ary)
 
 /*
  *  call-seq:
- *    array.to_h -> new_hash
- *    array.to_h {|item| ... } -> new_hash
+ *    to_h -> new_hash
+ *    to_h {|element| ... } -> new_hash
  *
- *  Returns a new Hash formed from +self+.
+ *  Returns a new hash formed from +self+.
  *
- *  When a block is given, calls the block with each array element;
- *  the block must return a 2-element +Array+ whose two elements
- *  form a key-value pair in the returned Hash:
+ *  With no block given, each element of +self+ must be a 2-element sub-array;
+ *  forms each sub-array into a key-value pair in the new hash:
+ *
+ *    a = [['foo', 'zero'], ['bar', 'one'], ['baz', 'two']]
+ *    a.to_h # => {"foo"=>"zero", "bar"=>"one", "baz"=>"two"}
+ *    [].to_h # => {}
+ *
+ *  With a block given, the block must return a 2-element array;
+ *  calls the block with each element of +self+;
+ *  forms each returned array into a key-value pair in the returned hash:
  *
  *    a = ['foo', :bar, 1, [2, 3], {baz: 4}]
- *    h = a.to_h {|item| [item, item] }
- *    h # => {"foo"=>"foo", :bar=>:bar, 1=>1, [2, 3]=>[2, 3], {:baz=>4}=>{:baz=>4}}
+ *    a.to_h {|element| [element, element.class] }
+ *    # => {"foo"=>String, :bar=>Symbol, 1=>Integer, [2, 3]=>Array, {:baz=>4}=>Hash}
  *
- *  When no block is given, +self+ must be an +Array+ of 2-element sub-arrays,
- *  each sub-array is formed into a key-value pair in the new Hash:
- *
- *    [].to_h # => {}
- *    a = [['foo', 'zero'], ['bar', 'one'], ['baz', 'two']]
- *    h = a.to_h
- *    h # => {"foo"=>"zero", "bar"=>"one", "baz"=>"two"}
- *
+ *  Related: see {Methods for Converting}[rdoc-ref:Array@Methods+for+Converting].
  */
 
 static VALUE
@@ -4493,14 +4494,17 @@ rb_ary_zip(int argc, VALUE *argv, VALUE ary)
 
 /*
  *  call-seq:
- *    array.transpose -> new_array
+ *    transpose -> new_array
  *
- *  Transposes the rows and columns in an +Array+ of Arrays;
- *  the nested Arrays must all be the same size:
+ *  Returns a new array that is +self+
+ *  as a {transposed matrix}[https://en.wikipedia.org/wiki/Transpose]:
  *
  *    a = [[:a0, :a1], [:b0, :b1], [:c0, :c1]]
  *    a.transpose # => [[:a0, :b0, :c0], [:a1, :b1, :c1]]
  *
+ *  The elements of +self+ must all be the same size.
+ *
+ *  Related: see {Methods for Converting}[rdoc-ref:Array@Methods+for+Converting].
  */
 
 static VALUE
@@ -5654,18 +5658,25 @@ rb_ary_or(VALUE ary1, VALUE ary2)
 
 /*
  *  call-seq:
- *    array.union(*other_arrays) -> new_array
+ *    union(*other_arrays) -> new_array
  *
- *  Returns a new +Array+ that is the union of +self+ and all given Arrays +other_arrays+;
- *  duplicates are removed;  order is preserved;  items are compared using <tt>eql?</tt>:
+ *  Returns a new array that is the union of the elements of +self+
+ *  and all given arrays +other_arrays+;
+ *  items are compared using <tt>eql?</tt>:
  *
  *    [0, 1, 2, 3].union([4, 5], [6, 7]) # => [0, 1, 2, 3, 4, 5, 6, 7]
+ *
+ *  Removes duplicates (preserving the first found):
+ *
  *    [0, 1, 1].union([2, 1], [3, 1]) # => [0, 1, 2, 3]
- *    [0, 1, 2, 3].union([3, 2], [1, 0]) # => [0, 1, 2, 3]
  *
- *  Returns a copy of +self+ if no arguments given.
+ *  Preserves order (preserving the position of the first found):
  *
- *  Related: Array#|.
+ *    [3, 2, 1, 0].union([5, 3], [4, 2]) # => [3, 2, 1, 0, 5, 4]
+ *
+ *  With no arguments given, returns a copy of +self+.
+ *
+ *  Related: see {Methods for Combining}[rdoc-ref:Array@Methods+for+Combining].
  */
 
 static VALUE
