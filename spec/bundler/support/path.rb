@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "pathname"
+require "pathname" unless defined?(Pathname)
 require "rbconfig"
 
 require_relative "env"
@@ -25,12 +25,8 @@ module Spec
       @relative_gemspec ||= ruby_core? ? "lib/bundler/bundler.gemspec" : "bundler.gemspec"
     end
 
-    def gemspec_dir
-      @gemspec_dir ||= gemspec.parent
-    end
-
     def loaded_gemspec
-      @loaded_gemspec ||= Gem::Specification.load(gemspec.to_s)
+      @loaded_gemspec ||= Dir.chdir(source_root) { Gem::Specification.load(gemspec.to_s) }
     end
 
     def test_gemfile
@@ -49,8 +45,16 @@ module Spec
       @dev_gemfile ||= tool_dir.join("dev_gems.rb")
     end
 
+    def dev_binstub
+      @dev_binstub ||= bindir.join("bundle")
+    end
+
     def bindir
-      @bindir ||= source_root.join(ruby_core? ? "libexec" : "exe")
+      @bindir ||= source_root.join(ruby_core? ? "spec/bin" : "bin")
+    end
+
+    def exedir
+      @exedir ||= source_root.join(ruby_core? ? "libexec" : "exe")
     end
 
     def installed_bindir
@@ -67,7 +71,7 @@ module Spec
 
     def path
       env_path = ENV["PATH"]
-      env_path = env_path.split(File::PATH_SEPARATOR).reject {|path| path == bindir.to_s }.join(File::PATH_SEPARATOR) if ruby_core?
+      env_path = env_path.split(File::PATH_SEPARATOR).reject {|path| path == exedir.to_s }.join(File::PATH_SEPARATOR) if ruby_core?
       env_path
     end
 
@@ -75,8 +79,16 @@ module Spec
       @spec_dir ||= source_root.join(ruby_core? ? "spec/bundler" : "spec")
     end
 
+    def rubygems_test_dir
+      @rubygems_test_dir ||= source_root.join("test/rubygems")
+    end
+
     def man_dir
       @man_dir ||= lib_dir.join("bundler/man")
+    end
+
+    def hax
+      @hax ||= spec_dir.join("support/hax.rb")
     end
 
     def tracked_files
@@ -102,18 +114,38 @@ module Spec
     end
 
     def tmp(*path)
-      tmp_root(scope).join(*path)
+      tmp_root.join("#{test_env_version}.#{scope}").join(*path)
     end
 
-    def tmp_root(scope)
-      source_root.join("tmp", "#{test_env_version}.#{scope}")
+    def tmp_root
+      if ruby_core? && (tmpdir = ENV["TMPDIR"])
+        # Use realpath to resolve any symlinks in TMPDIR (e.g., on macOS /var -> /private/var)
+        real = begin
+          File.realpath(tmpdir)
+        rescue Errno::ENOENT, Errno::EACCES
+          tmpdir
+        end
+        Pathname(real)
+      else
+        source_root.join("tmp")
+      end
+    end
+
+    # On Windows there is no relative path between different drives, and much of
+    # the spec setup (temp home, bundled app, caches) lives under the temp dir.
+    # When the temp dir is on a different drive than the source tree, examples
+    # that compare or look up paths across the two cannot be set up correctly.
+    def tmp_and_source_on_different_drives?
+      return false unless Gem.win_platform?
+      drive = ->(path) { path.to_s[/\A[a-zA-Z]:/]&.upcase }
+      drive[tmp_root] != drive[source_root]
     end
 
     # Bump this version whenever you make a breaking change to the spec setup
     # that requires regenerating tmp/.
 
     def test_env_version
-      1
+      2
     end
 
     def scope
@@ -128,19 +160,15 @@ module Spec
     end
 
     def default_bundle_path(*path)
-      if Bundler.feature_flag.default_install_uses_path?
-        local_gem_path(*path)
-      else
-        system_gem_path(*path)
-      end
+      system_gem_path(*path)
     end
 
     def default_cache_path(*path)
-      if Bundler.feature_flag.global_gem_cache?
-        home(".bundle/cache", *path)
-      else
-        default_bundle_path("cache/bundler", *path)
-      end
+      default_bundle_path("cache/bundler", *path)
+    end
+
+    def compact_index_cache_path
+      home(".bundle/cache/compact_index")
     end
 
     def bundled_app(*path)
@@ -171,20 +199,20 @@ module Spec
       bundled_app("Gemfile.lock")
     end
 
+    def scoped_base_system_gem_path
+      scoped_gem_path(base_system_gem_path)
+    end
+
     def base_system_gem_path
-      scoped_gem_path(base_system_gems)
+      tmp_root.join("gems/base")
     end
 
-    def base_system_gems
-      tmp("gems/base")
+    def rubocop_gem_path
+      tmp_root.join("gems/rubocop")
     end
 
-    def rubocop_gems
-      tmp("gems/rubocop")
-    end
-
-    def standard_gems
-      tmp("gems/standard")
+    def standard_gem_path
+      tmp_root.join("gems/standard")
     end
 
     def file_uri_for(path)
@@ -195,35 +223,35 @@ module Spec
     end
 
     def gem_repo1(*args)
-      tmp("gems/remote1", *args)
+      gem_path("remote1", *args)
     end
 
     def gem_repo_missing(*args)
-      tmp("gems/missing", *args)
+      gem_path("missing", *args)
     end
 
     def gem_repo2(*args)
-      tmp("gems/remote2", *args)
+      gem_path("remote2", *args)
     end
 
     def gem_repo3(*args)
-      tmp("gems/remote3", *args)
+      gem_path("remote3", *args)
     end
 
     def gem_repo4(*args)
-      tmp("gems/remote4", *args)
+      gem_path("remote4", *args)
     end
 
     def security_repo(*args)
-      tmp("gems/security_repo", *args)
+      gem_path("security_repo", *args)
     end
 
     def system_gem_path(*path)
-      tmp("gems/system", *path)
+      gem_path("system", *path)
     end
 
     def pristine_system_gem_path
-      tmp("gems/base_system")
+      tmp_root.join("gems/pristine_system")
     end
 
     def local_gem_path(*path, base: bundled_app)
@@ -232,6 +260,10 @@ module Spec
 
     def scoped_gem_path(base)
       base.join(Gem.ruby_engine, RbConfig::CONFIG["ruby_version"])
+    end
+
+    def gem_path(*args)
+      tmp("gems", *args)
     end
 
     def lib_path(*args)
@@ -261,7 +293,7 @@ module Spec
     def replace_version_file(version, dir: source_root)
       version_file = File.expand_path("lib/bundler/version.rb", dir)
       contents = File.read(version_file)
-      contents.sub!(/(^\s+VERSION\s*=\s*)"#{Gem::Version::VERSION_PATTERN}"/, %(\\1"#{version}"))
+      contents.sub!(/(^\s+VERSION\s*=\s*).*$/, %(\\1"#{version}"))
       File.open(version_file, "w") {|f| f << contents }
     end
 
@@ -273,14 +305,45 @@ module Spec
     end
 
     def git_root
-      ruby_core? ? source_root : source_root.parent
+      source_root
     end
 
     def rake_path
-      Dir["#{base_system_gems}/#{Bundler.ruby_scope}/**/rake*.gem"].first
+      find_base_path("rake")
+    end
+
+    def rake_version
+      File.basename(rake_path).delete_prefix("rake-").delete_suffix(".gem")
+    end
+
+    def sinatra_dependency_paths
+      deps = %w[
+        mustermann
+        rack
+        rack-protection
+        rack-session
+        tilt
+        sinatra
+        base64
+        logger
+        compact_index
+      ]
+      path = if deps.all? {|dep| !Dir[scoped_base_system_gem_path.join("gems/#{dep}-*")].empty? }
+        scoped_base_system_gem_path
+      elsif ruby_core? && deps.all? {|dep| !Dir[source_root.join(".bundle/gems/#{dep}-*")].empty? }
+        source_root.join(".bundle")
+      else
+        scoped_base_system_gem_path
+      end
+
+      Dir[path.join("gems/{#{deps.join(",")}}-*/lib")].map(&:to_s)
     end
 
     private
+
+    def find_base_path(name)
+      Dir["#{scoped_base_system_gem_path}/**/#{name}-*.gem"].first
+    end
 
     def git_ls_files(glob)
       skip "Not running on a git context, since running tests from a tarball" if ruby_core_tarball?
@@ -289,19 +352,21 @@ module Spec
     end
 
     def tracked_files_glob
-      ruby_core? ? "libexec/bundle* lib/bundler lib/bundler.rb spec/bundler man/bundle*" : "lib exe spec CHANGELOG.md LICENSE.md README.md bundler.gemspec"
+      ruby_core? ? "libexec/bundle* lib/bundler lib/bundler.rb lib/rubygems/vendor/uri lib/rubygems/vendor/securerandom lib/rubygems/vendor/pub_grub lib/rubygems/yaml_serializer.rb lib/rubygems/cooldown_settings.rb lib/rubygems/compact_index_client* lib/rubygems/credential_store* spec/bundler man/bundle*" : "exe/bundle exe/bundler lib/bundler lib/bundler.rb lib/rubygems/vendor/uri lib/rubygems/vendor/securerandom lib/rubygems/vendor/pub_grub lib/rubygems/yaml_serializer.rb lib/rubygems/cooldown_settings.rb lib/rubygems/compact_index_client* lib/rubygems/credential_store* bundler.gemspec MIT.txt"
     end
 
     def lib_tracked_files_glob
-      ruby_core? ? "lib/bundler lib/bundler.rb" : "lib"
+      "lib/bundler lib/bundler.rb"
     end
 
     def man_tracked_files_glob
-      ruby_core? ? "man/bundle* man/gemfile*" : "lib/bundler/man/bundle*.1 lib/bundler/man/gemfile*.5"
+      "lib/bundler/man/bundle*.1.ronn lib/bundler/man/gemfile*.5.ronn"
     end
 
     def ruby_core_tarball?
-      !git_root.join(".git").directory?
+      # A tarball checkout has no `.git` entry at all. Note that `.git` may be
+      # a file rather than a directory in linked git worktrees.
+      !git_root.join(".git").exist?
     end
 
     def rubocop_gemfile_basename
@@ -313,7 +378,7 @@ module Spec
     end
 
     def tool_dir
-      ruby_core? ? source_root.join("tool/bundler") : source_root.join("../tool/bundler")
+      source_root.join("tool/bundler")
     end
 
     def templates_dir

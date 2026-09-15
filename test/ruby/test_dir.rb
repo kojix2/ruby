@@ -590,6 +590,22 @@ class TestDir < Test::Unit::TestCase
       assert_empty(entries - Dir.glob("#{wild}/Common*", File::FNM_SHORTNAME), bug10819)
     end
 
+    def test_glob_long_path
+      bug18923 = '[Bug #18923]'
+      # the whole path is longer than MAX_PATH, while each component is
+      # within the 255 chars limit of NTFS
+      deep = File.join(@root, "a" * 200, "b" * 200)
+      begin
+        FileUtils.mkdir_p(deep)
+      rescue SystemCallError
+        omit "long path names are not available"
+      end
+      file = File.join(deep, "c.txt")
+      File.write(file, "")
+      assert_equal([file], Dir.glob(File.join(@root, "**", "*.txt")), bug18923)
+      assert_equal(["c.txt"], Dir.children(deep), bug18923)
+    end
+
     def test_home_windows
       setup_envs(%w[HOME USERPROFILE HOMEDRIVE HOMEPATH])
 
@@ -640,6 +656,21 @@ class TestDir < Test::Unit::TestCase
       begin;
         assert_equal("C:/ruby/homepath", Dir.home)
       end;
+    end
+
+    def test_children_long_name
+      Dir.mktmpdir do |dirname|
+        longest_possible_component = "b" * 255
+        long_path = File.join(dirname, longest_possible_component)
+        Dir.mkdir(long_path)
+        File.write("#{long_path}/c", "")
+        assert_equal(%w[c], Dir.children(long_path))
+      ensure
+        File.unlink("#{long_path}/c")
+        Dir.rmdir(long_path)
+      end
+    rescue Errno::ENOENT
+      omit "File system does not support long file name"
     end
   end
 

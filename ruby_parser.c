@@ -138,12 +138,6 @@ utf8_encoding(void)
     return rb_utf8_encoding();
 }
 
-static VALUE
-enc_associate(VALUE obj, parser_encoding *enc)
-{
-    return rb_enc_associate(obj, enc);
-}
-
 static parser_encoding *
 ascii8bit_encoding(void)
 {
@@ -180,12 +174,6 @@ intern3(const char *name, long len, parser_encoding *enc)
     return rb_intern3(name, len, enc);
 }
 
-static parser_encoding *
-usascii_encoding(void)
-{
-    return rb_usascii_encoding();
-}
-
 static int
 enc_symname_type(const char *name, long len, parser_encoding *enc, unsigned int allowed_attrset)
 {
@@ -197,6 +185,7 @@ typedef struct {
     rb_encoding *enc;
     NODE *succ_block;
     const rb_code_location_t *loc;
+    rb_parser_assignable_func assignable;
 } reg_named_capture_assign_t;
 
 static int
@@ -210,11 +199,12 @@ reg_named_capture_assign_iter(const OnigUChar *name, const OnigUChar *name_end,
     long len = name_end - name;
     const char *s = (const char *)name;
 
-    return rb_reg_named_capture_assign_iter_impl(p, s, len, enc, &arg->succ_block, loc);
+    return rb_reg_named_capture_assign_iter_impl(p, s, len, enc, &arg->succ_block, loc, arg->assignable);
 }
 
 static NODE *
-reg_named_capture_assign(struct parser_params* p, VALUE regexp, const rb_code_location_t *loc)
+reg_named_capture_assign(struct parser_params* p, VALUE regexp, const rb_code_location_t *loc,
+                         rb_parser_assignable_func assignable)
 {
     reg_named_capture_assign_t arg;
 
@@ -222,6 +212,7 @@ reg_named_capture_assign(struct parser_params* p, VALUE regexp, const rb_code_lo
     arg.enc = rb_enc_get(regexp);
     arg.succ_block = 0;
     arg.loc = loc;
+    arg.assignable = assignable;
     onig_foreach_name(RREGEXP_PTR(regexp), reg_named_capture_assign_iter, &arg);
 
     if (!arg.succ_block) return 0;
@@ -341,7 +332,6 @@ static const rb_parser_config_t rb_global_parser_config = {
 
     .attr_get = rb_attr_get,
 
-    .ary_push = rb_ary_push,
     .ary_new_from_args = rb_ary_new_from_args,
     .ary_unshift = rb_ary_unshift,
 
@@ -360,7 +350,6 @@ static const rb_parser_config_t rb_global_parser_config = {
     .id2name = rb_id2name,
     .id2str = rb_id2str,
     .id2sym = rb_id2sym,
-    .sym2id = rb_sym2id,
 
     .str_catf = rb_str_catf,
     .str_cat_cstr = rb_str_cat_cstr,
@@ -373,7 +362,6 @@ static const rb_parser_config_t rb_global_parser_config = {
     .rb_sprintf = rb_sprintf,
     .rstring_ptr = RSTRING_PTR,
     .rstring_len = RSTRING_LEN,
-    .obj_as_string = rb_obj_as_string,
 
     .int2num = rb_int2num_inline,
 
@@ -396,7 +384,6 @@ static const rb_parser_config_t rb_global_parser_config = {
     .enc_get = enc_get,
     .enc_asciicompat = enc_asciicompat,
     .utf8_encoding = utf8_encoding,
-    .enc_associate = enc_associate,
     .ascii8bit_encoding = ascii8bit_encoding,
     .enc_codelen = enc_codelen,
     .enc_mbcput = enc_mbcput,
@@ -405,7 +392,6 @@ static const rb_parser_config_t rb_global_parser_config = {
     .enc_isspace = enc_isspace,
     .enc_coderange_7bit = ENC_CODERANGE_7BIT,
     .enc_coderange_unknown = ENC_CODERANGE_UNKNOWN,
-    .usascii_encoding = usascii_encoding,
     .enc_mbminlen = enc_mbminlen,
     .enc_isascii = enc_isascii,
     .enc_mbc_to_codepoint = enc_mbc_to_codepoint,
@@ -419,10 +405,9 @@ static const rb_parser_config_t rb_global_parser_config = {
 
     .errinfo = rb_errinfo,
     .set_errinfo = rb_set_errinfo,
-    .exc_raise = rb_exc_raise,
     .make_exception = rb_make_exception,
 
-    .sized_xfree = ruby_sized_xfree,
+    .sized_xfree = ruby_xfree_sized,
     .sized_realloc_n = ruby_sized_realloc_n,
     .gc_guard = gc_guard,
     .gc_mark = rb_gc_mark,
@@ -455,6 +440,11 @@ static const rb_parser_config_t rb_global_parser_config = {
     /* For Ripper */
     .static_id2sym = static_id2sym,
     .str_coderange_scan_restartable = str_coderange_scan_restartable,
+
+    /* Source hash */
+    .source_hash_init = rb_source_hash_init,
+    .source_hash_update = rb_source_hash_update,
+    .source_hash_finalize = rb_source_hash_finalize,
 };
 #endif
 
@@ -523,7 +513,7 @@ static const rb_data_type_t ruby_parser_data_type = {
         parser_free,
         parser_memsize,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE
 };
 
 #ifdef UNIVERSAL_PARSER
@@ -751,7 +741,7 @@ static const rb_data_type_t ast_data_type = {
         ast_free,
         NULL, // No dsize() because this object does not appear in ObjectSpace.
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE
 };
 
 static VALUE
@@ -1104,6 +1094,33 @@ parser_aset_script_lines_for(VALUE path, rb_parser_ary_t *lines)
     if (rb_hash_lookup(hash, path) == Qnil) return;
     script_lines = rb_parser_build_script_lines_from(lines);
     rb_hash_aset(hash, path, script_lines);
+}
+
+/* The source hash API currently computes FNV-1a, but the algorithm is an
+ * implementation detail. The hash values are only ever compared against
+ * hashes computed by the same interpreter, so the algorithm can be changed
+ * freely between releases. */
+void
+rb_source_hash_init(rb_source_hash_state_t *state)
+{
+    state->hash = 0xcbf29ce484222325; /* FNV-1a offset basis */
+}
+
+void
+rb_source_hash_update(rb_source_hash_state_t *state, const uint8_t *ptr, size_t len)
+{
+    uint64_t hash = state->hash;
+    for (size_t i = 0; i < len; i++) {
+        hash = (hash ^ ptr[i]) * 0x100000001b3; /* FNV-1a prime */
+    }
+    state->hash = hash;
+}
+
+uint64_t
+rb_source_hash_finalize(const rb_source_hash_state_t *state)
+{
+    /* A hash of 0 means no source hash, so remap it to another value. */
+    return state->hash == 0 ? 1 : state->hash;
 }
 
 VALUE

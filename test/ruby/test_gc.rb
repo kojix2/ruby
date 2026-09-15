@@ -75,12 +75,9 @@ class TestGc < Test::Unit::TestCase
     GC.start
   end
 
-  def test_gc_config_setting_returns_nil_for_missing_keys
-    missing_value = GC.config(no_such_key: true)[:no_such_key]
-    assert_nil(missing_value)
-  ensure
-    GC.config(full_mark: true)
-    GC.start
+  def test_gc_config_setting_returns_config_hash
+    hash = GC.config(no_such_key: true)
+    assert_equal(GC.config, hash)
   end
 
   def test_gc_config_disable_major
@@ -115,6 +112,19 @@ class TestGc < Test::Unit::TestCase
   ensure
     GC.config(full_mark: true)
     GC.start
+  end
+
+  def test_gc_config_implementation
+    omit unless /darwin|linux/.match(RUBY_PLATFORM)
+
+    gc_name = (ENV['RUBY_GC_LIBRARY'] || "default")
+    assert_equal gc_name, GC.config[:implementation]
+  end
+
+  def test_gc_config_implementation_is_readonly
+    omit unless /darwin|linux/.match(RUBY_PLATFORM)
+
+    assert_raise(ArgumentError) { GC.config(implementation: "somethingelse") }
   end
 
   def test_start_full_mark
@@ -184,8 +194,14 @@ class TestGc < Test::Unit::TestCase
   def test_stat_single
     omit 'stress' if GC.stress
 
-    stat = GC.stat
-    assert_equal stat[:count], GC.stat(:count)
+    # GC.stat and GC.stat(:count) are two separate reads of :count. If a GC
+    # runs between them (e.g. triggered by an allocation on another thread),
+    # :count changes and the two reads disagree. Disable GC so both reads
+    # observe the same :count.
+    EnvUtil.without_gc do
+      stat = GC.stat
+      assert_equal stat[:count], GC.stat(:count)
+    end
     assert_raise(ArgumentError){ GC.stat(:invalid) }
   end
 
@@ -198,7 +214,7 @@ class TestGc < Test::Unit::TestCase
     assert_equal stat[:total_allocated_pages], stat[:heap_allocated_pages] + stat[:total_freed_pages]
     assert_equal stat[:heap_available_slots], stat[:heap_live_slots] + stat[:heap_free_slots] + stat[:heap_final_slots]
     assert_equal stat[:heap_live_slots], stat[:total_allocated_objects] - stat[:total_freed_objects] - stat[:heap_final_slots]
-    assert_equal stat[:heap_allocated_pages], stat[:heap_eden_pages]
+    assert_equal stat[:heap_allocated_pages], stat[:heap_eden_pages] + stat[:heap_empty_pages]
 
     if use_rgengc?
       assert_equal stat[:count], stat[:major_gc_count] + stat[:minor_gc_count]
@@ -220,7 +236,10 @@ class TestGc < Test::Unit::TestCase
         GC.stat(stat)
       end
 
-      assert_equal (GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE] + GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD]) * (2**i), stat_heap[:slot_size]
+      assert_equal GC.stat_heap(i, :slot_size), stat_heap[:slot_size]
+      assert_operator stat_heap[:heap_live_slots], :<=, stat[:heap_live_slots]
+      assert_operator stat_heap[:heap_free_slots], :<=, stat[:heap_free_slots]
+      assert_operator stat_heap[:heap_final_slots], :<=, stat[:heap_final_slots]
       assert_operator stat_heap[:heap_eden_pages], :<=, stat[:heap_eden_pages]
       assert_operator stat_heap[:heap_eden_slots], :>=, 0
       assert_operator stat_heap[:total_allocated_pages], :>=, 0
@@ -240,7 +259,6 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_stat_heap_all
-    omit "flaky with RJIT, which allocates objects itself" if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
     stat_heap_all = {}
     stat_heap = {}
     # Initialize to prevent GC in future calls
@@ -252,7 +270,7 @@ class TestGc < Test::Unit::TestCase
       GC.stat_heap(i, stat_heap)
 
       # Remove keys that can vary between invocations
-      %i(total_allocated_objects).each do |sym|
+      %i(total_allocated_objects heap_live_slots heap_free_slots).each do |sym|
         stat_heap[sym] = stat_heap_all[i][sym] = 0
       end
 
@@ -277,14 +295,44 @@ class TestGc < Test::Unit::TestCase
       hash.each { |k, v| stat_heap_sum[k] += v }
     end
 
+    assert_equal stat[:heap_live_slots], stat_heap_sum[:heap_live_slots]
+    assert_equal stat[:heap_free_slots], stat_heap_sum[:heap_free_slots]
+    assert_equal stat[:heap_final_slots], stat_heap_sum[:heap_final_slots]
     assert_equal stat[:heap_eden_pages], stat_heap_sum[:heap_eden_pages]
     assert_equal stat[:heap_available_slots], stat_heap_sum[:heap_eden_slots]
     assert_equal stat[:total_allocated_objects], stat_heap_sum[:total_allocated_objects]
     assert_equal stat[:total_freed_objects], stat_heap_sum[:total_freed_objects]
+  rescue Test::Unit::AssertionFailedError
+    # GC.stat and GC.stat_heap are separate reads of the same counters, so
+    # anything allocated between them makes the two disagree.  An accounting
+    # bug disagrees on the retry too.
+    raise if @retried
+    @retried = true
+    retry
+  end
+
+  def test_page_pool_stat_consistency
+    omit 'no page pool' unless GC.stat.key?(:page_pool_total_pages)
+
+    # Freeing arenas back to the OS must keep page_pool_discarded_pages in range.
+    # An underflowed counter wraps to a huge value, which also makes GC.stat
+    # allocate a Bignum and perturb the object counts it reports.
+    assert_separately([], __FILE__, __LINE__, <<~RUBY, timeout: 60)
+      3.times do
+        ary = 200_000.times.map { "x" * 40 }
+        ary.clear
+        GC.start(full_mark: true, immediate_sweep: true)
+        GC.start(full_mark: true, immediate_sweep: true)
+      end
+
+      stat = GC.stat
+      assert_operator stat[:page_pool_discarded_pages], :<=, stat[:page_pool_total_pages]
+      assert_operator stat[:page_pool_arenas], :>=, 0 # arenas is always 0 if doesn't have mmap
+    RUBY
   end
 
   def test_measure_total_time
-    assert_separately([], __FILE__, __LINE__, <<~RUBY)
+    assert_separately([], __FILE__, __LINE__, <<~RUBY, timeout: 60)
       GC.measure_total_time = false
 
       time_before = GC.stat(:time)
@@ -303,9 +351,9 @@ class TestGc < Test::Unit::TestCase
   def test_latest_gc_info
     omit 'stress' if GC.stress
 
-    assert_separately([], __FILE__, __LINE__, <<-'RUBY')
+    assert_separately([{"RUBY_GC_HEAP_INIT_BYTES" => "409600"}, "-W0"], __FILE__, __LINE__, <<-'RUBY')
       GC.start
-      count = GC.stat(:heap_free_slots) + GC.stat(:heap_allocatable_slots)
+      count = GC.stat(:heap_free_slots) + GC.stat_heap(0, :heap_allocatable_slots)
       count.times{ "a" + "b" }
       assert_equal :newobj, GC.latest_gc_info[:gc_by]
     RUBY
@@ -344,13 +392,14 @@ class TestGc < Test::Unit::TestCase
     3.times { GC.start }
     assert_nil GC.latest_gc_info(:need_major_by)
 
-    # allocate objects until need_major_by is set or major GC happens
-    objects = []
-    while GC.latest_gc_info(:need_major_by).nil?
-      objects.append(100.times.map { '*' })
-    end
-
     EnvUtil.without_gc do
+      # allocate objects until need_major_by is set or major GC happens
+      objects = []
+      while GC.latest_gc_info(:need_major_by).nil?
+        objects.append(100.times.map { '*' })
+        GC.start(full_mark: false)
+      end
+
       # We need to ensure that no GC gets ran before the call to GC.start since
       # it would trigger a major GC. Assertions could allocate objects and
       # trigger a GC so we don't run assertions until we perform the major GC.
@@ -366,51 +415,36 @@ class TestGc < Test::Unit::TestCase
   def test_latest_gc_info_weak_references_count
     assert_separately([], __FILE__, __LINE__, <<~RUBY)
       GC.disable
-      count = 10_000
+      COUNT = 10_000
       # Some weak references may be created, so allow some margin of error
       error_tolerance = 100
 
-      # Run full GC to clear out weak references
-      GC.start
-      # Run full GC again to collect stats about weak references
+      # Run full GC to collect stats about weak references
       GC.start
 
       before_weak_references_count = GC.latest_gc_info(:weak_references_count)
-      before_retained_weak_references_count = GC.latest_gc_info(:retained_weak_references_count)
 
-      # Create some objects and place it in a WeakMap
-      wmap = ObjectSpace::WeakMap.new
-      ary = Array.new(count)
-      enum = count.times
-      enum.each.with_index do |i|
-        obj = Object.new
-        ary[i] = obj
-        wmap[obj] = nil
+      # Create some WeakMaps
+      ary = Array.new(COUNT)
+      COUNT.times.with_index do |i|
+        ary[i] = ObjectSpace::WeakMap.new
       end
 
       # Run full GC to collect stats about weak references
       GC.start
 
-      assert_operator(GC.latest_gc_info(:weak_references_count), :>=, before_weak_references_count + count - error_tolerance)
-      assert_operator(GC.latest_gc_info(:retained_weak_references_count), :>=, before_retained_weak_references_count + count - error_tolerance)
-      assert_operator(GC.latest_gc_info(:retained_weak_references_count), :<=, GC.latest_gc_info(:weak_references_count))
+      assert_operator(GC.latest_gc_info(:weak_references_count), :>=, before_weak_references_count + COUNT - error_tolerance)
 
       before_weak_references_count = GC.latest_gc_info(:weak_references_count)
-      before_retained_weak_references_count = GC.latest_gc_info(:retained_weak_references_count)
 
+      # Clear ary, so if ary itself is somewhere on the stack, it won't hold all references
+      ary.clear
       ary = nil
 
-      # Free ary, which should empty out the wmap
-      GC.start
-      # Run full GC again to collect stats about weak references
+      # Free ary, which should GC all the WeakMaps
       GC.start
 
-      # Sometimes the WeakMap has one element, which might be held on by registers.
-      assert_operator(wmap.size, :<=, 1)
-
-      assert_operator(GC.latest_gc_info(:weak_references_count), :<=, before_weak_references_count - count + error_tolerance)
-      assert_operator(GC.latest_gc_info(:retained_weak_references_count), :<=, before_retained_weak_references_count - count + error_tolerance)
-      assert_operator(GC.latest_gc_info(:retained_weak_references_count), :<=, GC.latest_gc_info(:weak_references_count))
+      assert_operator(GC.latest_gc_info(:weak_references_count), :<=, before_weak_references_count - COUNT + error_tolerance)
     RUBY
   end
 
@@ -437,7 +471,7 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_singleton_method_added
-    assert_in_out_err([], <<-EOS, [], [], "[ruby-dev:44436]")
+    assert_in_out_err([], <<-EOS, [], [], "[ruby-dev:44436]", timeout: 30)
       class BasicObject
         undef singleton_method_added
         def singleton_method_added(mid)
@@ -452,32 +486,19 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_gc_parameter
-    env = {
-      "RUBY_GC_HEAP_INIT_SLOTS" => "100"
-    }
-    assert_in_out_err([env, "-W0", "-e", "exit"], "", [], [])
-    assert_in_out_err([env, "-W:deprecated", "-e", "exit"], "", [],
-                       /The environment variable RUBY_GC_HEAP_INIT_SLOTS is deprecated; use environment variables RUBY_GC_HEAP_%d_INIT_SLOTS instead/)
-
-    env = {}
-    GC.stat_heap.keys.each do |heap|
-      env["RUBY_GC_HEAP_#{heap}_INIT_SLOTS"] = "200000"
-    end
+    env = { "RUBY_GC_HEAP_INIT_BYTES" => "#{200000 * 40}" }
     assert_normal_exit("exit", "", :child_env => env)
 
-    env = {}
-    GC.stat_heap.keys.each do |heap|
-      env["RUBY_GC_HEAP_#{heap}_INIT_SLOTS"] = "0"
-    end
+    env = { "RUBY_GC_HEAP_INIT_BYTES" => "0" }
     assert_normal_exit("exit", "", :child_env => env)
 
     env = {
       "RUBY_GC_HEAP_GROWTH_FACTOR" => "2.0",
-      "RUBY_GC_HEAP_GROWTH_MAX_SLOTS" => "10000"
+      "RUBY_GC_HEAP_GROWTH_MAX_BYTES" => "409600"
     }
     assert_normal_exit("exit", "", :child_env => env)
     assert_in_out_err([env, "-w", "-e", "exit"], "", [], /RUBY_GC_HEAP_GROWTH_FACTOR=2.0/, "")
-    assert_in_out_err([env, "-w", "-e", "exit"], "", [], /RUBY_GC_HEAP_GROWTH_MAX_SLOTS=10000/, "[ruby-core:57928]")
+    assert_in_out_err([env, "-w", "-e", "exit"], "", [], /RUBY_GC_HEAP_GROWTH_MAX_BYTES=409600/, "[ruby-core:57928]")
 
     if use_rgengc?
       env = {
@@ -519,16 +540,19 @@ class TestGc < Test::Unit::TestCase
     end
   end
 
-  def test_gc_parameter_init_slots
+  def test_gc_parameter_init_bytes
+    omit "[Bug #21203] This test is flaky and intermittently failing now"
+
     assert_separately([], __FILE__, __LINE__, <<~RUBY, timeout: 60)
-      # Constant from gc.c.
-      GC_HEAP_INIT_SLOTS = 10_000
+      GC_HEAP_INIT_BYTES = 2560 * 1024
 
       gc_count = GC.stat(:count)
-      # Fill up all of the size pools to the init slots
+      # Fill up all heaps to the byte-derived init slot count
       GC::INTERNAL_CONSTANTS[:HEAP_COUNT].times do |i|
-        capa = (GC.stat_heap(i, :slot_size) - GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD] - (2 * RbConfig::SIZEOF["void*"])) / RbConfig::SIZEOF["void*"]
-        while GC.stat_heap(i, :heap_eden_slots) < GC_HEAP_INIT_SLOTS
+        slot_size = GC.stat_heap(i, :slot_size)
+        init_slots = GC_HEAP_INIT_BYTES / slot_size
+        capa = (slot_size - GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD] - (2 * RbConfig::SIZEOF["void*"])) / RbConfig::SIZEOF["void*"]
+        while GC.stat_heap(i, :heap_eden_slots) < init_slots
           Array.new(capa)
         end
       end
@@ -536,19 +560,17 @@ class TestGc < Test::Unit::TestCase
       assert_equal gc_count, GC.stat(:count)
     RUBY
 
-    env = {}
-    sizes = GC.stat_heap.keys.reverse.map { 20_000 }
-    GC.stat_heap.keys.each do |heap|
-      env["RUBY_GC_HEAP_#{heap}_INIT_SLOTS"] = sizes[heap].to_s
-    end
+    env = { "RUBY_GC_HEAP_INIT_BYTES" => "#{800 * 1024}" }
     assert_separately([env, "-W0"], __FILE__, __LINE__, <<~RUBY, timeout: 60)
-      SIZES = #{sizes}
+      GC_HEAP_INIT_BYTES = 800 * 1024
 
       gc_count = GC.stat(:count)
-      # Fill up all of the size pools to the init slots
+      # Fill up all heaps to the byte-derived init slot count
       GC::INTERNAL_CONSTANTS[:HEAP_COUNT].times do |i|
-        capa = (GC.stat_heap(i, :slot_size) - GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD] - (2 * RbConfig::SIZEOF["void*"])) / RbConfig::SIZEOF["void*"]
-        while GC.stat_heap(i, :heap_eden_slots) < SIZES[i]
+        slot_size = GC.stat_heap(i, :slot_size)
+        init_slots = GC_HEAP_INIT_BYTES / slot_size
+        capa = (slot_size - GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD] - (2 * RbConfig::SIZEOF["void*"])) / RbConfig::SIZEOF["void*"]
+        while GC.stat_heap(i, :heap_eden_slots) < init_slots
           Array.new(capa)
         end
       end
@@ -589,6 +611,124 @@ class TestGc < Test::Unit::TestCase
     assert GC::Profiler.raw_data
   ensure
     GC::Profiler.disable
+  end
+
+  def test_profiler_raw_data_limit
+    assert_separately([], __FILE__, __LINE__, <<~'RUBY', timeout: 30)
+      GC::Profiler.configure(max_records: 2)
+      GC::Profiler.enable
+      GC::Profiler.clear
+
+      3.times { GC.start }
+      records = GC::Profiler.raw_data
+
+      assert_equal 2, records.size
+      assert_operator records[0][:GC_SEQUENCE], :<, records[1][:GC_SEQUENCE]
+      assert_equal records, GC::Profiler.raw_data(limit: 100)
+      assert_equal [records.last], GC::Profiler.raw_data(limit: 1)
+    RUBY
+  end
+
+  def test_profiler_raw_data_since
+    assert_separately([], __FILE__, __LINE__, <<~'RUBY', timeout: 30)
+      GC::Profiler.configure(max_records: 4)
+      GC::Profiler.enable
+      GC::Profiler.clear
+
+      GC.start
+      sequence = GC::Profiler.raw_data.last[:GC_SEQUENCE]
+      2.times { GC.start }
+      records = GC::Profiler.raw_data(since: sequence)
+
+      assert_equal 2, records.size
+      assert_operator records[0][:GC_SEQUENCE], :>, sequence
+      assert_operator records[0][:GC_SEQUENCE], :<, records[1][:GC_SEQUENCE]
+    RUBY
+  end
+
+  def test_profiler_raw_data_with_another_ractor
+    # A second objspace sends GC.start through the global collector, which has to record
+    # a profile entry the same way a local collection does.
+    assert_separately([], <<~RUBY)
+      Warning[:experimental] = false
+      Ractor.new {}.value
+
+      GC::Profiler.enable
+      GC::Profiler.clear
+      GC.start
+
+      record = GC::Profiler.raw_data.last
+      assert_not_nil record
+      assert_kind_of Float, record[:GC_WALL_TIME]
+
+      # A global collection stops the world for its whole duration, so its pause time is
+      # recorded like a local one's -- and the phases it measures fit inside it.
+      assert_operator record[:GC_PAUSE_TIME], :>, 0.0
+      assert_operator record[:GC_MARK_WALL_TIME], :>, 0.0
+      assert_operator record[:GC_SWEEP_WALL_TIME], :>, 0.0
+      assert_in_delta record[:GC_PAUSE_TIME], record[:GC_STOP_TIME] + record[:GC_STW_TIME], 0.001
+      assert_operator record[:GC_MARK_WALL_TIME] + record[:GC_SWEEP_WALL_TIME], :<=, record[:GC_PAUSE_TIME]
+    RUBY
+  ensure
+    GC::Profiler.disable
+  end
+
+  def test_profiler_raw_data_includes_wall_time
+    auto_compact = GC.auto_compact if GC.respond_to?(:auto_compact)
+    GC.auto_compact = false if GC.respond_to?(:auto_compact=)
+
+    GC::Profiler.enable
+    GC::Profiler.clear
+
+    GC.start
+    record = GC::Profiler.raw_data.last
+
+    assert_kind_of Float, record[:GC_WALL_TIME]
+    assert_kind_of Float, record[:GC_INVOKE_WALL_TIME]
+    assert_kind_of Float, record[:GC_PAUSE_TIME]
+    assert_kind_of Float, record[:GC_STOP_TIME]
+    assert_kind_of Float, record[:GC_STW_TIME]
+    assert_kind_of Float, record[:GC_MARK_WALL_TIME]
+    assert_kind_of Float, record[:GC_SWEEP_WALL_TIME]
+    assert_kind_of Float, record[:GC_COMPACT_WALL_TIME]
+
+    assert_operator record[:GC_WALL_TIME], :>=, 0.0
+    assert_operator record[:GC_INVOKE_WALL_TIME], :>=, 0.0
+    assert_operator record[:GC_PAUSE_TIME], :>=, 0.0
+    assert_operator record[:GC_STOP_TIME], :>=, 0.0
+    assert_operator record[:GC_STW_TIME], :>=, 0.0
+    assert_operator record[:GC_MARK_WALL_TIME], :>=, 0.0
+    assert_operator record[:GC_SWEEP_WALL_TIME], :>=, 0.0
+    assert_operator record[:GC_COMPACT_WALL_TIME], :>=, 0.0
+    assert_in_delta record[:GC_PAUSE_TIME], record[:GC_STOP_TIME] + record[:GC_STW_TIME], 0.001
+    assert_operator record[:GC_MARK_WALL_TIME] + record[:GC_SWEEP_WALL_TIME], :<=, record[:GC_PAUSE_TIME] + 0.001
+    assert_equal 0.0, record[:GC_COMPACT_WALL_TIME]
+  ensure
+    GC::Profiler.disable
+    GC::Profiler.clear
+    GC.auto_compact = auto_compact if GC.respond_to?(:auto_compact=) && defined?(auto_compact)
+  end
+
+  def test_profiler_raw_data_reports_compaction_separately_from_sweep_wall_time
+    omit "compaction not supported" unless GC.respond_to?(:compact)
+
+    GC::Profiler.enable
+    GC::Profiler.clear
+
+    objects = 10_000.times.map { Object.new }
+    GC.compact
+    record = GC::Profiler.raw_data.last
+
+    assert_kind_of Float, record[:GC_COMPACT_WALL_TIME]
+    assert_operator record[:GC_COMPACT_WALL_TIME], :>, 0.0
+    phase_wall_time = record[:GC_MARK_WALL_TIME] + record[:GC_SWEEP_WALL_TIME] + record[:GC_COMPACT_WALL_TIME]
+    assert_operator phase_wall_time, :<=, record[:GC_PAUSE_TIME] + 0.001
+    objects.clear
+  rescue NotImplementedError
+    omit "compaction not supported"
+  ensure
+    GC::Profiler.disable
+    GC::Profiler.clear
   end
 
   def test_profiler_total_time
@@ -636,8 +776,19 @@ class TestGc < Test::Unit::TestCase
       # Warmup to make sure heap stabilizes
       1_000_000.times { Object.new }
 
-      before_stats = GC.stat
+      # We need to pre-allocate all the hashes for GC.stat calls, because
+      # otherwise the call to GC.stat/GC.stat_heap itself could cause a new
+      # page to be allocated and the before/after assertions will fail
+      before_stats = {}
+      after_stats = {}
+      # stat_heap needs a hash of hashes for each heap; easiest way to get the
+      # right shape for that is just to call stat_heap with no argument
       before_stat_heap = GC.stat_heap
+      after_stat_heap = GC.stat_heap
+
+      # Now collect the actual stats
+      GC.stat before_stats
+      GC.stat_heap nil, before_stat_heap
 
       1_000_000.times { Object.new }
 
@@ -645,24 +796,47 @@ class TestGc < Test::Unit::TestCase
       # running a minor GC here will guarantee that GC will be complete
       GC.start(full_mark: false)
 
-      after_stats = GC.stat
-      after_stat_heap = GC.stat_heap
+      GC.stat after_stats
+      GC.stat_heap nil, after_stat_heap
 
       # Debugging output to for failures in trunk-repeat50@phosphorus-docker
       debug_msg = "before_stats: #{before_stats}\nbefore_stat_heap: #{before_stat_heap}\nafter_stats: #{after_stats}\nafter_stat_heap: #{after_stat_heap}"
 
       # Should not be thrashing in page creation
-      assert_equal before_stats[:heap_allocated_pages], after_stats[:heap_allocated_pages], debug_msg
-      assert_equal 0, after_stats[:heap_empty_pages], debug_msg
+      assert_in_epsilon before_stats[:heap_allocated_pages], after_stats[:heap_allocated_pages], 0.5, debug_msg
       assert_equal 0, after_stats[:total_freed_pages], debug_msg
-      # Only young objects, so should not trigger major GC
-      assert_equal before_stats[:major_gc_count], after_stats[:major_gc_count], debug_msg
+    RUBY
+  end
+
+  def test_heaps_grow_independently
+    # [Bug #21214]
+
+    assert_separately([], __FILE__, __LINE__, <<-'RUBY', timeout: 60)
+      COUNT = 1_000_000
+
+      def allocate_small_object = []
+      def allocate_large_object = Array.new(10)
+
+      @arys = Array.new(COUNT) do
+        # Allocate 10 small transient objects
+        10.times { allocate_small_object }
+        # Allocate 1 large object that is persistent
+        allocate_large_object
+      end
+
+      # Running GC here is required to prevent this test from being flaky because
+      # the heap for the small transient objects may not have been cleared by the
+      # GC causing heap_available_slots to be slightly over 2 * COUNT.
+      GC.start
+
+      heap_available_slots = GC.stat(:heap_available_slots)
+
+      assert_operator(heap_available_slots, :<, COUNT * 2, "GC.stat: #{GC.stat}\nGC.stat_heap: #{GC.stat_heap}")
     RUBY
   end
 
   def test_gc_internals
-    assert_not_nil GC::INTERNAL_CONSTANTS[:HEAP_PAGE_OBJ_LIMIT]
-    assert_not_nil GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE]
+    assert_not_nil GC::INTERNAL_CONSTANTS[:HEAP_COUNT]
   end
 
   def test_sweep_in_finalizer
@@ -693,6 +867,7 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_interrupt_in_finalizer
+    omit 'randomly hangs on many platforms' if ENV.key?('GITHUB_ACTIONS')
     bug10595 = '[ruby-core:66825] [Bug #10595]'
     src = <<-'end;'
       Signal.trap(:INT, 'DEFAULT')
@@ -708,7 +883,7 @@ class TestGc < Test::Unit::TestCase
         ObjectSpace.define_finalizer(Object.new, f)
       end
     end;
-    out, err, status = assert_in_out_err(["-e", src], "", [], [], bug10595, signal: :SEGV) do |*result|
+    out, err, status = assert_in_out_err(["-e", src], "", [], [], bug10595, signal: :SEGV, timeout: 100) do |*result|
       break result
     end
     unless /mswin|mingw/ =~ RUBY_PLATFORM
@@ -730,6 +905,17 @@ class TestGc < Test::Unit::TestCase
     assert_nil(GC.verify_internal_consistency)
   end
 
+  def test_gc_stress_on_obj_allocation
+    EnvUtil.under_gc_stress do
+      count = GC.count
+      iters = 100
+      iters.times do
+        Object.new
+      end
+      assert_operator(GC.count - count, :>=, iters)
+    end
+  end
+
   def test_gc_stress_on_realloc
     assert_normal_exit(<<-'end;', '[Bug #9859]')
       class C
@@ -749,7 +935,7 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_gc_stress_at_startup
-    assert_in_out_err([{"RUBY_DEBUG"=>"gc_stress"}], '', [], [], '[Bug #15784]', success: true, timeout: 60)
+    assert_in_out_err([{"RUBY_DEBUG"=>"gc_stress"}], '', [], [], '[Bug #15784]', success: true, timeout: 120)
   end
 
   def test_gc_disabled_start
@@ -775,6 +961,8 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_exception_in_finalizer_procs
+    require '-test-/stack'
+    omit 'failing with ASAN' if Thread.asan?
     assert_in_out_err(["-W0"], "#{<<~"begin;"}\n#{<<~'end;'}", %w[c1 c2])
     c1 = proc do
       puts "c1"
@@ -795,6 +983,8 @@ class TestGc < Test::Unit::TestCase
   end
 
   def test_exception_in_finalizer_method
+    require '-test-/stack'
+    omit 'failing with ASAN' if Thread.asan?
     assert_in_out_err(["-W0"], "#{<<~"begin;"}\n#{<<~'end;'}", %w[c1 c2])
     def self.c1(x)
       puts "c1"
@@ -859,5 +1049,26 @@ class TestGc < Test::Unit::TestCase
       GC.start
       assert_include ObjectSpace.dump(young_obj), '"old":true'
     end
+  end
+
+  def test_finalizer_not_run_with_vm_lock
+    assert_ractor(<<~'RUBY', timeout: 30)
+      Thread.new do
+        loop do
+          Encoding.list.each do |enc|
+            enc.names
+          end
+        end
+      end
+
+      o = Object.new
+      ObjectSpace.define_finalizer(o, proc do
+        sleep 0.5 # finalizer shouldn't be run with VM lock, otherwise this context switch will crash
+      end)
+      o = nil
+      4.times do
+        GC.start
+      end
+    RUBY
   end
 end

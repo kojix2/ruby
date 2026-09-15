@@ -42,37 +42,10 @@
  */
 #define ROBJECT(obj)          RBIMPL_CAST((struct RObject *)(obj))
 /** @cond INTERNAL_MACRO */
-#define ROBJECT_EMBED_LEN_MAX ROBJECT_EMBED_LEN_MAX
-#define ROBJECT_EMBED         ROBJECT_EMBED
-#define ROBJECT_IV_CAPACITY   ROBJECT_IV_CAPACITY
-#define ROBJECT_IVPTR         ROBJECT_IVPTR
+#define ROBJECT_EMBED_LEN_MAX       ROBJECT_EMBED_LEN_MAX
+#define ROBJECT_FIELDS_CAPACITY     ROBJECT_FIELDS_CAPACITY
+#define ROBJECT_FIELDS              ROBJECT_FIELDS
 /** @endcond */
-
-/**
- * @private
- *
- * Bits that you can set to ::RBasic::flags.
- */
-enum ruby_robject_flags {
-    /**
-     * This flag has  something to do with memory footprint.   If the object is
-     * "small"  enough, ruby  tries to  be creative  to abuse  padding bits  of
-     * struct ::RObject for storing instance variables.  This flag denotes that
-     * situation.
-     *
-     * @warning  This  bit has  to be  considered read-only.   Setting/clearing
-     *           this  bit without  corresponding fix  up must  cause immediate
-     *           SEGV.   Also,   internal  structures   of  an   object  change
-     *           dynamically  and  transparently  throughout of  its  lifetime.
-     *           Don't assume it being persistent.
-     *
-     * @internal
-     *
-     * 3rd parties must  not be aware that  there even is more than  one way to
-     * store instance variables.  Might better be hidden.
-     */
-    ROBJECT_EMBED = RUBY_FL_USER1
-};
 
 struct st_table;
 
@@ -87,28 +60,8 @@ struct RObject {
 
     /** Object's specific fields. */
     union {
-
-        /**
-         * Object that use  separated memory region for  instance variables use
-         * this pattern.
-         */
-        struct {
-            /** Pointer to a C array that holds instance variables. */
-            VALUE *ivptr;
-
-            /**
-             * This  is a  table that  holds  instance variable  name to  index
-             * mapping.  Used when accessing instance variables using names.
-             *
-             * @internal
-             *
-             * This is a shortcut for `RCLASS_IV_INDEX_TBL(rb_obj_class(obj))`.
-             */
-            struct rb_id_table *iv_index_tbl;
-        } heap;
-
-        /* Embedded instance variables. When an object is small enough, it
-         * uses this area to store the instance variables.
+        /* Embedded instance variables. When an object slot is large enough, it
+         * uses this area to store the instance variables embedded.
          *
          * This is a length 1 array because:
          *   1. GCC has a bug that does not optimize C flexible array members
@@ -116,35 +69,14 @@ struct RObject {
          *   2. Zero length arrays are not supported by all compilers
          */
         VALUE ary[1];
+
+       /**
+        * When an object slot is too small or too complex to store instance
+        * variables inline, it references another, larger, object that contains
+        * the instance variables.
+        */
+       VALUE extended;
     } as;
 };
-
-RBIMPL_ATTR_PURE_UNLESS_DEBUG()
-RBIMPL_ATTR_ARTIFICIAL()
-/**
- * Queries the instance variables.
- *
- * @param[in]  obj  Object in question.
- * @return     Its instance variables, in C array.
- * @pre        `obj` must be an instance of ::RObject.
- *
- * @internal
- *
- * @shyouhei finds no reason for this to be visible from extension libraries.
- */
-static inline VALUE *
-ROBJECT_IVPTR(VALUE obj)
-{
-    RBIMPL_ASSERT_TYPE(obj, RUBY_T_OBJECT);
-
-    struct RObject *const ptr = ROBJECT(obj);
-
-    if (RB_FL_ANY_RAW(obj, ROBJECT_EMBED)) {
-        return ptr->as.ary;
-    }
-    else {
-        return ptr->as.heap.ivptr;
-    }
-}
 
 #endif /* RBIMPL_ROBJECT_H */

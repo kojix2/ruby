@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 # :markup: markdown
 
-# This module allows for introspection of \YJIT, CRuby's just-in-time compiler.
+# This module allows for introspection of YJIT, CRuby's just-in-time compiler.
 # Everything in the module is highly implementation specific and the API might
 # be less stable compared to the standard library.
 #
-# This module may not exist if \YJIT does not support the particular platform
+# This module may not exist if YJIT does not support the particular platform
 # for which CRuby is built.
 module RubyVM::YJIT
-  # Check if \YJIT is enabled.
+  # Check if YJIT is enabled.
   def self.enabled?
     Primitive.cexpr! 'RBOOL(rb_yjit_enabled_p)'
   end
@@ -33,22 +33,38 @@ module RubyVM::YJIT
     Primitive.rb_yjit_reset_stats_bang
   end
 
-  # Enable \YJIT compilation. `stats` option decides whether to enable \YJIT stats or not. `compilation_log` decides
-  # whether to enable \YJIT compilation logging or not.
+  # Enable YJIT compilation. `stats` option decides whether to enable YJIT stats or not. `log` decides
+  # whether to enable YJIT compilation logging or not. Optional `mem_size` and `call_threshold` can be
+  # provided to override default configuration.
   #
-  # `stats`:
-  # * `false`: Disable stats.
-  # * `true`: Enable stats. Print stats at exit.
-  # * `:quiet`: Enable stats. Do not print stats at exit.
-  #
-  # `log`:
-  # * `false`: Don't enable the log.
-  # * `true`: Enable the log. Print log at exit.
-  # * `:quiet`: Enable the log. Do not print log at exit.
-  def self.enable(stats: false, log: false)
+  # * `stats`:
+  #     * `false`: Don't enable stats.
+  #     * `true`: Enable stats. Print stats at exit.
+  #     * `:quiet`: Enable stats. Do not print stats at exit.
+  # * `log`:
+  #     * `false`: Don't enable the log.
+  #     * `true`: Enable the log. Print log at exit.
+  #     * `:quiet`: Enable the log. Do not print log at exit.
+  def self.enable(stats: false, log: false, mem_size: nil, call_threshold: nil)
     return false if enabled?
+
+    if Primitive.cexpr! 'RBOOL(rb_zjit_enabled_p)'
+      warn("Only one JIT can be enabled at the same time.")
+      return false
+    end
+
+    if mem_size
+      raise ArgumentError, "mem_size must be a Integer" unless mem_size.is_a?(Integer)
+      raise ArgumentError, "mem_size must be between 1 and 2048 MB" unless (1..2048).include?(mem_size)
+    end
+
+    if call_threshold
+      raise ArgumentError, "call_threshold must be a Integer" unless call_threshold.is_a?(Integer)
+      raise ArgumentError, "call_threshold must be a positive integer" unless call_threshold.positive?
+    end
+
     at_exit { print_and_dump_stats } if stats
-    Primitive.rb_yjit_enable(stats, stats != :quiet, log, log != :quiet)
+    Primitive.rb_yjit_enable(stats, stats != :quiet, log, log != :quiet, mem_size, call_threshold)
   end
 
   # If --yjit-trace-exits is enabled parse the hashes from
@@ -203,7 +219,7 @@ module RubyVM::YJIT
     if !self.enabled?
       warn(
         "YJIT needs to be enabled to produce disasm output, e.g.\n" +
-        "ruby --yjit-call-threshold=1 my_script.rb (see doc/yjit/yjit.md)"
+        "ruby --yjit-call-threshold=1 my_script.rb (see doc/jit/yjit.md)"
       )
       return nil
     end
@@ -213,7 +229,7 @@ module RubyVM::YJIT
     if !disasm_str
       warn(
         "YJIT disasm is only available when YJIT is built in dev mode, i.e.\n" +
-        "./configure --enable-yjit=dev (see doc/yjit/yjit.md)\n"
+        "./configure --enable-yjit=dev (see doc/jit/yjit.md)\n"
       )
       return nil
     end
@@ -247,9 +263,25 @@ module RubyVM::YJIT
     at_exit { print_and_dump_stats }
   end
 
+  # Blocks that are called when YJIT is enabled
+  @jit_hooks = []
+
   class << self
     # :stopdoc:
     private
+
+    # Register a block to be called when YJIT is enabled
+    def add_jit_hook(hook)
+      @jit_hooks << hook
+    end
+
+    # Run YJIT hooks registered by `#with_jit`
+    def call_jit_hooks
+      # Skip using builtin methods in Ruby if --yjit-c-builtin is given
+      return if Primitive.yjit_c_builtin_p
+      @jit_hooks.each(&:call)
+      @jit_hooks.clear
+    end
 
     # Print stats and dump exit locations
     def print_and_dump_stats # :nodoc:
@@ -290,7 +322,6 @@ module RubyVM::YJIT
         leave
         objtostring
         opt_aref
-        opt_aref_with
         opt_aset
         opt_case_dispatch
         opt_div
@@ -321,6 +352,9 @@ module RubyVM::YJIT
 
       # Number of failed compiler invocations
       compilation_failure = stats[:compilation_failure]
+
+      # Number of refused exceptional entries with an escaped environment
+      exceptional_entry_escaped_env = stats[:exceptional_entry_escaped_env]
 
       code_region_overhead = stats[:code_region_size] - (stats[:inline_code_size] + stats[:outlined_code_size])
 
@@ -358,6 +392,7 @@ module RubyVM::YJIT
       out.puts "bindings_allocations:  " + format_number(13, stats[:binding_allocations])
       out.puts "bindings_set:          " + format_number(13, stats[:binding_set])
       out.puts "compilation_failure:   " + format_number(13, compilation_failure) if compilation_failure != 0
+      out.puts "exceptional_entry_escaped_env:" + format_number(6, exceptional_entry_escaped_env) if exceptional_entry_escaped_env != 0
       out.puts "live_iseq_count:       " + format_number(13, stats[:live_iseq_count])
       out.puts "iseq_alloc_count:      " + format_number(13, stats[:iseq_alloc_count])
       out.puts "compiled_iseq_entry:   " + format_number(13, stats[:compiled_iseq_entry])
@@ -365,13 +400,16 @@ module RubyVM::YJIT
       out.puts "compiled_iseq_count:   " + format_number(13, stats[:compiled_iseq_count])
       out.puts "compiled_blockid_count:" + format_number(13, stats[:compiled_blockid_count])
       out.puts "compiled_block_count:  " + format_number(13, stats[:compiled_block_count])
+      out.puts "inline_block_count:    " + format_number_pct(13, stats[:inline_block_count], stats[:compiled_block_count])
       out.puts "deleted_defer_block_count:" + format_number_pct(10, stats[:deleted_defer_block_count], stats[:compiled_block_count])
       if stats[:compiled_blockid_count] != 0
         out.puts "versions_per_block:    " + format_number(13, "%4.3f" % (stats[:compiled_block_count].fdiv(stats[:compiled_blockid_count])))
       end
       out.puts "max_inline_versions:   " + format_number(13, stats[:max_inline_versions])
       out.puts "compiled_branch_count: " + format_number(13, stats[:compiled_branch_count])
-      out.puts "compile_time_ms:       " + format_number(13, stats[:compile_time_ns] / (1000 * 1000))
+
+      out.puts "yjit_active_ms:        " + format_number(13, stats[:yjit_active_ns] / 10**6)
+      out.puts "compile_time_ms:       " + format_number_pct(13, stats[:compile_time_ns] / 10**6 , stats[:yjit_active_ns] / 10**6)
       out.puts "block_next_count:      " + format_number(13, stats[:block_next_count])
       out.puts "defer_count:           " + format_number(13, stats[:defer_count])
       out.puts "defer_empty_count:     " + format_number(13, stats[:defer_empty_count])
@@ -403,10 +441,10 @@ module RubyVM::YJIT
       out.puts "object_shape_count:    " + format_number(13, stats[:object_shape_count])
       out.puts "side_exit_count:       " + format_number(13, stats[:side_exit_count])
       out.puts "total_exit_count:      " + format_number(13, stats[:total_exit_count])
-      out.puts "total_insns_count:     " + format_number(13, stats[:total_insns_count])
-      out.puts "vm_insns_count:        " + format_number(13, stats[:vm_insns_count])
+      out.puts "total_insns_count:     " + format_number(13, stats[:total_insns_count]) if stats[:total_insns_count]
+      out.puts "vm_insns_count:        " + format_number(13, stats[:vm_insns_count]) if stats[:vm_insns_count]
       out.puts "yjit_insns_count:      " + format_number(13, stats[:yjit_insns_count])
-      out.puts "ratio_in_yjit:         " + ("%12.1f" % stats[:ratio_in_yjit]) + "%"
+      out.puts "ratio_in_yjit:         " + ("%12.1f" % stats[:ratio_in_yjit]) + "%" if stats[:ratio_in_yjit]
       out.puts "avg_len_in_yjit:       " + ("%13.1f" % stats[:avg_len_in_yjit])
 
       print_sorted_exit_counts(stats, out: out, prefix: "exit_")
@@ -501,9 +539,14 @@ module RubyVM::YJIT
     # Format a number along with a percentage over a total value
     def format_number_pct(pad, number, total) # :nodoc:
       padded_count = format_number(pad, number)
-      percentage = number.fdiv(total) * 100
-      formatted_pct = "%4.1f%%" % percentage
-      "#{padded_count} (#{formatted_pct})"
+
+      if total != 0
+        percentage = number.fdiv(total) * 100
+        formatted_pct = "%4.1f%%" % percentage
+        "#{padded_count} (#{formatted_pct})"
+      else
+        "#{padded_count}"
+      end
     end
 
     # :startdoc:

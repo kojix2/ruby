@@ -40,7 +40,7 @@ describe 'Socket#connect' do
         # as it's too implementation-dependent and checking for connect()
         # errors is futile anyways because of TOCTOU
         @client.connect(@server.getsockname)
-      }.should raise_error(Errno::EISCONN)
+      }.should.raise(Errno::EISCONN)
     end
 
     platform_is_not :darwin do
@@ -63,8 +63,16 @@ describe 'Socket#connect' do
       client.timeout = 0
 
       -> {
-        client.connect(address)
-      }.should raise_error(IO::TimeoutError)
+        begin
+          client.connect(address)
+        rescue Errno::ECONNREFUSED
+          skip "Outgoing packets may be filtered"
+        rescue Errno::ENETUNREACH
+          skip "Off line"
+        end
+      }.should.raise(IO::TimeoutError)
+    ensure
+      client.close
     end
   end
 end

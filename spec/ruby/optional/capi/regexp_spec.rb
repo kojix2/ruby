@@ -17,11 +17,15 @@ describe "C-API Regexp function" do
     end
 
     it "returns a Regexp with the given options" do
-      @p.a_re("a", 0).options == 0
+      @p.a_re("a", 0).options.should == 0
       @p.a_re("a", Regexp::IGNORECASE).options.should == Regexp::IGNORECASE
       @p.a_re("a", Regexp::EXTENDED).options.should == Regexp::EXTENDED
       @p.a_re("a", Regexp::EXTENDED | Regexp::IGNORECASE).options.should == Regexp::EXTENDED | Regexp::IGNORECASE
       @p.a_re("a", Regexp::MULTILINE).options.should == Regexp::MULTILINE
+    end
+
+    it "returns a Regexp that equals an equivalent Regexp literal" do
+      @p.a_re("^[0-9]", 0).should == /^[0-9]/
     end
   end
 
@@ -77,7 +81,7 @@ describe "C-API Regexp function" do
     end
 
     it "returns MatchData when used with rb_reg_match" do
-       @p.rb_reg_match_backref_get(/a/, 'ab')[0].should == 'a'
+      @p.rb_reg_match_backref_get(/a/, 'ab')[0].should == 'a'
     end
   end
 
@@ -104,13 +108,13 @@ describe "C-API Regexp function" do
       end
 
       Thread.pass while thr.status and !running
-      $~.should be_nil
+      $~.should == nil
 
       thr.join
     end
   end
 
-  describe "rb_memicmp" do
+  describe "rb_memcicmp" do
     it "returns 0 for identical strings" do
       @p.rb_memcicmp('Hello', 'Hello').should == 0
     end

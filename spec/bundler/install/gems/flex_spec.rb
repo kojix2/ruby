@@ -191,7 +191,7 @@ RSpec.describe "bundle flex_install" do
     end
 
     it "discards the locked gems when the Gemfile requires different versions than the lock" do
-      bundle "config set force_ruby_platform true"
+      bundle_config "force_ruby_platform true"
 
       nice_error = <<~E.strip
         Could not find compatible versions
@@ -208,7 +208,7 @@ RSpec.describe "bundle flex_install" do
     end
 
     it "does not include conflicts with a single requirement tree, because that can't possibly be a conflict" do
-      bundle "config set force_ruby_platform true"
+      bundle_config "force_ruby_platform true"
 
       bad_error = <<~E.strip
         Bundler could not find compatible versions for gem "myrack-obama":
@@ -289,12 +289,36 @@ RSpec.describe "bundle flex_install" do
           myrack-obama
         #{checksums}
         BUNDLED WITH
-           #{Bundler::VERSION}
+          #{Bundler::VERSION}
       L
     end
 
     it "should work when you update" do
       bundle "update myrack"
+
+      checksums = checksums_section_when_enabled do |c|
+        c.checksum gem_repo1, "myrack", "0.9.1"
+        c.checksum gem_repo1, "myrack-obama", "1.0"
+      end
+
+      expect(lockfile).to eq <<~L
+        GEM
+          remote: https://gem.repo1/
+          specs:
+            myrack (0.9.1)
+            myrack-obama (1.0)
+              myrack
+
+        PLATFORMS
+          #{lockfile_platforms}
+
+        DEPENDENCIES
+          myrack (= 0.9.1)
+          myrack-obama
+        #{checksums}
+        BUNDLED WITH
+          #{Bundler::VERSION}
+      L
     end
   end
 
@@ -334,7 +358,7 @@ RSpec.describe "bundle flex_install" do
           myrack
         #{checksums}
         BUNDLED WITH
-           #{Bundler::VERSION}
+          #{Bundler::VERSION}
       L
     end
   end

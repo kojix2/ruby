@@ -1,16 +1,14 @@
-# -*- encoding: binary -*-
+# encoding: binary
 require_relative '../../../spec_helper'
 require_relative '../fixtures/classes'
 require_relative 'shared/basic'
 require_relative 'shared/string'
-require_relative 'shared/taint'
 
 describe "Array#pack with format 'A'" do
   it_behaves_like :array_pack_basic, 'A'
   it_behaves_like :array_pack_basic_non_float, 'A'
   it_behaves_like :array_pack_no_platform, 'A'
   it_behaves_like :array_pack_string, 'A'
-  it_behaves_like :array_pack_taint, 'A'
 
   it "calls #to_str to convert an Object to a String" do
     obj = mock("pack A string")
@@ -19,15 +17,15 @@ describe "Array#pack with format 'A'" do
   end
 
   it "will not implicitly convert a number to a string" do
-    -> { [0].pack('A') }.should raise_error(TypeError)
-    -> { [0].pack('a') }.should raise_error(TypeError)
+    -> { [0].pack('A') }.should.raise(TypeError)
+    -> { [0].pack('a') }.should.raise(TypeError)
   end
 
   it "adds all the bytes to the output when passed the '*' modifier" do
     ["abc"].pack("A*").should == "abc"
   end
 
-  it "padds the output with spaces when the count exceeds the size of the String" do
+  it "pads the output with spaces when the count exceeds the size of the String" do
     ["abc"].pack("A6").should == "abc   "
   end
 
@@ -49,13 +47,12 @@ describe "Array#pack with format 'a'" do
   it_behaves_like :array_pack_basic_non_float, 'a'
   it_behaves_like :array_pack_no_platform, 'a'
   it_behaves_like :array_pack_string, 'a'
-  it_behaves_like :array_pack_taint, 'a'
 
   it "adds all the bytes to the output when passed the '*' modifier" do
     ["abc"].pack("a*").should == "abc"
   end
 
-  it "padds the output with NULL bytes when the count exceeds the size of the String" do
+  it "pads the output with NULL bytes when the count exceeds the size of the String" do
     ["abc"].pack("a6").should == "abc\x00\x00\x00"
   end
 

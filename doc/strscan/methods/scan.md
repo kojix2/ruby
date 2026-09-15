@@ -1,6 +1,3 @@
-call-seq:
-  scan(pattern) -> substring or nil
-
 Attempts to [match][17] the given `pattern`
 at the beginning of the [target substring][3].
 
@@ -11,7 +8,7 @@ If the match succeeds:
   and may increment the [character position][7].
 - Sets [match values][9].
 
-```
+```rb
 scanner = StringScanner.new(HIRAGANA_TEXT)
 scanner.string     # => "こんにちは"
 scanner.pos = 6
@@ -45,7 +42,7 @@ If the match fails:
 - Does not increment byte and character positions.
 - Clears match values.
 
-```
+```rb
 scanner.scan(/nope/)           # => nil
 match_values_cleared?(scanner) # => true
 ```

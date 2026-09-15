@@ -3,7 +3,10 @@
 require "bundler/setup"
 require "syntax_suggest/api"
 
-require "benchmark"
+begin
+  require "benchmark"
+rescue LoadError
+end
 require "tempfile"
 
 RSpec.configure do |config|
@@ -77,6 +80,16 @@ def debug_perf
     printer.print(path: dir, profile: "profile")
 
     out
+  else
+    yield
+  end
+end
+
+def benchmark_measure
+  raise "No block given" unless block_given?
+
+  if defined?(::Benchmark)
+    debug_display(Benchmark.measure { yield })
   else
     yield
   end

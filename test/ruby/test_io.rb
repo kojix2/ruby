@@ -350,6 +350,152 @@ class TestIO < Test::Unit::TestCase
     end)
   end
 
+  def test_ungetc_with_seek
+    make_tempfile {|t|
+      t.open
+      t.write('0123456789')
+      t.rewind
+
+      t.ungetc('a')
+      t.seek(2, :SET)
+
+      assert_equal('2', t.getc)
+    }
+  end
+
+  def test_ungetc_with_seek_textmode
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.ungetc('a')
+        f.seek(2, :SET)
+        assert_equal('o', f.getc, bug22239)
+      }
+
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.seek(2, :SET)
+        assert_equal('o', f.getc, bug22239)
+      }
+    }
+  end
+
+  def test_ungetc_with_pos_textmode
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.ungetc('a')
+        f.pos = 2
+        assert_equal('o', f.getc, bug22239)
+      }
+
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.pos = 2
+        assert_equal('o', f.getc, bug22239)
+      }
+    }
+  end
+
+  def test_eof_after_seek_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.seek(0, IO::SEEK_END)
+        assert_predicate(f, :eof?, bug22239)
+        assert_nil(f.getc, bug22239)
+      }
+    }
+  end
+
+  def test_sysseek_after_rewind_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.rewind
+        assert_nothing_raised(IOError, bug22239) {f.sysseek(0)}
+      }
+    }
+  end
+
+  def test_getbyte_after_rewind_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.rewind
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_getbyte_after_seek_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.seek(0, :SET)
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_getbyte_after_pos_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.pos = 0
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_getbyte_after_flush_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.flush
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_getbyte_after_binmode_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.binmode
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_getbyte_after_tell_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(t.path, "rt") {|f|
+        f.getc
+        f.ungetc('a')
+        f.tell
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
   def test_ungetbyte
     make_tempfile {|t|
       t.open
@@ -370,6 +516,19 @@ class TestIO < Test::Unit::TestCase
       t.ungetbyte("\xe7\xb4\x85")
       assert_equal(-2, t.pos)
       assert_equal("\u7d05\u7389bar\n", t.gets)
+    }
+  end
+
+  def test_ungetbyte_with_seek
+    make_tempfile {|t|
+      t.open
+      t.write('0123456789')
+      t.rewind
+
+      t.ungetbyte('a'.ord)
+      t.seek(2, :SET)
+
+      assert_equal('2'.ord, t.getbyte)
     }
   end
 
@@ -438,6 +597,24 @@ class TestIO < Test::Unit::TestCase
           f.each_codepoint {|c| f.close if c == 10}
         end
       }
+    }
+  end
+
+  def test_each_codepoint_with_ungetc
+    bug21562 = '[ruby-core:123176] [Bug #21562]'
+    with_read_pipe("") {|p|
+      p.binmode
+      p.ungetc("aa")
+      a = ""
+      p.each_codepoint { |c| a << c }
+      assert_equal("aa", a, bug21562)
+    }
+    with_read_pipe("") {|p|
+      p.set_encoding("ascii-8bit", universal_newline: true)
+      p.ungetc("aa")
+      a = ""
+      p.each_codepoint { |c| a << c }
+      assert_equal("aa", a, bug21562)
     }
   end
 
@@ -655,7 +832,6 @@ class TestIO < Test::Unit::TestCase
 
   if have_nonblock?
     def test_copy_stream_no_busy_wait
-      omit "RJIT has busy wait on GC. This sometimes fails with --jit." if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
       omit "multiple threads already active" if Thread.list.size > 1
 
       msg = 'r58534 [ruby-core:80969] [Backport #13533]'
@@ -900,10 +1076,6 @@ class TestIO < Test::Unit::TestCase
   end if defined? UNIXSocket
 
   def test_copy_stream_socket4
-    if RUBY_PLATFORM =~ /mingw|mswin/
-      omit "pread(2) is not implemented."
-    end
-
     with_bigsrc {|bigsrc, bigcontent|
       File.open(bigsrc) {|f|
         assert_equal(0, f.pos)
@@ -923,10 +1095,6 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_copy_stream_socket5
-    if RUBY_PLATFORM =~ /mingw|mswin/
-      omit "pread(2) is not implemented."
-    end
-
     with_bigsrc {|bigsrc, bigcontent|
       File.open(bigsrc) {|f|
         assert_equal(bigcontent[0,100], f.read(100))
@@ -947,10 +1115,6 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_copy_stream_socket6
-    if RUBY_PLATFORM =~ /mingw|mswin/
-      omit "pread(2) is not implemented."
-    end
-
     mkcdtmpdir {
       megacontent = "abc" * 1234567
       File.open("megasrc", "w") {|f| f << megacontent }
@@ -974,9 +1138,7 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_copy_stream_socket7
-    if RUBY_PLATFORM =~ /mingw|mswin/
-      omit "pread(2) is not implemented."
-    end
+    omit "fork is not supported" unless Process.respond_to?(:fork)
 
     GC.start
     mkcdtmpdir {
@@ -1114,6 +1276,34 @@ class TestIO < Test::Unit::TestCase
       IO.copy_stream(src, dst)
       assert_equal("ok", IO.read("dst"), bug11199)
     }
+  end
+
+  def test_copy_stream_dup_buffer
+    bug21131 = '[ruby-core:120961] [Bug #21131]'
+    mkcdtmpdir do
+      dst_class = Class.new do
+        def initialize(&block)
+          @block = block
+        end
+
+        def write(data)
+          @block.call(data.dup)
+          data.bytesize
+        end
+      end
+
+      rng = Random.new(42)
+      body = Tempfile.new("ruby-bug", binmode: true)
+      body.write(rng.bytes(16_385))
+      body.rewind
+
+      payload = []
+      IO.copy_stream(body, dst_class.new{payload << it})
+      body.rewind
+      assert_equal(body.read, payload.join, bug21131)
+    ensure
+      body&.close
+    end
   end
 
   def test_copy_stream_write_in_binmode
@@ -1322,10 +1512,6 @@ class TestIO < Test::Unit::TestCase
     args = ['-e', '$>.write($<.read)'] if args.empty?
     ruby = EnvUtil.rubybin
     opts = {}
-    if defined?(Process::RLIMIT_NPROC)
-      lim = Process.getrlimit(Process::RLIMIT_NPROC)[1]
-      opts[:rlimit_nproc] = [lim, 2048].min
-    end
     f = IO.popen([ruby] + args, 'r+', opts)
     pid = f.pid
     yield(f)
@@ -1679,7 +1865,6 @@ class TestIO < Test::Unit::TestCase
   end if have_nonblock?
 
   def test_read_nonblock_no_exceptions
-    omit '[ruby-core:90895] RJIT worker may leave fd open in a forked child' if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled? # TODO: consider acquiring GVL from RJIT worker.
     with_pipe {|r, w|
       assert_equal :wait_readable, r.read_nonblock(4096, exception: false)
       w.puts "HI!"
@@ -2008,6 +2193,36 @@ class TestIO < Test::Unit::TestCase
       assert_equal first_line, f.readline
       assert_raise(ArgumentError) {f.readline("\0")}
     }
+  end
+
+  def test_readline_limit_nonascii
+    mkcdtmpdir do
+      i = 0
+
+      File.open("text#{i+=1}", "w+:utf-8") do |f|
+        f.write("Test\nok\u{bf}ok\n")
+        f.rewind
+
+        assert_equal("Test\nok\u{bf}", f.readline("\u{bf}"))
+        assert_equal("ok\n", f.readline("\u{bf}"))
+      end
+
+      File.open("text#{i+=1}", "w+b:utf-32le") do |f|
+        f.write("0123456789")
+        f.rewind
+
+        assert_equal(4, f.readline(4).bytesize)
+        assert_equal(4, f.readline(3).bytesize)
+      end
+
+      File.open("text#{i+=1}", "w+:utf-8:utf-32le") do |f|
+        f.write("0123456789")
+        f.rewind
+
+        assert_equal(4, f.readline(4).bytesize)
+        assert_equal(4, f.readline(3).bytesize)
+      end
+    end
   end
 
   def test_set_lineno_readline
@@ -2459,10 +2674,6 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_autoclose_true_closed_by_finalizer
-    # http://ci.rvm.jp/results/trunk-rjit@silicon-docker/1465760
-    # http://ci.rvm.jp/results/trunk-rjit@silicon-docker/1469765
-    omit 'this randomly fails with RJIT' if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
-
     feature2250 = '[ruby-core:26222]'
     pre = 'ft2250'
     t = Tempfile.new(pre)
@@ -2523,36 +2734,15 @@ class TestIO < Test::Unit::TestCase
     assert_equal({:a=>1}, open(o, {a: 1}))
   end
 
-  def test_open_pipe
-    assert_deprecated_warning(/Kernel#open with a leading '\|'/) do # https://bugs.ruby-lang.org/issues/19630
-      open("|" + EnvUtil.rubybin, "r+") do |f|
-        f.puts "puts 'foo'"
-        f.close_write
-        assert_equal("foo\n", f.read)
-      end
-    end
-  end
+  def test_path_with_pipe
+    mkcdtmpdir do
+      cmd = "|echo foo"
+      assert_file.not_exist?(cmd)
 
-  def test_read_command
-    assert_deprecated_warning(/IO process creation with a leading '\|'/) do # https://bugs.ruby-lang.org/issues/19630
-      assert_equal("foo\n", IO.read("|echo foo"))
-    end
-    assert_raise(Errno::ENOENT, Errno::EINVAL) do
-      File.read("|#{EnvUtil.rubybin} -e puts")
-    end
-    assert_raise(Errno::ENOENT, Errno::EINVAL) do
-      File.binread("|#{EnvUtil.rubybin} -e puts")
-    end
-    assert_raise(Errno::ENOENT, Errno::EINVAL) do
-      Class.new(IO).read("|#{EnvUtil.rubybin} -e puts")
-    end
-    assert_raise(Errno::ENOENT, Errno::EINVAL) do
-      Class.new(IO).binread("|#{EnvUtil.rubybin} -e puts")
-    end
-    assert_raise(Errno::ESPIPE) do
-      assert_deprecated_warning(/IO process creation with a leading '\|'/) do # https://bugs.ruby-lang.org/issues/19630
-        IO.read("|#{EnvUtil.rubybin} -e 'puts :foo'", 1, 1)
-      end
+      pipe_errors = [Errno::ENOENT, Errno::EINVAL, Errno::EACCES, Errno::EPERM]
+      assert_raise(*pipe_errors) { open(cmd, "r+") }
+      assert_raise(*pipe_errors) { IO.read(cmd) }
+      assert_raise(*pipe_errors) { IO.foreach(cmd) {|x| assert false } }
     end
   end
 
@@ -2655,6 +2845,104 @@ class TestIO < Test::Unit::TestCase
     }
   end
 
+  def test_reopen_binmode
+    f1 = File.open(__FILE__)
+    f2 = File.open(__FILE__)
+    f1.binmode
+    f1.reopen(f2)
+    assert_not_operator(f1, :binmode?)
+  ensure
+    f2.close
+    f1.close
+  end
+
+  def test_reopen_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(__FILE__, "rt") {|f|
+        f.ungetc(f.getc)
+        f.reopen(t.path, "rt")
+        assert_equal("foo\n", f.gets, bug22239)
+      }
+
+      open(__FILE__, "rt") {|f|
+        f.ungetc('a')
+        f.reopen(t.path, "rt")
+        assert_equal("foo\n", f.gets, bug22239)
+      }
+
+      open(__FILE__, "rt") {|f|
+        f.ungetc(f.getc)
+        f.reopen(t.path, "rt")
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_reopen_io_with_pending_byte
+    bug22239 = '[Bug #22239]'
+    mkcdtmpdir {
+      File.binwrite("src", "0123456789")
+
+      ["rb", "r+b"].each {|mode|
+        open("src", mode) {|f|
+          f.getbyte
+          IO.pipe {|r, w|
+            w.binmode
+            w.write("ABC")
+            w.close
+            f.reopen(r)
+            assert_equal("ABC", f.read, "reopen a #{mode} IO #{bug22239}")
+          }
+        }
+      }
+    }
+  end
+
+  def test_reopen_io_with_pending_char
+    bug22239 = '[Bug #22239]'
+    make_tempfile {|t|
+      open(__FILE__, "rt") {|f|
+        f.ungetc(f.getc)
+        open(t.path, "rt") {|f2| f.reopen(f2)}
+        assert_equal("foo\n", f.gets, bug22239)
+      }
+
+      open(__FILE__, "rt") {|f|
+        f.ungetc('a')
+        open(t.path, "rt") {|f2| f.reopen(f2)}
+        assert_equal("foo\n", f.gets, bug22239)
+      }
+
+      open(__FILE__, "rt") {|f|
+        f.ungetc(f.getc)
+        open(t.path, "rt") {|f2| f.reopen(f2)}
+        assert_nothing_raised(IOError, bug22239) {f.getbyte}
+      }
+    }
+  end
+
+  def test_reopen_io_with_pending_byte_then_write
+    bug22239 = '[Bug #22239]'
+    mkcdtmpdir {
+      File.binwrite("src", "abc")
+
+      ["rb", "r+b"].each_with_index {|mode, i|
+        dst = "dst#{i}"
+        open("src", mode) {|f|
+          f.getbyte
+          open(dst, "wb") {|f2|
+            f2.write("XXXXXXXX")
+            f.reopen(f2)
+            f.write("Y")
+            f.flush
+          }
+        }
+        assert_equal("XXXXXXXXY", File.binread(dst), "reopen a #{mode} IO #{bug22239}")
+      }
+    }
+  end
+
   def make_tempfile_for_encoding
     t = make_tempfile
     open(t.path, "rb+:utf-8") {|f| f.puts "\u7d05\u7389bar\n"}
@@ -2683,6 +2971,16 @@ class TestIO < Test::Unit::TestCase
         assert_equal("\xB9\xC8\xB6\xCCbar\n".force_encoding(Encoding::EUC_JP), s)
       }
     }
+  end
+
+  def test_reopen_encoding_from_io
+    f1 = File.open(__FILE__, "rb:UTF-16LE")
+    f2 = File.open(__FILE__, "r:UTF-8")
+    f1.reopen(f2)
+    assert_equal(Encoding::UTF_8, f1.external_encoding)
+  ensure
+    f2.close
+    f1.close
   end
 
   def test_reopen_opt_encoding
@@ -2736,19 +3034,6 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_foreach
-    a = []
-
-    assert_deprecated_warning(/IO process creation with a leading '\|'/) do # https://bugs.ruby-lang.org/issues/19630
-      IO.foreach("|" + EnvUtil.rubybin + " -e 'puts :foo; puts :bar; puts :baz'") {|x| a << x }
-    end
-    assert_equal(["foo\n", "bar\n", "baz\n"], a)
-
-    a = []
-    assert_deprecated_warning(/IO process creation with a leading '\|'/) do # https://bugs.ruby-lang.org/issues/19630
-      IO.foreach("|" + EnvUtil.rubybin + " -e 'puts :zot'", :open_args => ["r"]) {|x| a << x }
-    end
-    assert_equal(["zot\n"], a)
-
     make_tempfile {|t|
       a = []
       IO.foreach(t.path) {|x| a << x }
@@ -2824,10 +3109,10 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_print_separators
-    EnvUtil.suppress_warning {
-      $, = ':'
-      $\ = "\n"
-    }
+    assert_deprecated_warning(/non-nil '\$,'/) {$, = ":"}
+    assert_raise(TypeError) {$, = 1}
+    assert_deprecated_warning(/non-nil '\$\\'/) {$\ = "\n"}
+    assert_raise(TypeError) {$/ = 1}
     pipe(proc do |w|
       w.print('a')
       EnvUtil.suppress_warning {w.print('a','b','c')}
@@ -3307,8 +3592,6 @@ __END__
   end
 
   def test_cross_thread_close_stdio
-    omit "[Bug #18613]" if /freebsd/ =~ RUBY_PLATFORM
-
     assert_separately([], <<-'end;')
       IO.pipe do |r,w|
         $stdin.reopen(r)
@@ -3727,7 +4010,7 @@ __END__
       end
 
       tempfiles = []
-      (0..fd_setsize+1).map {|i|
+      (0...fd_setsize).map {|i|
         tempfiles << Tempfile.create("test_io_select_with_many_files")
       }
 
@@ -4003,8 +4286,6 @@ __END__
   end
 
   def test_race_closed_stream
-    omit "[Bug #18613]" if /freebsd/ =~ RUBY_PLATFORM
-
     assert_separately([], "#{<<-"begin;"}\n#{<<-"end;"}")
     begin;
       bug13158 = '[ruby-core:79262] [Bug #13158]'
@@ -4099,8 +4380,6 @@ __END__
     end
 
     def test_closed_stream_in_rescue
-      omit "[Bug #18613]" if /freebsd/ =~ RUBY_PLATFORM
-
       assert_separately([], "#{<<-"begin;"}\n#{<<~"end;"}")
       begin;
       10.times do
@@ -4162,6 +4441,23 @@ __END__
       con.close
     end
   end if Socket.const_defined?(:MSG_OOB)
+
+  def test_select_timeout
+    assert_equal(nil, IO.select(nil,nil,nil,0))
+    assert_equal(nil, IO.select(nil,nil,nil,0.0))
+    assert_raise(TypeError) { IO.select(nil,nil,nil,"invalid-timeout") }
+    assert_raise(ArgumentError) { IO.select(nil,nil,nil,-1) }
+    assert_raise(ArgumentError) { IO.select(nil,nil,nil,-0.1) }
+    assert_raise(ArgumentError) { IO.select(nil,nil,nil,-Float::INFINITY) }
+    assert_raise(RangeError) { IO.select(nil,nil,nil,Float::NAN) }
+    IO.pipe {|r, w|
+      w << "x"
+      ret = [[r], [], []]
+      assert_equal(ret, IO.select([r],nil,nil,0.1))
+      assert_equal(ret, IO.select([r],nil,nil,1))
+      assert_equal(ret, IO.select([r],nil,nil,Float::INFINITY))
+    }
+  end
 
   def test_recycled_fd_close
     dot = -'.'
@@ -4273,5 +4569,56 @@ __END__
         assert_equal("PIPE", Signal.signame(status.termsig) || status.termsig)
       end
     end
+  end
+
+  def test_blocking_timeout
+    assert_separately([], <<~'RUBY')
+      IO.pipe do |r, w|
+        trap(:INT) do
+          w.puts "INT"
+        end
+
+        main = Thread.current
+        thread = Thread.new do
+          # Wait until the main thread has entered `$stdin.gets`:
+          Thread.pass until main.status == 'sleep'
+
+          # Cause an interrupt while handling `$stdin.gets`:
+          Process.kill :INT, $$
+        end
+
+        r.timeout = 1
+        assert_equal("INT", r.gets.chomp)
+      rescue IO::TimeoutError
+        # Ignore - some platforms don't support interrupting `gets`.
+      ensure
+        thread&.join
+      end
+    RUBY
+  end
+
+  def test_fork_close
+    omit "fork is not supported" unless Process.respond_to?(:fork)
+
+    assert_separately([], <<~'RUBY')
+      r, w = IO.pipe
+
+      thread = Thread.new do
+        r.read
+      end
+
+      Thread.pass until thread.status == "sleep"
+
+      pid = fork do
+        r.close
+      end
+
+      w.close
+
+      status = Process.wait2(pid).last
+      thread.join
+
+      assert_predicate(status, :success?)
+    RUBY
   end
 end

@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require_relative "../shellwords"
-
 # This class is used by rubygems to build Rust extensions. It is a thin-wrapper
 # over the `cargo rustc` command which takes care of building Rust code in a way
 # that Ruby can use.
@@ -17,7 +15,7 @@ class Gem::Ext::CargoBuilder < Gem::Ext::Builder
   end
 
   def build(extension, dest_path, results, args = [], lib_dir = nil, cargo_dir = Dir.pwd,
-    target_rbconfig=Gem.target_rbconfig)
+    target_rbconfig = Gem.target_rbconfig, n_jobs: nil)
     require "tempfile"
     require "fileutils"
 
@@ -159,7 +157,11 @@ class Gem::Ext::CargoBuilder < Gem::Ext::Builder
   # We want to use the same linker that Ruby uses, so that the linker flags from
   # mkmf work properly.
   def linker_args
-    cc_flag = Shellwords.split(makefile_config("CC"))
+    cc_flag = self.class.shellsplit(makefile_config("CC"))
+    # Avoid to ccache like tool from Rust build
+    # see https://github.com/ruby/rubygems/pull/8521#issuecomment-2689854359
+    # ex. CC="ccache gcc" or CC="sccache clang --any --args"
+    cc_flag.shift if cc_flag.size >= 2 && !cc_flag[1].start_with?("-")
     linker = cc_flag.shift
     link_args = cc_flag.flat_map {|a| ["-C", "link-arg=#{a}"] }
 
@@ -178,7 +180,7 @@ class Gem::Ext::CargoBuilder < Gem::Ext::Builder
 
   def libruby_args(dest_dir)
     libs = makefile_config(ruby_static? ? "LIBRUBYARG_STATIC" : "LIBRUBYARG_SHARED")
-    raw_libs = Shellwords.split(libs)
+    raw_libs = self.class.shellsplit(libs)
     raw_libs.flat_map {|l| ldflag_to_link_modifier(l) }
   end
 
@@ -225,10 +227,9 @@ class Gem::Ext::CargoBuilder < Gem::Ext::Builder
       raise Gem::InstallError, "cargo metadata failed#{exit_reason}"
     end
 
-    # cargo metadata output is specified as json, but with the
-    # --format-version 1 option the output is compatible with YAML, so we can
-    # avoid the json dependency
-    metadata = Gem::SafeYAML.safe_load(output)
+    # cargo metadata output is specified as json
+    require "json"
+    metadata = JSON.parse(output)
     package = metadata["packages"].find {|pkg| normalize_path(pkg["manifest_path"]) == manifest_path }
     unless package
       found = metadata["packages"].map {|md| "#{md["name"]} at #{md["manifest_path"]}" }
@@ -252,8 +253,7 @@ EOF
 
   def rustc_dynamic_linker_flags(dest_dir, crate_name)
     split_flags("DLDFLAGS").
-      map {|arg| maybe_resolve_ldflag_variable(arg, dest_dir, crate_name) }.
-      compact.
+      filter_map {|arg| maybe_resolve_ldflag_variable(arg, dest_dir, crate_name) }.
       flat_map {|arg| ldflag_to_link_modifier(arg) }
   end
 
@@ -262,15 +262,11 @@ EOF
   end
 
   def split_flags(var)
-    Shellwords.split(RbConfig::CONFIG.fetch(var, ""))
+    self.class.shellsplit(RbConfig::CONFIG.fetch(var, ""))
   end
 
   def ldflag_to_link_modifier(arg)
     LinkFlagConverter.convert(arg)
-  end
-
-  def msvc_target?
-    makefile_config("target_os").include?("msvc")
   end
 
   def darwin_target?
@@ -279,11 +275,6 @@ EOF
 
   def mingw_target?
     makefile_config("target_os").include?("mingw")
-  end
-
-  def win_target?
-    target_platform = RbConfig::CONFIG["target_os"]
-    !!Gem::WIN_PATTERNS.find {|r| target_platform =~ r }
   end
 
   # Interpolate substitution vars in the arg (i.e. $(DEFFILE))

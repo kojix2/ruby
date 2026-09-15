@@ -24,6 +24,7 @@
 
 struct rb_callable_method_entry_struct; /* in method.h */
 struct rb_method_definition_struct;     /* in method.h */
+struct rb_cref_struct;                  /* in method.h */
 struct rb_execution_context_struct;     /* in vm_core.h */
 struct rb_control_frame_struct;         /* in vm_core.h */
 struct rb_callinfo;                     /* in vm_core.h */
@@ -55,8 +56,8 @@ void rb_vm_pop_cfunc_frame(void);
 void rb_vm_check_redefinition_by_prepend(VALUE klass);
 int rb_vm_check_optimizable_mid(VALUE mid);
 VALUE rb_yield_refine_block(VALUE refinement, VALUE refinements);
+struct rb_cref_struct *rb_vm_cref_dup(const struct rb_cref_struct *cref);
 VALUE ruby_vm_special_exception_copy(VALUE);
-PUREFUNC(st_table *rb_vm_fstring_table(void));
 
 void rb_lastline_set_up(VALUE val, unsigned int up);
 
@@ -70,6 +71,7 @@ const char *rb_type_str(enum ruby_value_type type);
 VALUE rb_check_funcall_default(VALUE, ID, int, const VALUE *, VALUE);
 VALUE rb_check_funcall_basic_kw(VALUE, ID, VALUE, int, const VALUE*, int);
 VALUE rb_yield_1(VALUE val);
+VALUE rb_ec_yield(struct rb_execution_context_struct *ec, VALUE val);
 VALUE rb_yield_force_blockarg(VALUE values);
 VALUE rb_lambda_call(VALUE obj, ID mid, int argc, const VALUE *argv,
                      rb_block_call_func_t bl_proc, int min_argc, int max_argc,
@@ -78,10 +80,13 @@ void rb_check_stack_overflow(void);
 #define RB_BLOCK_NO_USE_PACKED_ARGS 2
 VALUE rb_block_call2(VALUE obj, ID mid, int argc, const VALUE *argv, rb_block_call_func_t bl_proc, VALUE data2, long flags);
 struct vm_ifunc *rb_current_ifunc(void);
+VALUE rb_gccct_clear_table(void);
+VALUE rb_funcallv_uncached(VALUE recv, ID mid, int argc, const VALUE *argv);
+VALUE rb_eval_cmd_call_kw(VALUE cmd, int argc, const VALUE *argv, int kw_splat);
 
-#if USE_YJIT
+#if USE_YJIT || USE_ZJIT
 /* vm_exec.c */
-extern uint64_t rb_vm_insns_count;
+extern uint64_t rb_vm_insn_count;
 #endif
 
 extern bool rb_free_at_exit;
@@ -99,8 +104,6 @@ const struct rb_callcache *rb_vm_search_method_slowpath(const struct rb_callinfo
 /* vm_method.c */
 int rb_ec_obj_respond_to(struct rb_execution_context_struct *ec, VALUE obj, ID id, int priv);
 
-void rb_clear_constant_cache(void);
-
 /* vm_dump.c */
 void rb_print_backtrace(FILE *);
 
@@ -112,6 +115,10 @@ VALUE rb_vm_backtrace_locations(int argc, const VALUE * argv, struct rb_executio
 VALUE rb_make_backtrace(void);
 void rb_backtrace_print_as_bugreport(FILE*);
 int rb_backtrace_p(VALUE obj);
+VALUE rb_backtrace_dup(VALUE btobj);
+void *rb_backtrace_blob_dump(VALUE btobj, int *size_out);
+VALUE rb_backtrace_blob_load(const void *blob, int size);
+void rb_backtrace_blob_mark(const void *blob, int size);
 VALUE rb_backtrace_to_str_ary(VALUE obj);
 VALUE rb_backtrace_to_location_ary(VALUE obj);
 VALUE rb_location_ary_to_backtrace(VALUE ary);
@@ -121,7 +128,6 @@ int rb_get_node_id_from_frame_info(VALUE obj);
 const struct rb_iseq_struct *rb_get_iseq_from_frame_info(VALUE obj);
 
 VALUE rb_ec_backtrace_object(const struct rb_execution_context_struct *ec);
-void rb_backtrace_use_iseq_first_lineno_for_last_location(VALUE self);
 
 #define RUBY_DTRACE_CREATE_HOOK(name, arg) \
     RUBY_DTRACE_HOOK(name##_CREATE, arg)

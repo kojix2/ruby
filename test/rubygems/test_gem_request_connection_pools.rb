@@ -96,6 +96,14 @@ class TestGemRequestConnectionPool < Gem::TestCase
     refute no_proxy, "wildcard mismatch"
   end
 
+  def test_to_proxy_star
+    pools = Gem::Request::ConnectionPools.new nil, []
+
+    no_proxy = pools.send :no_proxy?, "rubygems.example", ["*"]
+
+    assert no_proxy, "asterisk matches every host"
+  end
+
   def test_net_http_args
     pools = Gem::Request::ConnectionPools.new nil, []
 
@@ -133,6 +141,19 @@ class TestGemRequestConnectionPool < Gem::TestCase
     ENV["no_proxy"] = orig_no_proxy
   end
 
+  def test_net_http_args_no_proxy_star
+    orig_no_proxy = ENV["no_proxy"]
+    ENV["no_proxy"] = "*"
+
+    pools = Gem::Request::ConnectionPools.new nil, []
+
+    net_http_args = pools.send :net_http_args, Gem::URI("http://example"), @proxy
+
+    assert_equal ["example", 80, nil, nil], net_http_args
+  ensure
+    ENV["no_proxy"] = orig_no_proxy
+  end
+
   def test_thread_waits_for_connection
     uri = Gem::URI.parse("http://example/some_endpoint")
     pools = Gem::Request::ConnectionPools.new nil, []
@@ -146,6 +167,18 @@ class TestGemRequestConnectionPool < Gem::TestCase
           pool.checkout
         end
       end
+    end.join
+  end
+
+  def test_checkouts_multiple_connections_from_the_pool
+    uri = Gem::URI.parse("http://example/some_endpoint")
+    pools = Gem::Request::ConnectionPools.new nil, [], 2
+    pool  = pools.pool_for uri
+
+    pool.checkout
+
+    Thread.new do
+      assert_not_nil(pool.checkout)
     end.join
   end
 end

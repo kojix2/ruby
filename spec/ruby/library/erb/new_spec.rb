@@ -83,7 +83,7 @@ END
 
     -> {
       ERBSpecs.new_erb(input, trim_mode: '-').result
-    }.should raise_error(SyntaxError)
+    }.should.raise(SyntaxError)
   end
 
   it "regards lines starting with '%' as '<% ... %>' when trim_mode is '%'" do
@@ -130,17 +130,17 @@ END
 <b><%#= item %></b>
 <%# end %>
 END
-  ERBSpecs.new_erb(input).result.should == "\n<b></b>\n\n"
+    ERBSpecs.new_erb(input).result.should == "\n<b></b>\n\n"
     ERBSpecs.new_erb(input, trim_mode: '<>').result.should == "<b></b>\n"
   end
 
   it "forget local variables defined previous one" do
     ERB.new(@eruby_str).result
-    ->{ ERB.new("<%= list %>").result }.should raise_error(NameError)
+    ->{ ERB.new("<%= list %>").result }.should.raise(NameError)
   end
 
-  describe "warning about arguments" do
-    version_is ERB.version, "2.2.1" do #ruby_version_is "3.1" do
+  version_is ERB.const_get(:VERSION, false), ""..."6.0.0" do
+    describe "warning about arguments" do
       it "warns when passed safe_level and later arguments" do
         -> {
           ERB.new(@eruby_str, nil, '%')

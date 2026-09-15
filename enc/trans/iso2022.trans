@@ -1,4 +1,5 @@
 #include "transcode_data.h"
+#include "ruby/internal/attr/nonstring.h"
 
 <%
   map = {
@@ -436,7 +437,7 @@ rb_cp50221_encoder = {
 
 /* JIS0201 to JIS0208 conversion table */
 enum {tbl0208_num = 0xDF - 0xA1 + 1};
-static const char tbl0208[tbl0208_num][2] = {
+RBIMPL_ATTR_NONSTRING_ARRAY() static const char tbl0208[tbl0208_num][2] = {
     "\x21\x23", "\x21\x56", "\x21\x57", "\x21\x22",
     "\x21\x26", "\x25\x72", "\x25\x21", "\x25\x23",
     "\x25\x25", "\x25\x27", "\x25\x29", "\x25\x63",
@@ -543,7 +544,7 @@ rb_cp50220_encoder = {
     TRANSCODE_TABLE_INFO,
     1, /* input_unit_length */
     3, /* max_input */
-    5, /* max_output */
+    9, /* max_output */
     asciicompat_encoder, /* asciicompat_type */
     3, iso2022jp_init, iso2022jp_init, /* state_size, state_init, state_fini */
     NULL, NULL, NULL, fun_so_cp50220_encoder,

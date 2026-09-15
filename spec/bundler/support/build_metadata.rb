@@ -8,11 +8,10 @@ module Spec
     include Spec::Path
     include Spec::Helpers
 
-    def write_build_metadata(dir: source_root)
+    def write_build_metadata(dir: source_root, built_at: release_date)
       build_metadata = {
         git_commit_sha: git_commit_sha,
-        built_at: loaded_gemspec.date.utc.strftime("%Y-%m-%d"),
-        release: true,
+        built_at: built_at,
       }
 
       replace_build_metadata(build_metadata, dir: dir)
@@ -20,7 +19,7 @@ module Spec
 
     def reset_build_metadata(dir: source_root)
       build_metadata = {
-        release: false,
+        built_at: nil,
       }
 
       replace_build_metadata(build_metadata, dir: dir)
@@ -42,6 +41,13 @@ module Spec
 
     def git_commit_sha
       ruby_core_tarball? ? "unknown" : git("rev-parse --short HEAD", source_root).strip
+    end
+
+    # Required lazily because ruby/ruby ships this helper without tool/changelog.rb.
+    def release_date
+      require source_root.join("tool/changelog").to_s
+
+      ChangelogHeader.from_config.release_date
     end
 
     extend self

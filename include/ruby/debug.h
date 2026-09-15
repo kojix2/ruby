@@ -297,7 +297,7 @@ VALUE rb_debug_inspector_frame_depth(const rb_debug_inspector_t *dc, long index)
 #define RB_DEBUG_INSPECTOR_FRAME_DEPTH(dc, index) rb_debug_inspector_frame_depth(dc, index)
 
 /**
- * Return current frmae depth.
+ * Return current frame depth.
  *
  * @retval     The depth of the current frame in Integer.
  */
@@ -479,7 +479,7 @@ RBIMPL_ATTR_RETURNS_NONNULL()
  */
 rb_trace_arg_t *rb_tracearg_from_tracepoint(VALUE tpval);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the event of the passed trace.
  *
@@ -488,7 +488,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 rb_event_flag_t rb_tracearg_event_flag(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Identical to  rb_tracearg_event_flag(), except  it returns  the name  of the
  * event in Ruby's symbol.
@@ -498,7 +498,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_event(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the line of the point where the trace is at.
  *
@@ -508,7 +508,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_lineno(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the file name of the point where the trace is at.
  *
@@ -518,7 +518,19 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_path(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
+/**
+ *
+ * Queries the parameters passed on a call or return event.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event does not support querying parameters.
+ * @return     Array of parameters in the format of `Method#parameters`.
+ *
+ */
+VALUE rb_tracearg_parameters(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the method name of the point where the trace is at.
  *
@@ -528,7 +540,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_method_id(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Identical  to  rb_tracearg_method_id(), except  it  returns  callee id  like
  * rb_frame_callee().
@@ -539,7 +551,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_callee_id(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the class that defines the method that the passed trace is at.  This
  * can be different from the class of rb_tracearg_self()'s return value because
@@ -551,7 +563,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_defined_class(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Creates a binding object of the point where the trace is at.
  *
@@ -566,7 +578,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_binding(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the receiver of the point trace is at.
  *
@@ -575,7 +587,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_self(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the return value that the trace represents.
  *
@@ -585,7 +597,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_return_value(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the raised exception that the trace represents.
  *
@@ -595,7 +607,33 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_raised_exception(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
+/**
+ * Queries the compiled source code of the 'script_compiled' event.
+ * If loaded from a file, it will return nil.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event is not 'script_compiled'.
+ * @retval     RUBY_Qnil         The script was loaded from a file.
+ * @retval     otherwise         The compiled source code.
+ *
+ */
+VALUE rb_tracearg_eval_script(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
+/**
+ *
+ * Queries the compiled instruction sequence on a 'script_compiled' event.
+ * Note that this method is MRI specific.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event is not 'script_compiled'.
+ * @return     The `RubyVM::InstructionSequence` object representing the instruction sequence.
+ *
+ */
+VALUE rb_tracearg_instruction_sequence(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the allocated/deallocated object that the trace represents.
  *
@@ -715,59 +753,6 @@ rb_postponed_job_handle_t rb_postponed_job_preregister(unsigned int flags, rb_po
  * @params[in]  h   A handle returned from rb_postponed_job_preregister
  */
 void rb_postponed_job_trigger(rb_postponed_job_handle_t h);
-
-/**
- * Schedules the given `func` to be called with `data` when Ruby next checks for
- * interrupts. If this function is called multiple times in between Ruby checking
- * for interrupts, then `func` will be called only once with the `data` value from
- * the first call to this function.
- *
- * Like `rb_postponed_job_trigger`, the context in which the job is called
- * holds the GVL and can allocate Ruby objects.
- *
- * This method essentially has the same semantics as:
- *
- * ```
- *   rb_postponed_job_trigger(rb_postponed_job_preregister(func, data));
- * ```
- *
- * @note    Previous versions of Ruby promised that the (`func`, `data`) pairs would
- *          be executed as many times as they were registered with this function; in
- *          reality this was always subject to race conditions and this function no
- *          longer provides this guarantee. Instead, multiple calls to this function
- *          can be coalesced into a single execution of the passed `func`, with the
- *          most recent `data` registered at that time passed in.
- *
- * @deprecated  This interface implies that arbitrarily many `func`'s can be enqueued
- *              over the lifetime of the program, whilst in reality the registration
- *              slots for postponed jobs are a finite resource. This is made clearer
- *              by the `rb_postponed_job_preregister` and `rb_postponed_job_trigger`
- *              functions, and a future version of Ruby might delete this function.
- *
- * @param[in]      flags      Unused and ignored.
- * @param[in]      func       Job body.
- * @param[in,out]  data       Passed as-is to `func`.
- * @retval         0          Postponed job registration table is full. Failed.
- * @retval         1          Registration succeeded.
- * @post           The passed job will run on the next interrupt check.
- */
- RBIMPL_ATTR_DEPRECATED(("use rb_postponed_job_preregister and rb_postponed_job_trigger"))
-int rb_postponed_job_register(unsigned int flags, rb_postponed_job_func_t func, void *data);
-
-/**
- * Identical to `rb_postponed_job_register`
- *
- * @deprecated  This is deprecated for the same reason as `rb_postponed_job_register`
- *
- * @param[in]      flags      Unused and ignored.
- * @param[in]      func       Job body.
- * @param[in,out]  data       Passed as-is to `func`.
- * @retval         0          Postponed job registration table is full. Failed.
- * @retval         1          Registration succeeded.
- * @post           The passed job will run on the next interrupt check.
- */
- RBIMPL_ATTR_DEPRECATED(("use rb_postponed_job_preregister and rb_postponed_job_trigger"))
-int rb_postponed_job_register_one(unsigned int flags, rb_postponed_job_func_t func, void *data);
 
 /** @} */
 

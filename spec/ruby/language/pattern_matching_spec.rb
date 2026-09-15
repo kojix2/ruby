@@ -164,16 +164,8 @@ describe "Pattern matching" do
         @src = '[0, 1] => [a, b]'
       end
 
-      ruby_version_is ""..."3.1" do
-        it "warns about pattern matching is experimental feature" do
-          -> { eval @src }.should complain(/pattern matching is experimental, and the behavior may change in future versions of Ruby!/i)
-        end
-      end
-
-      ruby_version_is "3.1" do
-        it "does not warn about pattern matching is experimental feature" do
-          -> { eval @src }.should_not complain
-        end
+      it "does not warn about pattern matching is experimental feature" do
+        -> { eval @src }.should_not complain
       end
     end
   end
@@ -193,7 +185,7 @@ describe "Pattern matching" do
         in []
         end
       RUBY
-    }.should raise_error(SyntaxError, /syntax error, unexpected `in'|\(eval\):3: syntax error, unexpected keyword_in|unexpected 'in'/)
+    }.should.raise(SyntaxError, /syntax error, unexpected `in'|\(eval\):3: syntax error, unexpected keyword_in|unexpected 'in'/)
 
     -> {
       eval <<~RUBY
@@ -202,7 +194,7 @@ describe "Pattern matching" do
         when 1 == 1
         end
       RUBY
-    }.should raise_error(SyntaxError, /syntax error, unexpected `when'|\(eval\):3: syntax error, unexpected keyword_when|unexpected 'when'/)
+    }.should.raise(SyntaxError, /syntax error, unexpected `when'|\(eval\):3: syntax error, unexpected keyword_when|unexpected 'when'/)
   end
 
   it "checks patterns until the first matching" do
@@ -230,14 +222,14 @@ describe "Pattern matching" do
       case [0, 1]
       in [0]
       end
-    }.should raise_error(NoMatchingPatternError, /\[0, 1\]/)
+    }.should.raise(NoMatchingPatternError, /\[0, 1\]/)
 
     error_pattern = ruby_version_is("3.4") ? /\{a: 0, b: 1\}/ : /\{:a=>0, :b=>1\}/
     -> {
       case {a: 0, b: 1}
       in a: 1, b: 1
       end
-    }.should raise_error(NoMatchingPatternError, error_pattern)
+    }.should.raise(NoMatchingPatternError, error_pattern)
   end
 
   it "raises NoMatchingPatternError if no pattern matches and evaluates the expression only once" do
@@ -246,7 +238,7 @@ describe "Pattern matching" do
       case (evals += 1; [0, 1])
       in [0]
       end
-    }.should raise_error(NoMatchingPatternError, /\[0, 1\]/)
+    }.should.raise(NoMatchingPatternError, /\[0, 1\]/)
     evals.should == 1
   end
 
@@ -258,7 +250,7 @@ describe "Pattern matching" do
           true
         end
       RUBY
-    }.should raise_error(SyntaxError, /unexpected|expected a delimiter after the patterns of an `in` clause/)
+    }.should.raise(SyntaxError, /unexpected|expected a delimiter after the patterns of an `in` clause/)
   end
 
   it "evaluates the case expression once for multiple patterns, caching the result" do
@@ -344,7 +336,7 @@ describe "Pattern matching" do
         case [0, 1]
         in [0, 1] if false
         end
-      }.should raise_error(NoMatchingPatternError, /\[0, 1\]/)
+      }.should.raise(NoMatchingPatternError, /\[0, 1\]/)
     end
   end
 
@@ -446,7 +438,7 @@ describe "Pattern matching" do
           in [a, a]
           end
         RUBY
-      }.should raise_error(SyntaxError, /duplicated variable name/)
+      }.should.raise(SyntaxError, /duplicated variable name/)
     end
 
     it "supports existing variables in a pattern specified with ^ operator" do
@@ -482,7 +474,7 @@ describe "Pattern matching" do
             false
           end
         RUBY
-      }.should raise_error(SyntaxError, /n: no such local variable/)
+      }.should.raise(SyntaxError, /n: no such local variable/)
     end
   end
 
@@ -501,7 +493,7 @@ describe "Pattern matching" do
           in [0, 0] | [0, a]
           end
         RUBY
-      }.should raise_error(SyntaxError, /illegal variable in alternative pattern/)
+      }.should.raise(SyntaxError)
     end
 
     it "support underscore prefixed variables in alternation" do
@@ -682,7 +674,7 @@ describe "Pattern matching" do
         in Object[]
         else
         end
-      }.should raise_error(TypeError, /deconstruct must return Array/)
+      }.should.raise(TypeError, /deconstruct must return Array/)
     end
 
     it "accepts a subclass of Array from #deconstruct" do
@@ -878,7 +870,7 @@ describe "Pattern matching" do
           in {"a" => 1}
           end
         RUBY
-      }.should raise_error(SyntaxError, /unexpected|expected a label as the key in the hash pattern/)
+      }.should.raise(SyntaxError, /unexpected|expected a label as the key in the hash pattern/)
     end
 
     it "does not support string interpolation in keys" do
@@ -888,7 +880,7 @@ describe "Pattern matching" do
           in {"#{x}": 1}
           end
         RUBY
-      }.should raise_error(SyntaxError, /symbol literal with interpolation is not allowed|expected a label as the key in the hash pattern/)
+      }.should.raise(SyntaxError, /symbol literal with interpolation is not allowed|expected a label as the key in the hash pattern/)
     end
 
     it "raise SyntaxError when keys duplicate in pattern" do
@@ -898,7 +890,18 @@ describe "Pattern matching" do
           in {a: 1, b: 2, a: 3}
           end
         RUBY
-      }.should raise_error(SyntaxError, /duplicated key name/)
+      }.should.raise(SyntaxError, /duplicated key name/)
+    end
+
+    it "raises NoMatchingPatternKeyError if the key does not match" do
+      kwargs = {a: 1}
+      -> do
+        case kwargs
+        in {b: 2}
+        end
+      end.should.raise(NoMatchingPatternKeyError, message: "key not found: :b")
+
+      NoMatchingPatternKeyError.superclass.should == NoMatchingPatternError
     end
 
     it "matches an object with #deconstruct_keys method which returns a Hash with equal keys and each value in Hash matches value in pattern" do
@@ -977,7 +980,7 @@ describe "Pattern matching" do
         case obj
         in Object[a: 1]
         end
-      }.should raise_error(TypeError, /deconstruct_keys must return Hash/)
+      }.should.raise(TypeError, /deconstruct_keys must return Hash/)
     end
 
     it "does not match object if #deconstruct_keys method returns Hash with non-symbol keys" do
@@ -1220,8 +1223,99 @@ describe "Pattern matching" do
       result.should == true
     end
   end
-end
 
-ruby_version_is "3.1" do
-  require_relative 'pattern_matching/3.1'
+  describe "Ruby 3.1 improvements" do
+    it "can omit parentheses in one line pattern matching" do
+      [1, 2] => a, b
+      [a, b].should == [1, 2]
+
+      {a: 1} => a:
+      a.should == 1
+    end
+
+    it "supports pinning instance variables" do
+      @a = /a/
+      case 'abc'
+      in ^@a
+        true
+      end.should == true
+    end
+
+    it "supports pinning class variables" do
+      result = nil
+      Module.new do
+        # avoid "class variable access from toplevel" runtime error with #module_eval
+        result = module_eval(<<~RUBY)
+          @@a = 0..10
+
+          case 2
+          in ^@@a
+            true
+          end
+        RUBY
+      end
+
+      result.should == true
+    end
+
+    it "supports pinning global variables" do
+      $a = /a/
+      case 'abc'
+      in ^$a
+        true
+      end.should == true
+    end
+
+    it "supports pinning expressions" do
+      case 'abc'
+      in ^(/a/)
+        true
+      end.should == true
+
+      case 0
+      in ^(0 + 0)
+        true
+      end.should == true
+    end
+
+    it "supports pinning expressions in array pattern" do
+      case [3]
+      in [^(1 + 2)]
+        true
+      end.should == true
+    end
+
+    it "supports pinning expressions in hash pattern" do
+      case {name: '2.6', released_at: Time.new(2018, 12, 25)}
+      in {released_at: ^(Time.new(2010)..Time.new(2020))}
+        true
+      end.should == true
+    end
+  end
+
+  describe "value in pattern" do
+    it "returns true if the pattern matches" do
+      (1 in 1).should == true
+
+      (1 in Integer).should == true
+
+      e = nil
+      ([1, 2] in [1, e]).should == true
+      e.should == 2
+
+      k = nil
+      ({k: 1} in {k:}).should == true
+      k.should == 1
+    end
+
+    it "returns false if the pattern does not match" do
+      (1 in 2).should == false
+
+      (1 in Float).should == false
+
+      ([1, 2] in [2, e]).should == false
+
+      ({k: 1} in {k: 2}).should == false
+    end
+  end
 end

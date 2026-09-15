@@ -14,6 +14,8 @@ static VALUE sym_wait_writable;
 
 static VALUE sock_s_unpack_sockaddr_in(VALUE, VALUE);
 
+ID tcp_fast_fallback;
+
 void
 rsock_sys_fail_host_port(const char *mesg, VALUE host, VALUE port)
 {
@@ -871,7 +873,8 @@ sock_gethostname(VALUE obj)
         rb_str_modify_expand(name, len);
         len += len;
     }
-    rb_str_resize(name, strlen(RSTRING_PTR(name)));
+    char *s = RSTRING_PTR(name), *p = memchr(s, 0, len);
+    if (p) rb_str_resize(name, (long)(p - s));
     return name;
 }
 #else
@@ -913,134 +916,6 @@ make_addrinfo(struct rb_addrinfo *res0, int norevlookup)
         rb_ary_push(base, ary);
     }
     return base;
-}
-
-static VALUE
-sock_sockaddr(struct sockaddr *addr, socklen_t len)
-{
-    char *ptr;
-
-    switch (addr->sa_family) {
-      case AF_INET:
-        ptr = (char*)&((struct sockaddr_in*)addr)->sin_addr.s_addr;
-        len = (socklen_t)sizeof(((struct sockaddr_in*)addr)->sin_addr.s_addr);
-        break;
-#ifdef AF_INET6
-      case AF_INET6:
-        ptr = (char*)&((struct sockaddr_in6*)addr)->sin6_addr.s6_addr;
-        len = (socklen_t)sizeof(((struct sockaddr_in6*)addr)->sin6_addr.s6_addr);
-        break;
-#endif
-      default:
-        rb_raise(rb_eSocket, "unknown socket family:%d", addr->sa_family);
-        break;
-    }
-    return rb_str_new(ptr, len);
-}
-
-/*
- * call-seq:
- *   Socket.gethostbyname(hostname) => [official_hostname, alias_hostnames, address_family, *address_list]
- *
- * Use Addrinfo.getaddrinfo instead.
- * This method is deprecated for the following reasons:
- *
- * - The 3rd element of the result is the address family of the first address.
- *   The address families of the rest of the addresses are not returned.
- * - Uncommon address representation:
- *   4/16-bytes binary string to represent IPv4/IPv6 address.
- * - gethostbyname() may take a long time and it may block other threads.
- *   (GVL cannot be released since gethostbyname() is not thread safe.)
- * - This method uses gethostbyname() function already removed from POSIX.
- *
- * This method obtains the host information for _hostname_.
- *
- *   p Socket.gethostbyname("hal") #=> ["localhost", ["hal"], 2, "\x7F\x00\x00\x01"]
- *
- */
-static VALUE
-sock_s_gethostbyname(VALUE obj, VALUE host)
-{
-    rb_warn("Socket.gethostbyname is deprecated; use Addrinfo.getaddrinfo instead.");
-    struct rb_addrinfo *res =
-        rsock_addrinfo(host, Qnil, AF_UNSPEC, SOCK_STREAM, AI_CANONNAME);
-    return rsock_make_hostent(host, res, sock_sockaddr);
-}
-
-/*
- * call-seq:
- *   Socket.gethostbyaddr(address_string [, address_family]) => hostent
- *
- * Use Addrinfo#getnameinfo instead.
- * This method is deprecated for the following reasons:
- *
- * - Uncommon address representation:
- *   4/16-bytes binary string to represent IPv4/IPv6 address.
- * - gethostbyaddr() may take a long time and it may block other threads.
- *   (GVL cannot be released since gethostbyname() is not thread safe.)
- * - This method uses gethostbyname() function already removed from POSIX.
- *
- * This method obtains the host information for _address_.
- *
- *   p Socket.gethostbyaddr([221,186,184,68].pack("CCCC"))
- *   #=> ["carbon.ruby-lang.org", [], 2, "\xDD\xBA\xB8D"]
- *
- *   p Socket.gethostbyaddr([127,0,0,1].pack("CCCC"))
- *   ["localhost", [], 2, "\x7F\x00\x00\x01"]
- *   p Socket.gethostbyaddr(([0]*15+[1]).pack("C"*16))
- *   #=> ["localhost", ["ip6-localhost", "ip6-loopback"], 10,
- *        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"]
- *
- */
-static VALUE
-sock_s_gethostbyaddr(int argc, VALUE *argv, VALUE _)
-{
-    VALUE addr, family;
-    struct hostent *h;
-    char **pch;
-    VALUE ary, names;
-    int t = AF_INET;
-
-    rb_warn("Socket.gethostbyaddr is deprecated; use Addrinfo#getnameinfo instead.");
-
-    rb_scan_args(argc, argv, "11", &addr, &family);
-    StringValue(addr);
-    if (!NIL_P(family)) {
-        t = rsock_family_arg(family);
-    }
-#ifdef AF_INET6
-    else if (RSTRING_LEN(addr) == 16) {
-        t = AF_INET6;
-    }
-#endif
-    h = gethostbyaddr(RSTRING_PTR(addr), RSTRING_SOCKLEN(addr), t);
-    if (h == NULL) {
-#ifdef HAVE_HSTRERROR
-        extern int h_errno;
-        rb_raise(rb_eSocket, "%s", (char*)hstrerror(h_errno));
-#else
-        rb_raise(rb_eSocket, "host not found");
-#endif
-    }
-    ary = rb_ary_new();
-    rb_ary_push(ary, rb_str_new2(h->h_name));
-    names = rb_ary_new();
-    rb_ary_push(ary, names);
-    if (h->h_aliases != NULL) {
-        for (pch = h->h_aliases; *pch; pch++) {
-            rb_ary_push(names, rb_str_new2(*pch));
-        }
-    }
-    rb_ary_push(ary, INT2NUM(h->h_addrtype));
-#ifdef h_addr
-    for (pch = h->h_addr_list; *pch; pch++) {
-        rb_ary_push(ary, rb_str_new(*pch, h->h_length));
-    }
-#else
-    rb_ary_push(ary, rb_str_new(h->h_addr, h->h_length));
-#endif
-
-    return ary;
 }
 
 /*
@@ -1181,7 +1056,7 @@ sock_s_getaddrinfo(int argc, VALUE *argv, VALUE _)
         norevlookup = rsock_do_not_reverse_lookup;
     }
 
-    res = rsock_getaddrinfo(host, port, &hints, 0);
+    res = rsock_getaddrinfo(host, port, &hints, 0, Qnil);
 
     ret = make_addrinfo(res, norevlookup);
     rb_freeaddrinfo(res);
@@ -1277,7 +1152,7 @@ sock_s_getnameinfo(int argc, VALUE *argv, VALUE _)
         hints.ai_socktype = (fl & NI_DGRAM) ? SOCK_DGRAM : SOCK_STREAM;
         /* af */
         hints.ai_family = NIL_P(af) ? PF_UNSPEC : rsock_family_arg(af);
-        res = rsock_getaddrinfo(host, port, &hints, 0);
+        res = rsock_getaddrinfo(host, port, &hints, 0, Qnil);
         sap = res->ai->ai_addr;
         salen = res->ai->ai_addrlen;
     }
@@ -1333,7 +1208,7 @@ sock_s_getnameinfo(int argc, VALUE *argv, VALUE _)
 static VALUE
 sock_s_pack_sockaddr_in(VALUE self, VALUE port, VALUE host)
 {
-    struct rb_addrinfo *res = rsock_addrinfo(host, port, AF_UNSPEC, 0, 0);
+    struct rb_addrinfo *res = rsock_addrinfo(host, port, AF_UNSPEC, 0, 0, Qnil);
     VALUE addr = rb_str_new((char*)res->ai->ai_addr, res->ai->ai_addrlen);
 
     rb_freeaddrinfo(res);
@@ -1854,6 +1729,67 @@ socket_s_ip_address_list(VALUE self)
 #define socket_s_ip_address_list rb_f_notimplement
 #endif
 
+/*
+ * call-seq:
+ *   Socket.tcp_fast_fallback -> true or false
+ *
+ * Returns whether Happy Eyeballs Version 2 ({RFC 8305}[https://datatracker.ietf.org/doc/html/rfc8305]),
+ * which is provided starting from Ruby 3.4 when using TCPSocket.new and Socket.tcp,
+ * is enabled or disabled.
+ *
+ * If true, it is enabled for TCPSocket.new and Socket.tcp.
+ * (Note: Happy Eyeballs Version 2 is not provided when using TCPSocket.new on Windows.)
+ *
+ * If false, Happy Eyeballs Version 2 is disabled.
+ *
+ * For details on Happy Eyeballs Version 2,
+ * see {Socket.tcp_fast_fallback=}[rdoc-ref:Socket.tcp_fast_fallback=].
+ */
+VALUE socket_s_tcp_fast_fallback(VALUE self) {
+    return rb_ivar_get(rb_cSocket, tcp_fast_fallback);
+}
+
+/*
+ * call-seq:
+ *   Socket.tcp_fast_fallback= -> true or false
+ *
+ * Enable or disable Happy Eyeballs Version 2 ({RFC 8305}[https://datatracker.ietf.org/doc/html/rfc8305])
+ * globally, which is provided starting from Ruby 3.4 when using TCPSocket.new and Socket.tcp.
+ *
+ * When set to true, the feature is enabled for both `TCPSocket.new` and `Socket.tcp`.
+ * (Note: This feature is not available when using TCPSocket.new on Windows.)
+ *
+ * When set to false, the behavior reverts to that of Ruby 3.3 or earlier.
+ *
+ * The default value is true if no value is explicitly set by calling this method.
+ * However, when the environment variable RUBY_TCP_NO_FAST_FALLBACK=1 is set,
+ * the default is false.
+ *
+ * To control the setting on a per-method basis, use the fast_fallback keyword argument for each method.
+ *
+ * === Happy Eyeballs Version 2
+ * Happy Eyeballs Version 2 ({RFC 8305}[https://datatracker.ietf.org/doc/html/rfc8305])
+ * is an algorithm designed to improve client socket connectivity.<br>
+ * It aims for more reliable and efficient connections by performing hostname resolution
+ * and connection attempts in parallel, instead of serially.
+ *
+ * Starting from Ruby 3.4, this method operates as follows with this algorithm:
+ *
+ * 1. Start resolving both IPv6 and IPv4 addresses concurrently.
+ * 2. Start connecting to the one of the addresses that are obtained first.<br>If IPv4 addresses are obtained first,
+ *    the method waits 50 ms for IPv6 name resolution to prioritize IPv6 connections.
+ * 3. After starting a connection attempt, wait 250 ms for the connection to be established.<br>
+ *    If no connection is established within this time, a new connection is started every 250 ms<br>
+ *    until a connection is  established or there are no more candidate addresses.<br>
+ *    (Although RFC 8305 strictly specifies sorting addresses,<br>
+ *    this method only alternates between IPv6 / IPv4 addresses due to the performance concerns)
+ * 4. Once a connection is established, all remaining connection attempts are canceled.
+ */
+VALUE socket_s_tcp_fast_fallback_set(VALUE self, VALUE value) {
+    rb_ivar_set(rb_cSocket, tcp_fast_fallback, value);
+    return value;
+}
+
 void
 Init_socket(void)
 {
@@ -1982,6 +1918,16 @@ Init_socket(void)
 
     rsock_init_socket_init();
 
+    const char *tcp_no_fast_fallback_config = getenv("RUBY_TCP_NO_FAST_FALLBACK");
+    VALUE fast_fallback_default;
+    if (tcp_no_fast_fallback_config == NULL || strcmp(tcp_no_fast_fallback_config, "0") == 0) {
+        fast_fallback_default = Qtrue;
+    } else {
+        fast_fallback_default = Qfalse;
+    }
+    tcp_fast_fallback = rb_intern_const("tcp_fast_fallback");
+    rb_ivar_set(rb_cSocket, tcp_fast_fallback, fast_fallback_default);
+
     rb_define_method(rb_cSocket, "initialize", sock_initialize, -1);
     rb_define_method(rb_cSocket, "connect", sock_connect, 1);
 
@@ -2008,8 +1954,6 @@ Init_socket(void)
     rb_define_singleton_method(rb_cSocket, "socketpair", rsock_sock_s_socketpair, -1);
     rb_define_singleton_method(rb_cSocket, "pair", rsock_sock_s_socketpair, -1);
     rb_define_singleton_method(rb_cSocket, "gethostname", sock_gethostname, 0);
-    rb_define_singleton_method(rb_cSocket, "gethostbyname", sock_s_gethostbyname, 1);
-    rb_define_singleton_method(rb_cSocket, "gethostbyaddr", sock_s_gethostbyaddr, -1);
     rb_define_singleton_method(rb_cSocket, "getservbyname", sock_s_getservbyname, -1);
     rb_define_singleton_method(rb_cSocket, "getservbyport", sock_s_getservbyport, -1);
     rb_define_singleton_method(rb_cSocket, "getaddrinfo", sock_s_getaddrinfo, -1);
@@ -2024,6 +1968,9 @@ Init_socket(void)
 #endif
 
     rb_define_singleton_method(rb_cSocket, "ip_address_list", socket_s_ip_address_list, 0);
+
+    rb_define_singleton_method(rb_cSocket, "tcp_fast_fallback", socket_s_tcp_fast_fallback, 0);
+    rb_define_singleton_method(rb_cSocket, "tcp_fast_fallback=", socket_s_tcp_fast_fallback_set, 1);
 
 #undef rb_intern
     sym_wait_writable = ID2SYM(rb_intern("wait_writable"));

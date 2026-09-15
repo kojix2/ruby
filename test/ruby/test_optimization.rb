@@ -211,7 +211,7 @@ class TestRubyOptimization < Test::Unit::TestCase
                 :&, :|, :[], :[]=, :length, :empty?, :nil?, :succ, :!, :=~]
     [:c_call, :c_return].each do |type|
       methods = []
-      tp = TracePoint.new(type) { |tp| methods << tp.method_id }
+      tp = TracePoint.new(type) { |tp| methods << tp.method_id if tp.path == __FILE__ }
       tp.enable do
         x = "a"; x = -x
         [1].max
@@ -243,7 +243,7 @@ class TestRubyOptimization < Test::Unit::TestCase
     end
 
     methods = []
-    tp = TracePoint.new(:c_call, :c_return) { |tp| methods << tp.method_id }
+    tp = TracePoint.new(:c_call, :c_return) { |tp| methods << tp.method_id if tp.path == __FILE__ }
     tp.enable do
       x = 1
       x != 42
@@ -591,7 +591,6 @@ class TestRubyOptimization < Test::Unit::TestCase
   end
 
   def test_tailcall_not_to_grow_stack
-    omit 'currently JIT-ed code always creates a new stack frame' if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
     bug16161 = '[ruby-core:94881]'
 
     tailcall("#{<<-"begin;"}\n#{<<~"end;"}")
@@ -607,11 +606,11 @@ class TestRubyOptimization < Test::Unit::TestCase
   end
 
   class Bug10557
-    def [](_)
+    def [](_, &)
       block_given?
     end
 
-    def []=(_, _)
+    def []=(_, _, &)
       block_given?
     end
   end
@@ -729,7 +728,7 @@ class TestRubyOptimization < Test::Unit::TestCase
       insn = iseq.disasm
       assert_match %r{putobject\s+#{Regexp.quote('"1.8.0"..."1.8.8"')}}, insn
       assert_match %r{putobject\s+#{Regexp.quote('"2.0.0".."2.3.2"')}}, insn
-      assert_no_match(/putstring/, insn)
+      assert_no_match(/dupstring/, insn)
       assert_no_match(/newrange/, insn)
     end
   end
@@ -946,15 +945,91 @@ class TestRubyOptimization < Test::Unit::TestCase
     END
   end
 
-  def test_peephole_optimization_without_trace
+  def bptest_call(&b) = b.call(1, 2)
+  def bptest_aref(&b) = b[1, 2]
+  def bptest_dot_yield(&b) = b.yield(1, 2)
+  def bptest_eqq(&b) = b === 2
+
+  def test_block_param_proxy_aref_yield_and_eqq
+    %i[bptest_call bptest_aref bptest_dot_yield bptest_eqq].each do |name|
+      assert_include(RubyVM::InstructionSequence.of(method(name)).disasm,
+                     "getblockparamproxy", "#{name} should use the block param proxy")
+    end
+    assert_equal(3, bptest_call {|a, b| a + b})
+    assert_equal(3, bptest_aref {|a, b| a + b})
+    assert_equal(3, bptest_dot_yield {|a, b| a + b})
+    assert_equal(3, bptest_eqq {|a| a + 1})
+  end
+
+  def test_block_param_proxy_should_not_create_objects
     assert_separately [], <<-END
+      def viacall(&b) = b.call
+      def viaaref(&b) = b[]
+      def viayield(&b) = b.yield
+      def viaeqq(&b) = b === 1
+      viacall{}; viaaref{}; viayield{}; viaeqq{} # warm up caches
+      h1 = {}; h2 = {}
+      ObjectSpace.count_objects(h1)
+      GC.start; GC.disable
+      ObjectSpace.count_objects(h1)
+      1000.times { viacall{}; viaaref{}; viayield{}; viaeqq{} }
+      ObjectSpace.count_objects(h2)
+
+      # The proxy avoids materializing a Proc (T_DATA), so allocations must
+      # not scale with the number of calls.
+      assert_operator(h2[:T_DATA] - h1[:T_DATA], :<, 1000)
+    END
+  end
+
+  def test_block_param_proxy_honors_redefinition
+    assert_separately [], <<-END
+      $VERBOSE = nil # silence "method redefined" warnings
+      def viacall(&b) = b.call
+      def viaaref(&b) = b[]
+      def viayield(&b) = b.yield
+      def viaeqq(&b) = b === 1
+
+      assert_equal(:orig, viacall { :orig })
+      assert_equal(:orig, viaaref { :orig })
+      assert_equal(:orig, viayield { :orig })
+      assert_equal(:orig, viaeqq { :orig })
+
+      class Proc
+        def [](*) = :redef_aref
+      end
+      assert_equal(:redef_aref, viaaref { :orig }, "redefining Proc#[] must deopt blk[]")
+      assert_equal(:orig, viacall { :orig }, "Proc#[] redefinition must not affect blk.call")
+      assert_equal(:orig, viayield { :orig }, "Proc#[] redefinition must not affect blk.yield")
+      assert_equal(:orig, viaeqq { :orig }, "Proc#[] redefinition must not affect blk === x")
+
+      class Proc
+        def yield(*) = :redef_yield
+      end
+      assert_equal(:redef_yield, viayield { :orig }, "redefining Proc#yield must deopt blk.yield")
+      assert_equal(:orig, viacall { :orig }, "Proc#yield redefinition must not affect blk.call")
+
+      class Proc
+        def ===(*) = :redef_eqq
+      end
+      assert_equal(:redef_eqq, viaeqq { :orig }, "redefining Proc#=== must deopt blk === x")
+      assert_equal(:orig, viacall { :orig }, "Proc#=== redefinition must not affect blk.call")
+
+      class Proc
+        def call(*) = :redef_call
+      end
+      assert_equal(:redef_call, viacall { :orig }, "redefining Proc#call must deopt blk.call")
+    END
+  end
+
+  def test_peephole_optimization_without_trace
+    assert_ruby_status [], <<-END
       RubyVM::InstructionSequence.compile_option = {trace_instruction: false}
       eval "def foo; 1.times{|(a), &b| nil && a}; end"
     END
   end
 
   def test_clear_unreachable_keyword_args
-    assert_separately [], <<-END, timeout: 60
+    assert_ruby_status [], <<-END, timeout: 60
       script =  <<-EOS
         if true
         else
@@ -1048,6 +1123,21 @@ class TestRubyOptimization < Test::Unit::TestCase
     assert_equal(:ok, x.bug)
   end
 
+  def test_peephole_branch_dup_with_label_after_dup
+    assert_ruby_status [], <<-END
+      src = <<~'SRC'
+        $g&.call&.to_s
+        [*d, [__dir__].each(&:each), C1.value(/ab/o, &b)].each {}
+        begin
+          ((-243 != qux) ? (1..2) : 8i&.value) => ^([1].select(&:to_s))
+        rescue
+          ((-243 != qux) ? (1..2) : 8i&.value) => ^([1].select(&:to_s))
+        end
+      SRC
+      RubyVM::InstructionSequence.compile(src)
+    END
+  end
+
   def test_peephole_jump_after_newarray
     i = 0
     %w(1) || 2 while (i += 1) < 100
@@ -1081,7 +1171,7 @@ class TestRubyOptimization < Test::Unit::TestCase
   class Objtostring
   end
 
-  def test_objtostring
+  def test_objtostring_immediate
     assert_raise(NoMethodError){"#{BasicObject.new}"}
     assert_redefine_method('Symbol', 'to_s', <<-'end')
       assert_match %r{\A#<Symbol:0x[0-9a-f]+>\z}, "#{:foo}"
@@ -1095,16 +1185,192 @@ class TestRubyOptimization < Test::Unit::TestCase
     assert_redefine_method('FalseClass', 'to_s', <<-'end')
       assert_match %r{\A#<FalseClass:0x[0-9a-f]+>\z}, "#{false}"
     end
+  end
+
+  def test_objtostring_fixnum
     assert_redefine_method('Integer', 'to_s', <<-'end')
       (-1..10).each { |i|
         assert_match %r{\A#<Integer:0x[0-9a-f]+>\z}, "#{i}"
       }
     end
+  end
+
+  def test_objtostring
     assert_equal "TestRubyOptimization::Objtostring", "#{Objtostring}"
     assert_match %r{\A#<Class:0x[0-9a-f]+>\z}, "#{Class.new}"
     assert_match %r{\A#<Module:0x[0-9a-f]+>\z}, "#{Module.new}"
     o = Object.new
     def o.to_s; 1; end
     assert_match %r{\A#<Object:0x[0-9a-f]+>\z}, "#{o}"
+  end
+
+  def test_opt_duparray_send_include_p
+    [
+      'x = :b; [:a, :b].include?(x)',
+      '@c = :b; [:a, :b].include?(@c)',
+      '@c = "b"; %i[a b].include?(@c.to_sym)',
+      '[:a, :b].include?(self) == false',
+      "[:a, :b].include?(:a)",
+      "[true, false].include?(false)",
+      "[1, nil].include?(nil)",
+      "# frozen_string_literal: true\n['a', 'b'].include?('a')",
+      "# frozen_string_literal: true\n['a', 'b'].include?('c') == false",
+      "# frozen_string_literal: true\n['a', 'b'].include?(2) == false",
+      "# frozen_string_literal: true\n['a', 'b'].include?(/a/) == false",
+    ].each do |code|
+      iseq = RubyVM::InstructionSequence.compile(code)
+      insn = iseq.disasm
+      assert_match(/opt_duparray_send/, insn)
+      assert_no_match(/\bduparray\b/, insn)
+      assert_equal(true, eval(code))
+    end
+
+    x, y = :b, :c
+    assert_equal(true,  [:a, :b].include?(x))
+    assert_equal(false, [:a, :b].include?(y))
+
+    assert_in_out_err([], <<~RUBY, ["1,2", "3,3", "1,2", "4,4"])
+      class Array
+        prepend(Module.new do
+          def include?(i)
+            puts self.join(",")
+            # Modify self to prove that we are operating on a copy.
+            map! { i }
+            puts self.join(",")
+          end
+        end)
+      end
+      def x(i)
+        [1, 2].include?(i)
+      end
+      x(3)
+      x(4)
+    RUBY
+
+    # Ensure raises happen correctly.
+    assert_in_out_err([], <<~RUBY, ["will raise", "int 1 not 3"])
+      class Integer
+        undef_method :==
+        def == x
+          raise "int \#{self} not \#{x}"
+        end
+      end
+      x = 3
+      puts "will raise"
+      begin
+        p [1, 2].include?(x)
+      rescue
+        puts $!
+      end
+    RUBY
+  end
+
+  def test_opt_newarray_send_include_p
+    [
+      'b = :b; [:a, b].include?(:b)',
+      # Use Object.new to ensure that we get newarray rather than duparray.
+      'value = 1; [Object.new, true, "true", 1].include?(value)',
+      'value = 1; [Object.new, "1"].include?(value.to_s)',
+      '[Object.new, "1"].include?(self) == false',
+    ].each do |code|
+      iseq = RubyVM::InstructionSequence.compile(code)
+      insn = iseq.disasm
+      assert_match(/opt_newarray_send/, insn)
+      assert_no_match(/\bnewarray\b/, insn)
+      assert_equal(true, eval(code))
+    end
+
+    x, y = :b, :c
+    assert_equal(true,  [:a, x].include?(x))
+    assert_equal(false, [:a, x].include?(y))
+
+    assert_in_out_err([], <<~RUBY, ["1,3", "3,3", "1,4", "4,4"])
+      class Array
+        prepend(Module.new do
+          def include?(i)
+            puts self.join(",")
+            # Modify self to prove that we are operating on a copy.
+            map! { i }
+            puts self.join(",")
+          end
+        end)
+      end
+      def x(i)
+        [1, i].include?(i)
+      end
+      x(3)
+      x(4)
+    RUBY
+
+    # Ensure raises happen correctly.
+    assert_in_out_err([], <<~RUBY, ["will raise", "int 1 not 3"])
+      class Integer
+        undef_method :==
+        def == x
+          raise "int \#{self} not \#{x}"
+        end
+      end
+      x = 3
+      puts "will raise"
+      begin
+        p [1, x].include?(x)
+      rescue
+        puts $!
+      end
+    RUBY
+  end
+
+  def test_opt_new_with_safe_navigation
+    payload = nil
+    assert_nil payload&.new
+  end
+
+  def test_opt_new
+    pos_initialize = "
+      def initialize a, b
+        @a = a
+        @b = b
+      end
+    "
+    kw_initialize = "
+      def initialize a:, b:
+        @a = a
+        @b = b
+      end
+    "
+    kw_hash_initialize = "
+      def initialize a, **kw
+        @a = a
+        @b = kw[:b]
+      end
+    "
+    pos_prelude = "class OptNewFoo; #{pos_initialize}; end;"
+    kw_prelude = "class OptNewFoo; #{kw_initialize}; end;"
+    kw_hash_prelude = "class OptNewFoo; #{kw_hash_initialize}; end;"
+    [
+      "#{pos_prelude} OptNewFoo.new 1, 2",
+      "#{pos_prelude} a = 1; b = 2; OptNewFoo.new a, b",
+      "#{pos_prelude} def optnew_foo(a, b) = OptNewFoo.new(a, b); optnew_foo 1, 2",
+      "#{pos_prelude} def optnew_foo(*a) = OptNewFoo.new(*a); optnew_foo 1, 2",
+      "#{pos_prelude} def optnew_foo(...) = OptNewFoo.new(...); optnew_foo 1, 2",
+      "#{kw_prelude} def optnew_foo(**a) = OptNewFoo.new(**a); optnew_foo a: 1, b: 2",
+      "#{kw_hash_prelude} def optnew_foo(*a, **b) = OptNewFoo.new(*a, **b); optnew_foo 1, b: 2",
+    ].each do |code|
+      iseq = RubyVM::InstructionSequence.compile(code)
+      insn = iseq.disasm
+      assert_match(/opt_new/, insn)
+      assert_match(/OptNewFoo:.+@a=1, @b=2/, iseq.eval.inspect)
+      # clean up to avoid warnings
+      Object.send :remove_const, :OptNewFoo
+      Object.remove_method :optnew_foo if defined?(optnew_foo)
+    end
+    [
+      'def optnew_foo(&) = OptNewFoo.new(&)',
+      'def optnew_foo(a, ...) = OptNewFoo.new(a, ...)',
+    ].each do |code|
+      iseq = RubyVM::InstructionSequence.compile(code)
+      insn = iseq.disasm
+      assert_no_match(/opt_new/, insn)
+    end
   end
 end

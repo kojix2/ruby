@@ -3,7 +3,7 @@ bundle-open(1) -- Opens the source directory for a gem in your bundle
 
 ## SYNOPSIS
 
-`bundle open` [GEM] [--path=PATH]
+`bundle open` [GEM] [--path=PATH] [--exact-match]
 
 ## DESCRIPTION
 
@@ -23,5 +23,9 @@ Will open the source directory for the 'rack' gem in your bundle.
 Will open the README.md file of the 'rack' gem source in your bundle.
 
 ## OPTIONS
-* `--path`:
+
+* `--path[=PATH]`:
   Specify GEM source relative path to open.
+
+* `--exact-match`:
+  Only match gems whose names exactly match the given name.

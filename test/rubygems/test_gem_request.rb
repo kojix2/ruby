@@ -2,20 +2,12 @@
 
 require_relative "helper"
 require "rubygems/request"
-require "ostruct"
 
 unless Gem::HAVE_OPENSSL
   warn "Skipping Gem::Request tests.  openssl not found."
 end
 
 class TestGemRequest < Gem::TestCase
-  CA_CERT_FILE     = cert_path "ca"
-  CHILD_CERT       = load_cert "child"
-  EXPIRED_CERT     = load_cert "expired"
-  PUBLIC_CERT      = load_cert "public"
-  PUBLIC_CERT_FILE = cert_path "public"
-  SSL_CERT         = load_cert "ssl"
-
   def make_request(uri, request_class, last_modified, proxy)
     Gem::Request.create_with_proxy uri, request_class, last_modified, proxy
   end
@@ -249,7 +241,7 @@ class TestGemRequest < Gem::TestCase
 
     auth_header = conn.payload["Authorization"]
     assert_equal "Basic #{base64_encode64("{DEScede}pass:x-oauth-basic")}".strip, auth_header
-    assert_includes @ui.output, "GET https://REDACTED:x-oauth-basic@example.rubygems/specs.#{Gem.marshal_version}"
+    assert_includes @ui.output, "GET https://REDACTED@example.rubygems/specs.#{Gem.marshal_version}"
   end
 
   def test_fetch_head
@@ -364,19 +356,19 @@ class TestGemRequest < Gem::TestCase
   def test_verify_certificate_extra_message
     pend if Gem.java_platform?
 
-    error_number = OpenSSL::X509::V_ERR_INVALID_CA
+    error_number = OpenSSL::X509::V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
 
     store = OpenSSL::X509::Store.new
-    context = OpenSSL::X509::StoreContext.new store
-    context.error = error_number
+    context = OpenSSL::X509::StoreContext.new store, CHILD_CERT
+    context.verify
 
     use_ui @ui do
       Gem::Request.verify_certificate context
     end
 
     expected = <<-ERROR
-ERROR:  SSL verification error at depth 0: invalid CA certificate (#{error_number})
-ERROR:  Certificate  is an invalid CA certificate
+ERROR:  SSL verification error at depth 0: unable to get local issuer certificate (#{error_number})
+ERROR:  You must add #{CHILD_CERT.issuer} to your local trusted store
     ERROR
 
     assert_equal expected, @ui.error
@@ -501,11 +493,20 @@ ERROR:  Certificate  is an invalid CA certificate
 
   def util_stub_net_http(hash)
     old_client = Gem::Request::ConnectionPools.client
-    conn = Conn.new OpenStruct.new(hash)
+    conn = Conn.new Response.new(hash)
     Gem::Request::ConnectionPools.client = conn
     yield conn
   ensure
     Gem::Request::ConnectionPools.client = old_client
+  end
+
+  class Response
+    attr_reader :code, :body, :message
+
+    def initialize(hash)
+      @code = hash[:code]
+      @body = hash[:body]
+    end
   end
 
   class Conn

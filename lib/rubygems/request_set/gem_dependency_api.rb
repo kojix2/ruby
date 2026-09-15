@@ -13,7 +13,7 @@
 #   source 'https://rubygems.org'
 #
 #   gem 'rails', '3.2.14a
-#   gem 'devise', '~> 2.1', '>= 2.1.3'
+#   gem 'devise', '>= 2.1.3', '< 3'
 #   gem 'cancan'
 #   gem 'airbrake'
 #   gem 'pg'
@@ -330,7 +330,7 @@ class Gem::RequestSet::GemDependencyAPI
   # git: ::
   #   Install this dependency from a git repository:
   #
-  #     gem 'private_gem', git: git@my.company.example:private_gem.git'
+  #     gem 'private_gem', git: 'git@my.company.example:private_gem.git'
   #
   # gist: ::
   #   Install this dependency from the gist ID:

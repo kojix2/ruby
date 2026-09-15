@@ -1,7 +1,7 @@
 # -*- coding: us-ascii -*-
 # frozen_string_literal: true
 
-require_relative 'random/formatter'
+require 'random/formatter'
 
 # == Secure random number generator interface.
 #
@@ -18,7 +18,7 @@ require_relative 'random/formatter'
 # * /dev/urandom
 # * Win32
 #
-# Gem::SecureRandom is extended by the Gem::Random::Formatter module which
+# Gem::SecureRandom is extended by the Random::Formatter module which
 # defines the following methods:
 #
 # * alphanumeric
@@ -38,10 +38,14 @@ require_relative 'random/formatter'
 # If a secure random number generator is not available,
 # +NotImplementedError+ is raised.
 
+# Skip reloading when an identical copy (e.g. the one shipped inside the Bundler
+# gem) was already required from a different path, to avoid redefinition warnings.
+return if defined?(Gem::SecureRandom::VERSION)
+
 module Gem::SecureRandom
 
   # The version
-  VERSION = "0.3.1"
+  VERSION = "0.4.1"
 
   class << self
     # Returns a random binary string containing +size+ bytes.
@@ -50,6 +54,12 @@ module Gem::SecureRandom
     def bytes(n)
       return gen_random(n)
     end
+
+    # Compatibility methods for Ruby 3.2, we can remove this after dropping to support Ruby 3.2
+    def alphanumeric(n = nil, chars: ALPHANUMERIC)
+      n = 16 if n.nil?
+      choose(chars, n)
+    end if RUBY_VERSION < '3.3'
 
     private
 
@@ -88,9 +98,9 @@ module Gem::SecureRandom
 
     # :startdoc:
 
-    # Generate random data bytes for Gem::Random::Formatter
+    # Generate random data bytes for Random::Formatter
     public :gen_random
   end
 end
 
-Gem::SecureRandom.extend(Gem::Random::Formatter)
+Gem::SecureRandom.extend(Random::Formatter)

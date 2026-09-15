@@ -3,6 +3,10 @@
 require_relative "helper"
 require "rubygems/ext"
 require "open3"
+begin
+  require "fiddle"
+rescue LoadError
+end
 
 class TestGemExtCargoBuilder < Gem::TestCase
   def setup
@@ -107,7 +111,9 @@ class TestGemExtCargoBuilder < Gem::TestCase
         Open3.capture2e(*gem, "build", "rust_ruby_example.gemspec", "--output", built_gem)
         Open3.capture2e(*gem, "install", "--verbose", "--local", built_gem, *ARGV)
 
-        stdout_and_stderr_str, status = Open3.capture2e(env_for_subprocess, *ruby_with_rubygems_in_load_path, "-rrust_ruby_example", "-e", "puts 'Result: ' + RustRubyExample.reverse('hello world')")
+        # Require inside -e because -r bypasses gem activation under RUBY_BOX=1
+        # (https://bugs.ruby-lang.org/issues/22295)
+        stdout_and_stderr_str, status = Open3.capture2e(env_for_subprocess, *ruby_with_rubygems_in_load_path, "-e", "require 'rust_ruby_example'; puts 'Result: ' + RustRubyExample.reverse('hello world')")
         assert status.success?, stdout_and_stderr_str
         assert_match "Result: #{"hello world".reverse}", stdout_and_stderr_str
       end
@@ -130,11 +136,63 @@ class TestGemExtCargoBuilder < Gem::TestCase
         Open3.capture2e(*gem, "install", "--verbose", "--local", built_gem, *ARGV)
       end
 
-      stdout_and_stderr_str, status = Open3.capture2e(env_for_subprocess, *ruby_with_rubygems_in_load_path, "-rcustom_name", "-e", "puts 'Result: ' + CustomName.say_hello")
+      stdout_and_stderr_str, status = Open3.capture2e(env_for_subprocess, *ruby_with_rubygems_in_load_path, "-e", "require 'custom_name'; puts 'Result: ' + CustomName.say_hello")
 
       assert status.success?, stdout_and_stderr_str
       assert_match "Result: Hello world!", stdout_and_stderr_str
     end
+  end
+
+  def test_linker_args
+    orig_cc = RbConfig::MAKEFILE_CONFIG["CC"]
+    RbConfig::MAKEFILE_CONFIG["CC"] = "clang"
+
+    builder = Gem::Ext::CargoBuilder.new
+    args = builder.send(:linker_args)
+
+    assert args[1], "linker=clang"
+    assert_nil args[2]
+  ensure
+    RbConfig::MAKEFILE_CONFIG["CC"] = orig_cc
+  end
+
+  def test_linker_args_with_options
+    orig_cc = RbConfig::MAKEFILE_CONFIG["CC"]
+    RbConfig::MAKEFILE_CONFIG["CC"] = "gcc -Wl,--no-undefined"
+
+    builder = Gem::Ext::CargoBuilder.new
+    args = builder.send(:linker_args)
+
+    assert args[1], "linker=clang"
+    assert args[3], "link-args=-Wl,--no-undefined"
+  ensure
+    RbConfig::MAKEFILE_CONFIG["CC"] = orig_cc
+  end
+
+  def test_linker_args_with_cachetools
+    orig_cc = RbConfig::MAKEFILE_CONFIG["CC"]
+    RbConfig::MAKEFILE_CONFIG["CC"] = "sccache clang"
+
+    builder = Gem::Ext::CargoBuilder.new
+    args = builder.send(:linker_args)
+
+    assert args[1], "linker=clang"
+    assert_nil args[2]
+  ensure
+    RbConfig::MAKEFILE_CONFIG["CC"] = orig_cc
+  end
+
+  def test_linker_args_with_cachetools_and_options
+    orig_cc = RbConfig::MAKEFILE_CONFIG["CC"]
+    RbConfig::MAKEFILE_CONFIG["CC"] = "ccache gcc -Wl,--no-undefined"
+
+    builder = Gem::Ext::CargoBuilder.new
+    args = builder.send(:linker_args)
+
+    assert args[1], "linker=clang"
+    assert args[3], "link-args=-Wl,--no-undefined"
+  ensure
+    RbConfig::MAKEFILE_CONFIG["CC"] = orig_cc
   end
 
   private
@@ -143,13 +201,14 @@ class TestGemExtCargoBuilder < Gem::TestCase
     pend "jruby not supported" if Gem.java_platform?
     pend "truffleruby not supported (yet)" if RUBY_ENGINE == "truffleruby"
     system(@rust_envs, "cargo", "-V", out: IO::NULL, err: [:child, :out])
-    pend "cargo not present" unless $?.success?
+    pend "cargo not present" unless Process.last_status.success?
     pend "ruby.h is not provided by ruby repo" if ruby_repo?
     pend "rust toolchain of mingw is broken" if mingw_windows?
   end
 
   def assert_ffi_handle(bundle, name)
-    require "fiddle"
+    return unless defined?(Fiddle)
+
     dylib_handle = Fiddle.dlopen bundle
     assert_nothing_raised { dylib_handle[name] }
   ensure
@@ -157,7 +216,8 @@ class TestGemExtCargoBuilder < Gem::TestCase
   end
 
   def refute_ffi_handle(bundle, name)
-    require "fiddle"
+    return unless defined?(Fiddle)
+
     dylib_handle = Fiddle.dlopen bundle
     assert_raise { dylib_handle[name] }
   ensure

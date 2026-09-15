@@ -1,4 +1,4 @@
-# -*- encoding: binary -*-
+# encoding: binary
 require_relative 'spec_helper'
 
 load_extension("integer")
@@ -302,6 +302,14 @@ describe "CApiIntegerSpecs" do
 
     it "overflows for large inputs" do
       @s.rb_int_positive_pow(8, 23).should == 590295810358705651712
+    end
+  end
+
+  ruby_version_is "4.1" do
+    describe "rb_int_parse_cstr" do
+      it "returns the parsed integer, end position, and digit count" do
+        @s.rb_int_parse_cstr("123x", nil, 10, 0).should == [123, 3, 3]
+      end
     end
   end
 end

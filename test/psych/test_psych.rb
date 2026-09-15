@@ -36,6 +36,7 @@ class TestPsych < Psych::TestCase
   end
 
   def test_canonical
+    omit 'canonical output is not supported on the libfyaml backend' if libfyaml?
     yml = Psych.dump({:a => {'b' => 'c'}}, {:canonical => true})
     assert_match(/\? "b/, yml)
   end
@@ -89,6 +90,7 @@ class TestPsych < Psych::TestCase
     things = [22, "foo \n", {}]
     stream = Psych.dump_stream(*things)
     assert_equal things, Psych.load_stream(stream)
+    assert_equal things, Psych.safe_load_stream(stream)
   end
 
   def test_dump_file
@@ -116,9 +118,28 @@ class TestPsych < Psych::TestCase
     assert_equal Psych.libyaml_version.join('.'), Psych::LIBYAML_VERSION
   end
 
+  def test_backend
+    omit 'Psych::BACKEND is not defined on this backend' unless defined?(Psych::BACKEND)
+    assert_includes %w[libyaml libfyaml], Psych::BACKEND
+    assert_equal 'libfyaml', Psych::BACKEND if libfyaml?
+  end
+
+  def test_libfyaml_version
+    omit 'libfyaml backend only' unless libfyaml?
+    assert_kind_of String, Psych.libfyaml_version
+    assert_match(/\A\d+\.\d+/, Psych.libfyaml_version)
+  end
+
+  def test_libfyaml_version_absent_without_libfyaml
+    omit 'libfyaml backend defines libfyaml_version' if libfyaml?
+    refute_respond_to Psych, :libfyaml_version
+  end
+
   def test_load_stream
     docs = Psych.load_stream("--- foo\n...\n--- bar\n...")
     assert_equal %w{ foo bar }, docs
+    safe_docs = Psych.safe_load_stream("--- foo\n...\n--- bar\n...")
+    assert_equal %w{ foo bar }, safe_docs
   end
 
   def test_load_stream_freeze
@@ -138,13 +159,31 @@ class TestPsych < Psych::TestCase
     assert_equal [], Psych.load_stream("")
   end
 
+  def test_safe_load_stream_default_fallback
+    assert_equal [], Psych.safe_load_stream("")
+  end
+
   def test_load_stream_raises_on_bad_input
     assert_raise(Psych::SyntaxError) { Psych.load_stream("--- `") }
+  end
+
+  def test_safe_load_stream_raises_on_bad_input
+    assert_raise(Psych::SyntaxError) { Psych.safe_load_stream("--- `") }
   end
 
   def test_parse_stream
     docs = Psych.parse_stream("--- foo\n...\n--- bar\n...")
     assert_equal(%w[foo bar], docs.children.map(&:transform))
+  end
+
+  # https://github.com/ruby/psych/issues/331
+  def test_load_with_leading_bom
+    assert_equal({ "a" => "b", "c" => "d" }, Psych.load("\uFEFFa: b\nc: d"))
+  end
+
+  def test_parse_stream_with_leading_bom
+    docs = Psych.parse_stream("\uFEFFa: b\nc: d")
+    assert_equal [{ "a" => "b", "c" => "d" }], docs.children.map(&:to_ruby)
   end
 
   def test_parse_stream_with_block
@@ -415,6 +454,7 @@ eoyml
   end
 
   def test_safe_dump_extra_permitted_classes
+    omit 'libfyaml formats the empty flow mapping differently' if libfyaml?
     assert_equal "--- !ruby/object {}\n", Psych.safe_dump(Object.new, permitted_classes: [Object])
   end
 
@@ -431,6 +471,9 @@ eoyml
   end
 
   def test_safe_dump_stringify_names
+    # The 1.2 libfyaml backend does not quote 'no', so the expected escaping
+    # of the "no" key does not apply.
+    omit "libfyaml does not quote the 'no' key" if libfyaml?
     yaml = <<-eoyml
 ---
 foo:
@@ -457,6 +500,7 @@ eoyml
   end
 
   def test_safe_dump_aliases
+    omit 'libfyaml formats anchors and aliases differently' if libfyaml?
     x = []
     x << x
     error = assert_raise Psych::BadAlias do

@@ -145,6 +145,7 @@ getblockparamproxy
 (lindex_t idx, rb_num_t level)
 ()
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     const VALUE *ep = vm_get_ep(GET_EP(), level);
     VM_ASSERT(VM_ENV_LOCAL_P(ep));
@@ -212,6 +213,7 @@ getinstancevariable
 (VALUE val)
 /* Ractor crashes when it accesses class/module-level instances variables. */
 // attr bool leaf = false; /* has IVAR_ACCESSOR_SHOULD_BE_MAIN_RACTOR() */
+// attr bool zjit_profile = true;
 {
     val = vm_getinstancevariable(GET_ISEQ(), GET_SELF(), id, ic);
 }
@@ -223,6 +225,7 @@ setinstancevariable
 (VALUE val)
 ()
 // attr bool leaf = false; /* has rb_check_frozen() */
+// attr bool zjit_profile = true;
 {
     vm_setinstancevariable(GET_ISEQ(), GET_SELF(), id, val, ic);
 }
@@ -370,7 +373,7 @@ putspecialobject
 
 /* put string val. string will be copied. */
 DEFINE_INSN
-putstring
+dupstring
 (VALUE str)
 ()
 (VALUE val)
@@ -380,7 +383,7 @@ putstring
 
 /* put chilled string val. string will be copied but frozen in the future. */
 DEFINE_INSN
-putchilledstring
+dupchilledstring
 (VALUE str)
 ()
 (VALUE val)
@@ -426,9 +429,7 @@ toregexp
 // attr bool leaf = false;
 // attr rb_snum_t sp_inc = 1 - (rb_snum_t)cnt;
 {
-    const VALUE ary = rb_ary_tmp_new_from_values(0, cnt, STACK_ADDR_FROM_TOP(cnt));
-    val = rb_reg_new_ary(ary, (int)opt);
-    rb_ary_clear(ary);
+    val = rb_reg_new_from_values(cnt, STACK_ADDR_FROM_TOP(cnt), (int)opt);
 }
 
 /* intern str to Symbol and push it. */
@@ -437,6 +438,9 @@ intern
 ()
 (VALUE str)
 (VALUE sym)
+/* This instruction can raise EncodingError, thus can call
+ * EncodingError#initialize. */
+// attr bool leaf = false;
 {
     sym = rb_str_intern(str);
 }
@@ -566,6 +570,7 @@ splatkw
 (VALUE hash, VALUE block)
 (VALUE obj, VALUE block)
 // attr bool leaf = false; /* has rb_to_hash_type() */
+// attr bool zjit_profile = true;
 {
     if (NIL_P(hash)) {
         obj = Qnil;
@@ -587,11 +592,10 @@ newhash
     RUBY_DTRACE_CREATE_HOOK(HASH, num);
 
     if (num) {
-        val = rb_hash_new_with_size(num / 2);
-        rb_hash_bulk_insert(num, STACK_ADDR_FROM_TOP(num), val);
+        val = rb_hash_new_with_bulk_insert(num, STACK_ADDR_FROM_TOP(num));
     }
     else {
-        val = rb_hash_new();
+        val = rb_hash_new_capa(0);
     }
 }
 
@@ -744,6 +748,7 @@ definedivar
 ()
 (VALUE val)
 // attr bool leaf  = false;
+// attr bool zjit_profile = true;
 {
     val = Qnil;
     if (!UNDEF_P(vm_getivar(GET_SELF(), id, GET_ISEQ(), ic, NULL, FALSE, Qundef))) {
@@ -802,13 +807,20 @@ defineclass
 (VALUE val)
 {
     VALUE klass = vm_find_or_create_class_by_id(id, flags, cbase, super);
+    const rb_box_t *box = rb_current_box();
 
     rb_iseq_check(class_iseq);
 
+    rb_cref_t *cref = vm_cref_push(ec, klass, NULL, FALSE, FALSE);
+
+    if (VM_DEFINECLASS_DYNAMIC_CREF_P(flags)) {
+        CREF_DYNAMIC_SET(cref);
+    }
+
     /* enter scope */
     vm_push_frame(ec, class_iseq, VM_FRAME_MAGIC_CLASS | VM_ENV_FLAG_LOCAL, klass,
-                  GET_BLOCK_HANDLER(),
-                  (VALUE)vm_cref_push(ec, klass, NULL, FALSE, FALSE),
+                  GC_GUARDED_PTR(box),
+                  (VALUE)cref,
                   ISEQ_BODY(class_iseq)->iseq_encoded, GET_SP(),
                   ISEQ_BODY(class_iseq)->local_table_size,
                   ISEQ_BODY(class_iseq)->stack_max);
@@ -844,6 +856,7 @@ send
 (CALL_DATA cd, ISEQ blockiseq)
 (...)
 (VALUE val)
+// attr bool zjit_profile = true;
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(cd->ci);
 // attr rb_snum_t comptime_sp_inc = sp_inc_of_sendish(ci);
 {
@@ -869,7 +882,7 @@ sendforward
     struct rb_forwarding_call_data adjusted_cd;
     struct rb_callinfo adjusted_ci;
 
-    VALUE bh = vm_caller_setup_fwd_args(GET_EC(), GET_CFP(), cd, blockiseq, 0, &adjusted_cd, &adjusted_ci);
+    VALUE bh = vm_caller_setup_fwd_args(ec, GET_CFP(), cd, blockiseq, 0, &adjusted_cd, &adjusted_ci);
 
     val = vm_sendish(ec, GET_CFP(), &adjusted_cd.cd, bh, mexp_search_method);
     JIT_EXEC(ec, val);
@@ -890,6 +903,7 @@ opt_send_without_block
 (CALL_DATA cd)
 (...)
 (VALUE val)
+// attr bool zjit_profile = true;
 // attr bool handles_sp = true;
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(cd->ci);
 // attr rb_snum_t comptime_sp_inc = sp_inc_of_sendish(ci);
@@ -904,6 +918,32 @@ opt_send_without_block
     }
 }
 
+/* Jump if "new" method has been defined by user */
+DEFINE_INSN
+opt_new
+(CALL_DATA cd, OFFSET dst)
+()
+()
+// attr bool leaf = false;
+{
+    VALUE argc = vm_ci_argc(cd->ci);
+    VALUE val = TOPN(argc);
+
+    // The bookkeeping slot should be empty.
+    RUBY_ASSERT(TOPN(argc + 1) == Qnil);
+
+    if (vm_method_cfunc_is(GET_CFP(), cd, val, rb_class_new_instance_pass_kw)) {
+        RB_DEBUG_COUNTER_INC(opt_new_hit);
+        val = rb_obj_alloc(val);
+        TOPN(argc) = val;
+        TOPN(argc + 1) = val;
+    }
+    else {
+        RB_DEBUG_COUNTER_INC(opt_new_miss);
+        JUMP(dst);
+    }
+}
+
 /* Convert object to string using to_s or equivalent. */
 DEFINE_INSN
 objtostring
@@ -911,8 +951,9 @@ objtostring
 (VALUE recv)
 (VALUE val)
 // attr bool leaf = false;
+// attr bool zjit_profile = true;
 {
-    val = vm_objtostring(GET_ISEQ(), recv, cd);
+    val = vm_objtostring(GET_CFP(), recv, cd);
 
     if (UNDEF_P(val)) {
         CALL_SIMPLE_METHOD();
@@ -969,8 +1010,9 @@ opt_nil_p
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
-    val = vm_opt_nil_p(GET_ISEQ(), cd, recv);
+    val = vm_opt_nil_p(GET_CFP(), cd, recv);
 
     if (UNDEF_P(val)) {
         CALL_SIMPLE_METHOD();
@@ -992,6 +1034,28 @@ opt_str_uminus
 }
 
 DEFINE_INSN
+opt_duparray_send
+(VALUE ary, ID method, rb_num_t argc)
+(...)
+(VALUE val)
+/* This instruction typically has no funcalls.  But it may compare array
+ * contents to each other which may call methods when necessary.
+ * No way to detect such method calls beforehand.
+ * We must mark it as not leaf. */
+// attr bool leaf = false; /* has rb_funcall() */
+// attr rb_snum_t sp_inc = 1 - (rb_snum_t)argc;
+// attr rb_snum_t comptime_sp_inc = 1 - (rb_snum_t)argc;
+{
+    switch (method) {
+      case idIncludeP:
+        val = vm_opt_duparray_include_p(ec, ary, TOPN(0));
+        break;
+      default:
+        rb_bug("unreachable");
+    }
+}
+
+DEFINE_INSN
 opt_newarray_send
 (rb_num_t num, rb_num_t method)
 (...)
@@ -1004,7 +1068,7 @@ opt_newarray_send
 // attr rb_snum_t sp_inc = 1 - (rb_snum_t)num;
 // attr rb_snum_t comptime_sp_inc = 1 - (rb_snum_t)num;
 {
-    switch(method) {
+    switch (method) {
       case VM_OPT_NEWARRAY_SEND_HASH:
         val = vm_opt_newarray_hash(ec, num, STACK_ADDR_FROM_TOP(num));
         break;
@@ -1013,6 +1077,9 @@ opt_newarray_send
         break;
       case VM_OPT_NEWARRAY_SEND_MAX:
         val = vm_opt_newarray_max(ec, num, STACK_ADDR_FROM_TOP(num));
+        break;
+      case VM_OPT_NEWARRAY_SEND_INCLUDE_P:
+        val = vm_opt_newarray_include_p(ec, (long)num-1, STACK_ADDR_FROM_TOP(num), TOPN(0));
         break;
       case VM_OPT_NEWARRAY_SEND_PACK:
         val = vm_opt_newarray_pack_buffer(ec, (long)num-1, STACK_ADDR_FROM_TOP(num), TOPN(0), Qundef);
@@ -1033,10 +1100,26 @@ invokesuper
 (VALUE val)
 // attr rb_snum_t sp_inc = sp_inc_of_sendish(cd->ci);
 // attr rb_snum_t comptime_sp_inc = sp_inc_of_sendish(ci);
+// attr bool zjit_profile = true;
 {
-    VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), cd->ci, blockiseq, true);
-    val = vm_sendish(ec, GET_CFP(), cd, bh, mexp_search_super);
+    struct rb_callinfo adjusted_ci = VM_CI_ON_STACK(vm_ci_mid(cd->ci),
+                                                   vm_ci_flag(cd->ci),
+                                                   vm_ci_argc(cd->ci),
+                                                   vm_ci_kwarg(cd->ci));
+    const struct rb_callcache *original_cc = rbimpl_atomic_ptr_load((void **)&cd->cc, RBIMPL_ATOMIC_ACQUIRE);
+    struct rb_call_data adjusted_cd = {
+        .ci = &adjusted_ci,
+        .cc = original_cc,
+    };
+
+    VALUE bh = vm_caller_setup_arg_block(ec, GET_CFP(), adjusted_cd.ci, blockiseq, true);
+    val = vm_sendish(ec, GET_CFP(), &adjusted_cd, bh, mexp_search_super);
     JIT_EXEC(ec, val);
+
+    if (original_cc != adjusted_cd.cc && vm_cc_markable(adjusted_cd.cc)) {
+        rbimpl_atomic_ptr_store((volatile void **)&cd->cc, (void *)adjusted_cd.cc, RBIMPL_ATOMIC_RELEASE);
+        RB_OBJ_WRITTEN(GET_ISEQ(), Qundef, adjusted_cd.cc);
+    }
 
     if (UNDEF_P(val)) {
         RESTORE_REGS();
@@ -1056,7 +1139,7 @@ invokesuperforward
     struct rb_forwarding_call_data adjusted_cd;
     struct rb_callinfo adjusted_ci;
 
-    VALUE bh = vm_caller_setup_fwd_args(GET_EC(), GET_CFP(), cd, blockiseq, 1, &adjusted_cd, &adjusted_ci);
+    VALUE bh = vm_caller_setup_fwd_args(ec, GET_CFP(), cd, blockiseq, 1, &adjusted_cd, &adjusted_ci);
 
     val = vm_sendish(ec, GET_CFP(), &adjusted_cd.cd, bh, mexp_search_super);
     JIT_EXEC(ec, val);
@@ -1080,6 +1163,7 @@ invokeblock
 // attr bool handles_sp = true;
 // attr rb_snum_t sp_inc = sp_inc_of_invokeblock(cd->ci);
 // attr rb_snum_t comptime_sp_inc = sp_inc_of_invokeblock(ci);
+// attr bool zjit_profile = true;
 {
     VALUE bh = VM_BLOCK_HANDLER_NONE;
     val = vm_sendish(ec, GET_CFP(), cd, bh, mexp_search_invokeblock);
@@ -1152,7 +1236,7 @@ jump
 ()
 ()
 /* Same discussion as leave. */
-// attr bool leaf = leafness_of_check_ints; /* has rb_threadptr_execute_interrupts() */
+// attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
 {
     RUBY_VM_CHECK_INTS(ec);
     JUMP(dst);
@@ -1165,7 +1249,7 @@ branchif
 (VALUE val)
 ()
 /* Same discussion as jump. */
-// attr bool leaf = leafness_of_check_ints; /* has rb_threadptr_execute_interrupts() */
+// attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
 {
     if (RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
@@ -1180,7 +1264,7 @@ branchunless
 (VALUE val)
 ()
 /* Same discussion as jump. */
-// attr bool leaf = leafness_of_check_ints; /* has rb_threadptr_execute_interrupts() */
+// attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
 {
     if (!RTEST(val)) {
         RUBY_VM_CHECK_INTS(ec);
@@ -1195,10 +1279,60 @@ branchnil
 (VALUE val)
 ()
 /* Same discussion as jump. */
-// attr bool leaf = leafness_of_check_ints; /* has rb_threadptr_execute_interrupts() */
+// attr bool leaf = false; /* has rb_threadptr_execute_interrupts() */
 {
     if (NIL_P(val)) {
         RUBY_VM_CHECK_INTS(ec);
+        JUMP(dst);
+    }
+}
+
+/* same as jump, but without interrupt check */
+DEFINE_INSN
+jump_without_ints
+(OFFSET dst)
+()
+()
+// attr bool leaf = true;
+{
+    JUMP(dst);
+}
+
+/* same as branchif, but without interrupt check */
+DEFINE_INSN
+branchif_without_ints
+(OFFSET dst)
+(VALUE val)
+()
+// attr bool leaf = true;
+{
+    if (RTEST(val)) {
+        JUMP(dst);
+    }
+}
+
+/* same as branchunless, but without interrupt check */
+DEFINE_INSN
+branchunless_without_ints
+(OFFSET dst)
+(VALUE val)
+()
+// attr bool leaf = true;
+{
+    if (!RTEST(val)) {
+        JUMP(dst);
+    }
+}
+
+/* same as branchnil, but without interrupt check */
+DEFINE_INSN
+branchnil_without_ints
+(OFFSET dst)
+(VALUE val)
+()
+// attr bool leaf = true;
+{
+    if (NIL_P(val)) {
         JUMP(dst);
     }
 }
@@ -1240,6 +1374,7 @@ opt_plus
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_plus(recv, obj);
 
@@ -1254,6 +1389,7 @@ opt_minus
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_minus(recv, obj);
 
@@ -1268,6 +1404,7 @@ opt_mult
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_mult(recv, obj);
 
@@ -1285,6 +1422,7 @@ opt_div
 /* In case of division by zero, it raises. Thus
  * ZeroDivisionError#initialize is called.  */
 // attr bool leaf = false;
+// attr bool zjit_profile = true;
 {
     val = vm_opt_div(recv, obj);
 
@@ -1301,6 +1439,7 @@ opt_mod
 (VALUE val)
 /* Same discussion as opt_div. */
 // attr bool leaf = false;
+// attr bool zjit_profile = true;
 {
     val = vm_opt_mod(recv, obj);
 
@@ -1315,8 +1454,9 @@ opt_eq
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
-    val = opt_equality(GET_ISEQ(), recv, obj, cd);
+    val = opt_equality(GET_CFP(), recv, obj, cd);
 
     if (UNDEF_P(val)) {
         CALL_SIMPLE_METHOD();
@@ -1329,8 +1469,9 @@ opt_neq
 (CALL_DATA cd_eq, CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
-    val = vm_opt_neq(GET_ISEQ(), cd, cd_eq, recv, obj);
+    val = vm_opt_neq(GET_CFP(), cd, cd_eq, recv, obj);
 
     if (UNDEF_P(val)) {
         CALL_SIMPLE_METHOD();
@@ -1343,6 +1484,7 @@ opt_lt
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_lt(recv, obj);
 
@@ -1357,6 +1499,7 @@ opt_le
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_le(recv, obj);
 
@@ -1371,6 +1514,7 @@ opt_gt
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_gt(recv, obj);
 
@@ -1385,6 +1529,7 @@ opt_ge
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_ge(recv, obj);
 
@@ -1403,6 +1548,7 @@ opt_ltlt
  * string.  Then what happens if that codepoint does not exist in the
  * string's encoding?  Of course an exception.  That's not a leaf. */
 // attr bool leaf = false; /* has "invalid codepoint" exception */
+// attr bool zjit_profile = true;
 {
     val = vm_opt_ltlt(recv, obj);
 
@@ -1417,6 +1563,7 @@ opt_and
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_and(recv, obj);
 
@@ -1431,6 +1578,7 @@ opt_or
 (CALL_DATA cd)
 (VALUE recv, VALUE obj)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_or(recv, obj);
 
@@ -1450,6 +1598,7 @@ opt_aref
  * default_proc.  This is a method call.  So opt_aref is
  * (surprisingly) not leaf. */
 // attr bool leaf = false; /* has rb_funcall() */ /* calls #yield */
+// attr bool zjit_profile = true;
 {
     val = vm_opt_aref(recv, obj);
 
@@ -1467,48 +1616,11 @@ opt_aset
 /* This is another story than opt_aref.  When vm_opt_aset() resorts
  * to rb_hash_aset(), which should call #hash for `obj`. */
 // attr bool leaf = false; /* has rb_funcall() */ /* calls #hash */
+// attr bool zjit_profile = true;
 {
     val = vm_opt_aset(recv, obj, set);
 
     if (UNDEF_P(val)) {
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* recv[str] = set */
-DEFINE_INSN
-opt_aset_with
-(VALUE key, CALL_DATA cd)
-(VALUE recv, VALUE val)
-(VALUE val)
-/* Same discussion as opt_aset. */
-// attr bool leaf = false; /* has rb_funcall() */ /* calls #hash */
-{
-    VALUE tmp = vm_opt_aset_with(recv, key, val);
-
-    if (!UNDEF_P(tmp)) {
-        val = tmp;
-    }
-    else {
-        TOPN(0) = rb_str_resurrect(key);
-        PUSH(val);
-        CALL_SIMPLE_METHOD();
-    }
-}
-
-/* recv[str] */
-DEFINE_INSN
-opt_aref_with
-(VALUE key, CALL_DATA cd)
-(VALUE recv)
-(VALUE val)
-/* Same discussion as opt_aref. */
-// attr bool leaf = false; /* has rb_funcall() */ /* calls #yield */
-{
-    val = vm_opt_aref_with(recv, key);
-
-    if (UNDEF_P(val)) {
-        PUSH(rb_str_resurrect(key));
         CALL_SIMPLE_METHOD();
     }
 }
@@ -1519,6 +1631,7 @@ opt_length
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_length(recv, BOP_LENGTH);
 
@@ -1533,6 +1646,7 @@ opt_size
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_length(recv, BOP_SIZE);
 
@@ -1547,6 +1661,7 @@ opt_empty_p
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_empty_p(recv);
 
@@ -1561,6 +1676,7 @@ opt_succ
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
     val = vm_opt_succ(recv);
 
@@ -1575,8 +1691,9 @@ opt_not
 (CALL_DATA cd)
 (VALUE recv)
 (VALUE val)
+// attr bool zjit_profile = true;
 {
-    val = vm_opt_not(GET_ISEQ(), cd, recv);
+    val = vm_opt_not(GET_CFP(), cd, recv);
 
     if (UNDEF_P(val)) {
         CALL_SIMPLE_METHOD();
@@ -1590,6 +1707,7 @@ opt_regexpmatch2
 (VALUE obj2, VALUE obj1)
 (VALUE val)
 // attr bool leaf = false; /* match_at() has rb_thread_check_ints() */
+// attr bool zjit_profile = true;
 {
     val = vm_opt_regexpmatch2(obj2, obj1);
 

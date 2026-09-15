@@ -40,7 +40,7 @@ class Array # :nodoc:
 end
 
 ##
-# mkmf.rb is used by Ruby C extensions to generate a Makefile which will
+# \Module \MakeMakefile is used by Ruby C extensions to generate a Makefile which will
 # correctly compile and link the C extension to Ruby and a third-party
 # library.
 module MakeMakefile
@@ -419,7 +419,7 @@ MESSAGE
 
     # disable ASAN leak reporting - conftest programs almost always don't bother
     # to free their memory.
-    envs['ASAN_OPTIONS'] = "detect_leaks=0" unless ENV.key?('ASAN_OPTIONS')
+    envs['LSAN_OPTIONS'] = "detect_leaks=0" unless ENV.key?('LSAN_OPTIONS')
 
     return envs, expand[commands]
   end
@@ -539,7 +539,6 @@ MSG
   end
 
   def link_config(ldflags, opt="", libpath=$DEFLIBPATH|$LIBPATH)
-    librubyarg = $extmk ? $LIBRUBYARG_STATIC : "$(LIBRUBYARG)"
     conf = RbConfig::CONFIG.merge('hdrdir' => $hdrdir.quote,
                                   'src' => "#{conftest_source}",
                                   'arch_hdrdir' => $arch_hdrdir.quote,
@@ -550,7 +549,7 @@ MSG
                                   'ARCH_FLAG' => "#$ARCH_FLAG",
                                   'LDFLAGS' => "#$LDFLAGS #{ldflags}",
                                   'LOCAL_LIBS' => "#$LOCAL_LIBS #$libs",
-                                  'LIBS' => "#{librubyarg} #{opt} #$LIBS")
+                                  'LIBS' => "$(LIBRUBYARG) #{opt} #$LIBS")
     conf['LIBPATH'] = libpathflag(libpath.map {|s| RbConfig::expand(s.dup, conf)})
     conf
   end
@@ -573,11 +572,16 @@ MSG
                      conf)
   end
 
-  def cpp_command(outfile, opt="")
+  def cpp_config(opt)
     conf = cc_config(opt)
     if $universal and (arch_flag = conf['ARCH_FLAG']) and !arch_flag.empty?
       conf['ARCH_FLAG'] = arch_flag.gsub(/(?:\G|\s)-arch\s+\S+/, '')
     end
+    conf
+  end
+
+  def cpp_command(outfile, opt="")
+    conf = cpp_config(opt)
     RbConfig::expand("$(CPP) #$INCFLAGS #$CPPFLAGS #$CFLAGS #{opt} #{CONFTEST_C} #{outfile}",
                      conf)
   end
@@ -604,9 +608,9 @@ MSG
     yield(opt, opts)
   end
 
-  def try_link0(src, opt = "", **opts, &b) # :nodoc:
+  def try_link0(src, opt = "", ldflags: "", **opts, &b) # :nodoc:
     exe = CONFTEST+$EXEEXT
-    cmd = link_command("", opt)
+    cmd = link_command(ldflags, opt)
     if $universal
       require 'tmpdir'
       Dir.mktmpdir("mkmf_", oldtmpdir = ENV["TMPDIR"]) do |tmpdir|
@@ -750,7 +754,7 @@ MSG
 
   # :nodoc:
   def try_ldflags(flags, werror: $mswin, **opts)
-    try_link(MAIN_DOES_NOTHING, flags, werror: werror, **opts)
+    try_link(MAIN_DOES_NOTHING, "", ldflags: flags, werror: werror, **opts)
   end
 
   # :startdoc:
@@ -860,7 +864,7 @@ int main() {printf("%"PRI_CONFTEST_PREFIX"#{neg ? 'd' : 'u'}\\n", conftest_const
         v
       }
       unless strvars.empty?
-        prepare << "char " << strvars.map {|v| "#{v}[1024]"}.join(", ") << "; "
+        prepare << "char " << strvars.map {|v| %[#{v}[1024] = ""]}.join(", ") << "; "
       end
     when nil
       call = ""
@@ -926,20 +930,12 @@ SRC
     xpopen(cpp_command('', opt)) do |f|
       if Regexp === pat
         puts("    ruby -ne 'print if #{pat.inspect}'")
-        f.grep(pat) {|l|
+        !f.grep(pat) {|l|
           puts "#{f.lineno}: #{l}"
-          return true
-        }
-        false
+        }.empty?
       else
         puts("    egrep '#{pat}'")
-        begin
-          stdin = $stdin.dup
-          $stdin.reopen(f)
-          system("egrep", pat)
-        ensure
-          $stdin.reopen(stdin)
-        end
+        system("egrep", pat, in: f)
       end
     end
   ensure
@@ -1418,6 +1414,8 @@ SRC
       false
     end
   end
+
+  # :startdoc:
 
   # Returns whether or not the constant +const+ is defined.  You may
   # optionally pass the +type+ of +const+ as <code>[const, type]</code>,
@@ -1968,7 +1966,7 @@ SRC
       if pkgconfig = with_config("#{pkg}-config") and find_executable0(pkgconfig)
       # if and only if package specific config command is given
       elsif ($PKGCONFIG ||=
-             (pkgconfig = with_config("pkg-config") {config_string("PKG_CONFIG") || "pkg-config"}) &&
+             (pkgconfig = with_config("pkg-config") {config_string("PKG_CONFIG") || ENV["PKG_CONFIG"] || "pkg-config"}) &&
              find_executable0(pkgconfig) && pkgconfig) and
            xsystem([*envs, $PKGCONFIG, "--exists", pkg])
         # default to pkg-config command
@@ -1984,7 +1982,20 @@ SRC
           opts = Array(opts).map { |o| "--#{o}" }
           opts = xpopen([*envs, pkgconfig, *opts, *args], err:[:child, :out], &:read)
           Logging.open {puts opts.each_line.map{|s|"=> #{s.inspect}"}}
-          opts.strip if $?.success?
+          if $?.success?
+            opts = opts.strip
+            libarg, libpath = LIBARG, LIBPATHFLAG.strip
+            opts = opts.shellsplit.map { |s|
+              if s.start_with?('-l')
+                libarg % s[2..]
+              elsif s.start_with?('-L')
+                libpath % s[2..]
+              else
+                s
+              end
+            }.quote.join(" ")
+            opts
+          end
         }
       end
       orig_ldflags = $LDFLAGS
@@ -2070,6 +2081,9 @@ SRC
     verbose = with_config('verbose') ?  "1" : (CONFIG['MKMF_VERBOSE'] || "0")
     vpath = $VPATH.dup
     CONFIG["hdrdir"] ||= $hdrdir
+    if $mswin and dir = [CONFIG["srcdir"], $extmk ? CONFIG["topdir"] : $topdir, CONFIG["hdrdir"], $arch_hdrdir].compact.find {|d| /\s/ =~ d}
+      warn "mkmf: nmake cannot handle spaces in paths: #{dir}"
+    end
     mk << %{
 SHELL = /bin/sh
 
@@ -2368,6 +2382,25 @@ RULES
   # directory, i.e. the current directory.  It is included as part of the
   # +VPATH+ and added to the list of +INCFLAGS+.
   #
+  # Yields the configuration part of the makefile to be generated, as an array
+  # of strings, if the block is given.  The returned value will be used the
+  # new configuration part.
+  #
+  #   create_makefile('foo') {|conf|
+  #     [
+  #       *conf,
+  #       "MACRO_YOU_NEED = something",
+  #     ]
+  #   }
+  #
+  # If "depend" file exist in the source directory, that content will be
+  # included in the generated makefile, with formatted by depend_rules method.
+  #
+  # With <tt>--update-depend</tt>, the autogenerated section in "depend" is
+  # updated from the sources and objects found by this method.  The source
+  # tree root is detected from ".git", or can be specified with
+  # <tt>--depend-root=DIR</tt>.  An existing autogenerated section is
+  # required.
   def create_makefile(target, srcprefix = nil)
     $target = target
     libpath = $DEFLIBPATH|$LIBPATH
@@ -2484,16 +2517,19 @@ TIMESTAMP_DIR = #{$extout && $extmk ? '$(extout)/.timestamp' : '.'}
     sodir = $extout ? '$(TARGET_SO_DIR)' : '$(RUBYARCHDIR)'
     n = '$(TARGET_SO_DIR)$(TARGET)'
     cleanobjs = ["$(OBJS)"]
+    cleanlibs = []
     if $extmk
       %w[bc i s].each {|ex| cleanobjs << "$(OBJS:.#{$OBJEXT}=.#{ex})"}
     end
     if target
       config_string('cleanobjs') {|t| cleanobjs << t.gsub(/\$\*/, "$(TARGET)#{deffile ? '-$(arch)': ''}")}
+      cleanlibs << '$(TARGET_SO)'
     end
+    config_string('cleanlibs') {|t| cleanlibs << t.gsub(/\$\*/) {n}}
     conf << "\
 TARGET_SO_DIR =#{$extout ? " $(RUBYARCHDIR)/" : ''}
 TARGET_SO     = $(TARGET_SO_DIR)$(DLLIB)
-CLEANLIBS     = #{'$(TARGET_SO) ' if target}#{config_string('cleanlibs') {|t| t.gsub(/\$\*/) {n}}}
+CLEANLIBS     = #{cleanlibs.join(' ')}
 CLEANOBJS     = #{cleanobjs.join(' ')} *.bak
 TARGET_SO_DIR_TIMESTAMP = #{timestamp_file(sodir, target_prefix)}
 " #"
@@ -2565,7 +2601,7 @@ static: #{$extmk && !$static ? "all" : %[$(STATIC_LIB)#{$extout ? " install-rb" 
           dest = "#{dir}/#{File.basename(f)}"
           mfile.print("do-install-rb#{sfx}: #{dest}\n")
           mfile.print("#{dest}: #{f} #{timestamp_file(dir, target_prefix)}\n")
-          mfile.print("\t$(Q) $(#{$extout ? 'COPY' : 'INSTALL_DATA'}) #{f} $(@D)\n")
+          mfile.print("\t$(Q) $(#{$extout ? 'COPY' : 'INSTALL_DATA'}) #{f} $@\n")
           if defined?($installed_list) and !$extout
             mfile.print("\t@echo #{dest}>>$(INSTALLED_LIST)\n")
           end
@@ -2669,7 +2705,40 @@ site-install-rb: install-rb
       mfile.print "\t$(Q) #{makedef} > $@\n\n"
     end
 
-    depend = File.join(srcdir, "depend")
+    source_depend = File.join(srcdir, "depend")
+    # This option is intended for standalone extension repositories.  In the
+    # Ruby source tree, automatic root detection would treat the entire tree
+    # as the extension project; use tool/mkdepend.rb instead.
+    if arg_config("--update-depend")
+      require_relative "mkmf/depend"
+      unless $objs.size == srcs.size
+        raise "cannot map #{$objs.size} objects to #{srcs.size} sources"
+      end
+      source_map = $objs.zip(srcs).to_h do |object, source|
+        target = object.delete_suffix(".#{$OBJEXT}")
+        source = source.delete_prefix("$(srcdir)/")
+        [target, File.expand_path(source, srcdir)]
+      end
+      depend_root = arg_config(
+        "--depend-root", MakeMakefile::Depend.find_root(srcdir)
+      )
+      MakeMakefile::Depend.new(root: depend_root).update_extension(
+        source_depend, source_map,
+        make_variables: {"LOCAL_HDRS" => $headers},
+        nmake: !!$nmake,
+      )
+    end
+
+    depend = source_depend
+    if $extmk && $top_srcdir
+      source_dir = File.expand_path(srcdir)
+      top_source_dir = File.expand_path($top_srcdir)
+      if source_dir.start_with?(top_source_dir + File::SEPARATOR)
+        relative_dir = source_dir.delete_prefix(top_source_dir + File::SEPARATOR)
+        generated = File.join($topdir, ".deps", relative_dir, "depend")
+        depend = generated if File.file?(generated)
+      end
+    end
     if File.exist?(depend)
       mfile.print("###\n", *depend_rules(File.read(depend)))
     else
@@ -2694,9 +2763,6 @@ site-install-rb: install-rb
     if $warnflags = CONFIG['warnflags'] and CONFIG['GCC'] == 'yes'
       # turn warnings into errors only for bundled extensions.
       config['warnflags'] = $warnflags.gsub(/(?:\A|\s)-W\Kerror[-=](?!implicit-function-declaration)/, '')
-      if /icc\z/ =~ config['CC']
-        config['warnflags'].gsub!(/(\A|\s)-W(?:division-by-zero|deprecated-declarations)/, '\1')
-      end
       RbConfig.expand(rbconfig['warnflags'] = config['warnflags'].dup)
       config.each do |key, val|
         RbConfig.expand(rbconfig[key] = val.dup) if /warnflags/ =~ val
@@ -3004,13 +3070,30 @@ realclean: distclean
 
     def cc_command(opt="")
       conf = cc_config(opt)
+      cxx_command(opt, conf)
       RbConfig::expand("$(CXX) #$INCFLAGS #$CPPFLAGS #$CXXFLAGS #$ARCH_FLAG #{opt} -c #{CONFTEST_CXX}",
+                       conf)
+    end
+
+    def cpp_command(outfile, opt="")
+      conf = cpp_config(opt)
+      cxx = cxx_command(opt, conf)
+      cpp = conf['CPP'].sub(/(\A|\s)#{Regexp.quote(conf['CC'])}(?=\z|\s)/) {
+        "#$1#{cxx}"
+      }
+      RbConfig::expand("#{cpp} #$INCFLAGS #$CPPFLAGS #$CXXFLAGS #{opt} #{CONFTEST_CXX} #{outfile}",
                        conf)
     end
 
     def link_command(ldflags, *opts)
       conf = link_config(ldflags, *opts)
       RbConfig::expand(TRY_LINK_CXX.dup, conf)
+    end
+
+    def cxx_command(opt="", conf = cc_config(opt))
+      cxx = conf['CXX']
+      raise Errno::ENOENT, "C++ compiler not found" if !cxx or cxx == 'false'
+      cxx
     end
 
     # :startdoc:

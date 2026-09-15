@@ -1,7 +1,6 @@
 # frozen_string_literal: true
+
 require_relative 'test_helper'
-require 'stringio'
-require 'tempfile'
 
 class JSONCommonInterfaceTest < Test::Unit::TestCase
   include JSON
@@ -41,39 +40,32 @@ class JSONCommonInterfaceTest < Test::Unit::TestCase
       '"g":"\\"\\u0000\\u001f","h":1000.0,"i":0.001}'
   end
 
-  def test_index
-    assert_equal @json, JSON[@hash]
-    assert_equal @json, JSON[@hash_with_method_missing]
-    assert_equal @hash, JSON[@json]
-  end
-
   def test_parser
     assert_match(/::Parser\z/, JSON.parser.name)
   end
 
   def test_generator
-    assert_match(/::Generator\z/, JSON.generator.name)
+    assert_match(/::(TruffleRuby)?Generator\z/, JSON.generator.name)
   end
 
   def test_state
-    assert_match(/::Generator::State\z/, JSON.state.name)
-  end
-
-  def test_create_id
-    assert_equal 'json_class', JSON.create_id
-    JSON.create_id = 'foo_bar'
-    assert_equal 'foo_bar', JSON.create_id
-  ensure
-    JSON.create_id = 'json_class'
-  end
-
-  def test_deep_const_get
-    assert_raise(ArgumentError) { JSON.deep_const_get('Nix::Da') }
-    assert_equal File::SEPARATOR, JSON.deep_const_get('File::SEPARATOR')
+    assert_match(/::(TruffleRuby)?Generator::State\z/, JSON.state.name)
   end
 
   def test_parse
     assert_equal [ 1, 2, 3, ], JSON.parse('[ 1, 2, 3 ]')
+  end
+
+  def test_parse_unknown_option
+    error = assert_raise(ArgumentError) do
+      JSON.parse('[]', quirks_mode: true)
+    end
+    assert_match "quirks_mode", error.message
+
+    error = assert_raise(ArgumentError) do
+      JSON.parse('[]', a: 1, b: 2)
+    end
+    assert_match "a, b", error.message
   end
 
   def test_parse_bang
@@ -84,12 +76,48 @@ class JSONCommonInterfaceTest < Test::Unit::TestCase
     assert_equal '[1,2,3]', JSON.generate([ 1, 2, 3 ])
   end
 
+  def test_generate_unknown_option
+    error = assert_raise(ArgumentError) do
+      JSON.generate([], quirks_mode: true)
+    end
+    assert_match "quirks_mode", error.message
+
+    error = assert_raise(ArgumentError) do
+      JSON.generate([], a: 1, b: 2)
+    end
+    assert_match(/unknown keywords: :?a, :?b/, error.message)
+  end
+
   def test_fast_generate
     assert_equal '[1,2,3]', JSON.generate([ 1, 2, 3 ])
   end
 
   def test_pretty_generate
     assert_equal "[\n  1,\n  2,\n  3\n]", JSON.pretty_generate([ 1, 2, 3 ])
+    assert_equal <<~JSON.strip, JSON.pretty_generate({ a: { b: "f"}, c: "d"})
+      {
+        "a": {
+          "b": "f"
+        },
+        "c": "d"
+      }
+    JSON
+
+    # Cause the state to be spilled on the heap.
+    o = Object.new
+    def o.to_s
+      "Object"
+    end
+    actual = JSON.pretty_generate({ a: { b: o}, c: "d", e: "f"})
+    assert_equal <<~JSON.strip, actual
+      {
+        "a": {
+          "b": "Object"
+        },
+        "c": "d",
+        "e": "f"
+      }
+    JSON
   end
 
   def test_load
@@ -109,7 +137,7 @@ class JSONCommonInterfaceTest < Test::Unit::TestCase
 
   def test_load_with_proc
     visited = []
-    JSON.load('{"foo": [1, 2, 3], "bar": {"baz": "plop"}}', proc { |o| visited << JSON.dump(o) })
+    JSON.load('{"foo": [1, 2, 3], "bar": {"baz": "plop"}}', proc { |o| visited << JSON.dump(o); o })
 
     expected = [
       '"foo"',
@@ -128,49 +156,141 @@ class JSONCommonInterfaceTest < Test::Unit::TestCase
 
   def test_load_with_options
     json  = '{ "foo": NaN }'
-    assert JSON.load(json, nil, :allow_nan => true)['foo'].nan?
+    assert JSON.load(json, nil, allow_nan: true)['foo'].nan?
+    assert JSON.load(json, allow_nan: true)['foo'].nan?
   end
 
   def test_load_null
-    assert_equal nil, JSON.load(nil, nil, :allow_blank => true)
-    assert_raise(TypeError) { JSON.load(nil, nil, :allow_blank => false) }
-    assert_raise(JSON::ParserError) { JSON.load('', nil, :allow_blank => false) }
+    assert_equal nil, JSON.load(nil, nil, allow_blank: true)
+    assert_raise(TypeError) { JSON.load(nil, nil, allow_blank: false) }
+    assert_raise(JSON::ParserError) { JSON.load('', nil, allow_blank: false) }
+    assert_raise(TypeError) { JSON.load([], nil, allow_blank: true) }
+    assert_raise(TypeError) { JSON.load({}, nil, allow_blank: true) }
+  end
+
+  def test_unsafe_load
+    string_able_klass = Class.new do
+      def initialize(str)
+        @str = str
+      end
+
+      def to_str
+        @str
+      end
+    end
+
+    io_able_klass = Class.new do
+      def initialize(str)
+        @str = str
+      end
+
+      def to_io
+        StringIO.new(@str)
+      end
+    end
+
+    assert_equal @hash, JSON.unsafe_load(@json)
+    tempfile = Tempfile.open('@json')
+    tempfile.write @json
+    tempfile.rewind
+    assert_equal @hash, JSON.unsafe_load(tempfile)
+    stringio = StringIO.new(@json)
+    stringio.rewind
+    assert_equal @hash, JSON.unsafe_load(stringio)
+    string_able = string_able_klass.new(@json)
+    assert_equal @hash, JSON.unsafe_load(string_able)
+    io_able = io_able_klass.new(@json)
+    assert_equal @hash, JSON.unsafe_load(io_able)
+    assert_equal nil, JSON.unsafe_load(nil)
+    assert_equal nil, JSON.unsafe_load('')
+  ensure
+    tempfile.close!
+  end
+
+  def test_unsafe_load_with_proc
+    visited = []
+    JSON.unsafe_load('{"foo": [1, 2, 3], "bar": {"baz": "plop"}}', proc { |o| visited << JSON.dump(o); o })
+
+    expected = [
+      '"foo"',
+      '1',
+      '2',
+      '3',
+      '[1,2,3]',
+      '"bar"',
+      '"baz"',
+      '"plop"',
+      '{"baz":"plop"}',
+      '{"foo":[1,2,3],"bar":{"baz":"plop"}}',
+    ]
+    assert_equal expected, visited
+  end
+
+  def test_unsafe_load_default_options
+    too_deep = '[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["Too deep"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]'
+    assert JSON.unsafe_load(too_deep, nil).is_a?(Array)
+    nan_json = '{ "foo": NaN }'
+    assert JSON.unsafe_load(nan_json, nil)['foo'].nan?
+    assert_equal nil, JSON.unsafe_load(nil, nil)
+    t = Time.new(2025, 9, 3, 14, 50, 0)
+    assert_equal t.to_s, JSON.unsafe_load(JSON(t)).to_s
+  end
+
+  def test_unsafe_load_with_options
+    nan_json = '{ "foo": NaN }'
+    assert_raise(JSON::ParserError) { JSON.unsafe_load(nan_json, nil, allow_nan: false)['foo'].nan? }
+    # make sure it still uses the defaults when something is provided
+    assert JSON.unsafe_load(nan_json, nil, allow_blank: true)['foo'].nan?
+    assert JSON.unsafe_load(nan_json, allow_nan: true)['foo'].nan?
+  end
+
+  def test_unsafe_load_null
+    assert_equal nil, JSON.unsafe_load(nil, nil, allow_blank: true)
+    assert_raise(TypeError) { JSON.unsafe_load(nil, nil, allow_blank: false) }
+    assert_raise(JSON::ParserError) { JSON.unsafe_load('', nil, allow_blank: false) }
   end
 
   def test_dump
-    too_deep = '[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]'
+    too_deep = '[' * 101 + ']' * 101
     obj = eval(too_deep)
-    assert_equal too_deep, dump(obj)
-    assert_kind_of String, Marshal.dump(obj)
-    assert_raise(ArgumentError) { dump(obj, 100) }
-    assert_raise(ArgumentError) { Marshal.dump(obj, 100) }
-    assert_equal too_deep, dump(obj, 101)
-    assert_kind_of String, Marshal.dump(obj, 101)
+    assert_raise(JSON::NestingError) { dump(obj) }
+    assert_equal too_deep, dump(obj, max_nesting: 101)
 
-    assert_equal too_deep, JSON.dump(obj, StringIO.new, 101, strict: false).string
-    assert_equal too_deep, dump(obj, StringIO.new, 101, strict: false).string
-    assert_raise(JSON::GeneratorError) { JSON.dump(Object.new, StringIO.new, 101, strict: true).string }
-    assert_raise(JSON::GeneratorError) { dump(Object.new, StringIO.new, 101, strict: true).string }
+    assert_equal too_deep, JSON.dump(obj, StringIO.new, max_nesting: 101, strict: false).string
+    assert_equal too_deep, dump(obj, StringIO.new, max_nesting: 101, strict: false).string
+    assert_raise(JSON::GeneratorError) { JSON.dump(Object.new, StringIO.new, max_nesting: 101, strict: true).string }
+    assert_raise(JSON::GeneratorError) { dump(Object.new, StringIO.new, max_nesting: 101, strict: true).string }
 
-    assert_equal too_deep, dump(obj, nil, nil, strict: false)
-    assert_equal too_deep, dump(obj, nil, 101, strict: false)
-    assert_equal too_deep, dump(obj, StringIO.new, nil, strict: false).string
-    assert_equal too_deep, dump(obj, nil, strict: false)
-    assert_equal too_deep, dump(obj, 101, strict: false)
-    assert_equal too_deep, dump(obj, StringIO.new, strict: false).string
-    assert_equal too_deep, dump(obj, strict: false)
+    assert_raise(JSON::NestingError) { dump(obj, nil, strict: false) }
+    assert_equal too_deep, dump(obj, nil, max_nesting: 101, strict: false)
+    assert_raise(JSON::NestingError) { dump(obj, StringIO.new, strict: false) }
+    assert_raise(JSON::NestingError) { dump(obj, strict: false) }
+    assert_equal too_deep, dump(obj, max_nesting: 101, strict: false)
+    assert_raise(JSON::NestingError) { dump(obj, StringIO.new, strict: false) }
+    assert_raise(JSON::NestingError) { dump(obj, strict: false) }
   end
 
-  def test_dump_should_modify_defaults
-    max_nesting = JSON.dump_default_options[:max_nesting]
-    dump([], StringIO.new, 10)
-    assert_equal max_nesting, JSON.dump_default_options[:max_nesting]
+  def test_dump_in_io
+    io = StringIO.new
+    assert_same io, JSON.dump([1], io)
+    assert_equal "[1]", io.string
+
+    big_object = ["a" * 10, "b" * 40, { foo: 1.23 }] * 5000
+    io.rewind
+    assert_same io, JSON.dump(big_object, io)
+    assert_equal JSON.dump(big_object), io.string
   end
 
   def test_JSON
     assert_equal @json, JSON(@hash)
     assert_equal @json, JSON(@hash_with_method_missing)
     assert_equal @hash, JSON(@json)
+  end
+
+  def test_index
+    assert_equal @json, JSON[@hash]
+    assert_equal @json, JSON[@hash_with_method_missing]
+    assert_equal @hash, JSON[@json]
   end
 
   def test_load_file
@@ -189,7 +309,28 @@ class JSONCommonInterfaceTest < Test::Unit::TestCase
     test_load_file_with_option_shared(:load_file!)
   end
 
+  def test_load_file_with_bad_default_external_encoding
+    data = { "key" => "€" }
+    temp_file_containing(JSON.dump(data)) do |path|
+      loaded_data = with_external_encoding(Encoding::US_ASCII) do
+        JSON.load_file(path)
+      end
+      assert_equal data, loaded_data
+    end
+  end
+
   private
+
+  def with_external_encoding(encoding)
+    verbose = $VERBOSE
+    $VERBOSE = nil
+    previous_encoding = Encoding.default_external
+    Encoding.default_external = encoding
+    yield
+  ensure
+    Encoding.default_external = previous_encoding
+    $VERBOSE = verbose
+  end
 
   def test_load_shared(method_name)
     temp_file_containing(@json) do |filespec|

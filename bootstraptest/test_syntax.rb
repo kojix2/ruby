@@ -571,7 +571,7 @@ assert_equal 'ok', %q{
 
 assert_equal 'ok', %q{
   1.times{
-    p(1, (next; 2))
+    p(1, (next if true; 2))
   }; :ok
 }
 assert_equal '3', %q{
@@ -585,7 +585,7 @@ assert_equal '3', %q{
   i = 0
   1 + (while true
          break 2 if (i+=1) > 1
-         p(1, (next; 2))
+         p(1, (next if true; 2))
        end)
 }
 # redo
@@ -594,7 +594,7 @@ assert_equal 'ok', %q{
   1.times{
     break if i>1
     i+=1
-    p(1, (redo; 2))
+    p(1, (redo if true; 2))
   }; :ok
 }
 assert_equal '3', %q{
@@ -608,7 +608,7 @@ assert_equal '3', %q{
   i = 0
   1 + (while true
          break 2 if (i+=1) > 1
-         p(1, (redo; 2))
+         p(1, (redo if true; 2))
        end)
 }
 assert_equal '1', %q{
@@ -848,7 +848,7 @@ assert_normal_exit %q{
       def x(a=1, b, *rest); nil end
     end
   end
-}, bug2415 unless rjit_enabled? # flaky
+}, bug2415
 
 assert_normal_exit %q{
   0.times do
@@ -880,7 +880,7 @@ assert_normal_exit %q{
       end
     end
   end
-}, bug2415 unless rjit_enabled? # flaky
+}, bug2415
 
 assert_normal_exit %q{
   a {

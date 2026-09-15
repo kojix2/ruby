@@ -315,12 +315,22 @@ class OpenSSL::TestBN < OpenSSL::TestCase
     assert_instance_of(String, @e1.hash.to_s)
   end
 
+  def test_marshal
+    assert_equal(@e1, Marshal.load(Marshal.dump(@e1)))
+    assert_equal(@e2, Marshal.load(Marshal.dump(@e2)))
+
+    obj = Marshal.load("\x04\x08U:\x10OpenSSL::BNi\xfe\x01\x00")
+    assert_equal(-0xffff, obj)
+  end
+
   def test_argument_error
     bug15760 = '[ruby-core:92231] [Bug #15760]'
     assert_raise(ArgumentError, bug15760) { OpenSSL::BN.new(nil, 2) }
   end
 
   def test_get_flags_and_set_flags
+    return if aws_lc? # AWS-LC does not support BN::CONSTTIME.
+
     e = OpenSSL::BN.new(999)
 
     assert_equal(0, e.get_flags(OpenSSL::BN::CONSTTIME))
@@ -343,28 +353,40 @@ class OpenSSL::TestBN < OpenSSL::TestCase
     assert_equal(4, e.get_flags(OpenSSL::BN::CONSTTIME))
   end
 
-  if respond_to?(:ractor)
+  if defined?(Ractor) && respond_to?(:ractor)
+    unless Ractor.method_defined?(:value) # Ruby 3.4 or earlier
+      using Module.new {
+        refine Ractor do
+          alias value take
+        end
+      }
+    end
+
     ractor
     def test_ractor
-      assert_equal(@e1, Ractor.new { OpenSSL::BN.new("999") }.take)
-      assert_equal(@e3, Ractor.new { OpenSSL::BN.new("\a\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 2) }.take)
-      assert_equal("999", Ractor.new(@e1) { |e1| e1.to_s }.take)
-      assert_equal("07FFFFFFFFFFFFFFFFFFFFFFFFFF", Ractor.new(@e3) { |e3| e3.to_s(16) }.take)
-      assert_equal(2**107-1, Ractor.new(@e3) { _1.to_i }.take)
-      assert_equal([1000, -999], Ractor.new(@e2) { _1.coerce(1000) }.take)
-      assert_equal(false, Ractor.new  { 1.to_bn.zero? }.take)
-      assert_equal(true, Ractor.new { 1.to_bn.one? }.take)
-      assert_equal(true, Ractor.new(@e2) { _1.negative? }.take)
-      assert_equal("-03E7", Ractor.new(@e2) { _1.to_s(16) }.take)
-      assert_equal(2**107-1, Ractor.new(@e3) { _1.to_i }.take)
-      assert_equal([1000, -999], Ractor.new(@e2) { _1.coerce(1000) }.take)
-      assert_equal(true, Ractor.new { 0.to_bn.zero? }.take)
-      assert_equal(true, Ractor.new { 1.to_bn.one? }.take )
-      assert_equal(false,Ractor.new { 2.to_bn.odd? }.take)
-      assert_equal(true, Ractor.new(@e2) { _1.negative? }.take)
-      assert_include(128..255, Ractor.new { OpenSSL::BN.rand(8)}.take)
-      assert_include(0...2**32, Ractor.new { OpenSSL::BN.generate_prime(32) }.take)
-      assert_equal(0, Ractor.new { OpenSSL::BN.new(999).get_flags(OpenSSL::BN::CONSTTIME) }.take)
+      assert_equal(@e1, Ractor.new { OpenSSL::BN.new("999") }.value)
+      assert_equal(@e3, Ractor.new { OpenSSL::BN.new("\a\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF", 2) }.value)
+      assert_equal("999", Ractor.new(@e1) { |e1| e1.to_s }.value)
+      assert_equal("07FFFFFFFFFFFFFFFFFFFFFFFFFF", Ractor.new(@e3) { |e3| e3.to_s(16) }.value)
+      assert_equal(2**107-1, Ractor.new(@e3) { _1.to_i }.value)
+      assert_equal([1000, -999], Ractor.new(@e2) { _1.coerce(1000) }.value)
+      assert_equal(false, Ractor.new  { 1.to_bn.zero? }.value)
+      assert_equal(true, Ractor.new { 1.to_bn.one? }.value)
+      assert_equal(true, Ractor.new(@e2) { _1.negative? }.value)
+      assert_equal("-03E7", Ractor.new(@e2) { _1.to_s(16) }.value)
+      assert_equal(2**107-1, Ractor.new(@e3) { _1.to_i }.value)
+      assert_equal([1000, -999], Ractor.new(@e2) { _1.coerce(1000) }.value)
+      assert_equal(true, Ractor.new { 0.to_bn.zero? }.value)
+      assert_equal(true, Ractor.new { 1.to_bn.one? }.value )
+      assert_equal(false,Ractor.new { 2.to_bn.odd? }.value)
+      assert_equal(true, Ractor.new(@e2) { _1.negative? }.value)
+      assert_include(128..255, Ractor.new { OpenSSL::BN.rand(8)}.value)
+      assert_include(0...2**32, Ractor.new { OpenSSL::BN.generate_prime(32) }.value)
+      if !aws_lc? # AWS-LC does not support BN::CONSTTIME.
+        assert_equal(0, Ractor.new { OpenSSL::BN.new(999).get_flags(OpenSSL::BN::CONSTTIME) }.value)
+      end
+      # test if shareable when frozen
+      assert Ractor.shareable?(@e1.freeze)
     end
   end
 end

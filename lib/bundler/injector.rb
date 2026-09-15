@@ -41,7 +41,7 @@ module Bundler
 
         # resolve to see if the new deps broke anything
         @definition = builder.to_definition(lockfile_path, {})
-        @definition.resolve_remotely!
+        @definition.remotely!
 
         # since nothing broke, we can add those gems to the gemfile
         append_to(gemfile_path, build_gem_lines(@options[:conservative_versioning])) if @deps.any?
@@ -80,20 +80,19 @@ module Bundler
     def conservative_version(spec)
       version = spec.version
       return ">= 0" if version.nil?
-      segments = version.segments
       seg_end_index = version >= Gem::Version.new("1.0") ? 1 : 2
 
       prerelease_suffix = version.to_s.delete_prefix(version.release.to_s) if version.prerelease?
-      "#{version_prefix}#{segments[0..seg_end_index].join(".")}#{prerelease_suffix}"
+      "#{version_prefix}#{version.segments[0..seg_end_index].join(".")}#{prerelease_suffix}"
     end
 
     def version_prefix
       if @options[:strict]
         "= "
-      elsif @options[:optimistic]
-        ">= "
-      else
+      elsif @options[:pessimistic]
         "~> "
+      else
+        ">= "
       end
     end
 
@@ -108,17 +107,17 @@ module Bundler
         end
 
         if d.groups != Array(:default)
-          group = d.groups.size == 1 ? ", :group => #{d.groups.first.inspect}" : ", :groups => #{d.groups.inspect}"
+          group = d.groups.size == 1 ? ", group: #{d.groups.first.inspect}" : ", groups: #{d.groups.inspect}"
         end
 
-        source = ", :source => \"#{d.source}\"" unless d.source.nil?
-        path = ", :path => \"#{d.path}\"" unless d.path.nil?
-        git = ", :git => \"#{d.git}\"" unless d.git.nil?
-        github = ", :github => \"#{d.github}\"" unless d.github.nil?
-        branch = ", :branch => \"#{d.branch}\"" unless d.branch.nil?
-        ref = ", :ref => \"#{d.ref}\"" unless d.ref.nil?
-        glob = ", :glob => \"#{d.glob}\"" unless d.glob.nil?
-        require_path = ", :require => #{convert_autorequire(d.autorequire)}" unless d.autorequire.nil?
+        source = ", source: \"#{d.source}\"" unless d.source.nil?
+        path = ", path: \"#{d.path}\"" unless d.path.nil?
+        git = ", git: \"#{d.git}\"" unless d.git.nil?
+        github = ", github: \"#{d.github}\"" unless d.github.nil?
+        branch = ", branch: \"#{d.branch}\"" unless d.branch.nil?
+        ref = ", ref: \"#{d.ref}\"" unless d.ref.nil?
+        glob = ", glob: \"#{d.glob}\"" unless d.glob.nil?
+        require_path = ", require: #{convert_autorequire(d.autorequire)}" unless d.autorequire.nil?
 
         %(gem #{name}#{requirement}#{group}#{source}#{path}#{git}#{github}#{branch}#{ref}#{glob}#{require_path})
       end.join("\n")
@@ -184,7 +183,7 @@ module Bundler
     # @param [Array] gems            Array of names of gems to be removed.
     # @param [Pathname] gemfile_path The Gemfile from which to remove dependencies.
     def remove_gems_from_gemfile(gems, gemfile_path)
-      patterns = /gem\s+(['"])#{Regexp.union(gems)}\1|gem\s*\((['"])#{Regexp.union(gems)}\2\)/
+      patterns = /gem\s+(['"])#{Regexp.union(gems)}\1|gem\s*\((['"])#{Regexp.union(gems)}\2.*\)/
       new_gemfile = []
       multiline_removal = false
       File.readlines(gemfile_path).each do |line|

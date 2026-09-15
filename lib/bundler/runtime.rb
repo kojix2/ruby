@@ -4,6 +4,8 @@ module Bundler
   class Runtime
     include SharedHelpers
 
+    PRUNE_CATEGORIES = [:cache, :git].freeze
+
     def initialize(root, definition)
       @root = root
       @definition = definition
@@ -50,35 +52,30 @@ module Bundler
       Plugin.hook(Plugin::Events::GEM_BEFORE_REQUIRE_ALL, dependencies)
 
       dependencies.each do |dep|
-        required_file = nil
         Plugin.hook(Plugin::Events::GEM_BEFORE_REQUIRE, dep)
 
-        begin
-          # Loop through all the specified autorequires for the
-          # dependency. If there are none, use the dependency's name
-          # as the autorequire.
-          Array(dep.autorequire || dep.name).each do |file|
-            # Allow `require: true` as an alias for `require: <name>`
-            file = dep.name if file == true
-            required_file = file
-            begin
-              Kernel.require file
-            rescue RuntimeError => e
-              raise e if e.is_a?(LoadError) # we handle this a little later
+        # Loop through all the specified autorequires for the
+        # dependency. If there are none, use the dependency's name
+        # as the autorequire.
+        Array(dep.autorequire || dep.name).each do |file|
+          # Allow `require: true` as an alias for `require: <name>`
+          file = dep.name if file == true
+          required_file = file
+          begin
+            Kernel.require required_file
+          rescue LoadError => e
+            if dep.autorequire.nil? && e.path == required_file
+              if required_file.include?("-")
+                required_file = required_file.tr("-", "/")
+                retry
+              end
+            else
               raise Bundler::GemRequireError.new e,
                 "There was an error while trying to load the gem '#{file}'."
             end
-          end
-        rescue LoadError => e
-          raise if dep.autorequire || e.path != required_file
-
-          if dep.autorequire.nil? && dep.name.include?("-")
-            begin
-              namespaced_file = dep.name.tr("-", "/")
-              Kernel.require namespaced_file
-            rescue LoadError => e
-              raise if e.path != namespaced_file
-            end
+          rescue StandardError => e
+            raise Bundler::GemRequireError.new e,
+              "There was an error while trying to load the gem '#{file}'."
           end
         end
 
@@ -135,11 +132,23 @@ module Bundler
 
       specs_to_cache.each do |spec|
         next if spec.name == "bundler"
-        next if spec.source.is_a?(Source::Gemspec)
-        spec.source.cache(spec, custom_path) if spec.source.respond_to?(:cache)
+
+        source = spec.source
+        next if source.is_a?(Source::Gemspec)
+
+        if source.respond_to?(:migrate_cache)
+          source.migrate_cache(custom_path, local: local)
+        elsif source.respond_to?(:cache)
+          source.cache(spec, custom_path)
+        end
       end
 
-      prune_cache(cache_path) unless Bundler.settings[:no_prune]
+      SharedHelpers.glob_files_in_dir("*/.git", cache_path.to_s).each do |git_dir|
+        FileUtils.rm_rf(git_dir)
+        FileUtils.touch(File.expand_path("../.bundlecache", git_dir))
+      end
+
+      prune_cache(cache_path) unless Bundler.settings[:keep_outdated_cache]
     end
 
     def prune_cache(cache_path)
@@ -152,13 +161,15 @@ module Bundler
     end
 
     def clean(dry_run = false)
-      gem_bins             = Dir["#{Gem.dir}/bin/*"]
-      git_dirs             = Dir["#{Gem.dir}/bundler/gems/*"]
-      git_cache_dirs       = Dir["#{Gem.dir}/cache/bundler/git/*"]
-      gem_dirs             = Dir["#{Gem.dir}/gems/*"]
-      gem_files            = Dir["#{Gem.dir}/cache/*.gem"]
-      gemspec_files        = Dir["#{Gem.dir}/specifications/*.gemspec"]
-      extension_dirs       = Dir["#{Gem.dir}/extensions/*/*/*"] + Dir["#{Gem.dir}/bundler/gems/extensions/*/*/*"]
+      gem_bins             = SharedHelpers.glob_files_in_dir("bin/*", Gem.dir)
+      git_dirs             = SharedHelpers.glob_files_in_dir("bundler/gems/*", Gem.dir)
+      git_cache_dirs       = SharedHelpers.glob_files_in_dir("cache/bundler/git/*", Gem.dir)
+      gem_dirs             = SharedHelpers.glob_files_in_dir("gems/*", Gem.dir)
+      gem_files            = SharedHelpers.glob_files_in_dir("cache/*.gem", Gem.dir)
+      gemspec_files        = Gem::SpecificationRecord.dirs_from([Gem.dir]).flat_map do |dir|
+        SharedHelpers.glob_files_in_dir("*.gemspec", dir)
+      end
+      extension_dirs       = SharedHelpers.glob_files_in_dir("extensions/*/*/*", Gem.dir) + SharedHelpers.glob_files_in_dir("bundler/gems/extensions/*/*/*", Gem.dir)
       spec_gem_paths       = []
       # need to keep git sources around
       spec_git_paths       = @definition.spec_git_paths
@@ -167,7 +178,14 @@ module Bundler
       spec_cache_paths     = []
       spec_gemspec_paths   = []
       spec_extension_paths = []
-      Bundler.rubygems.add_default_gems_to(specs).values.each do |spec|
+      specs_to_keep = Bundler.rubygems.add_default_gems_to(specs).values
+
+      current_bundler = Bundler.rubygems.find_bundler(Bundler.gem_version)
+      if current_bundler
+        specs_to_keep << current_bundler
+      end
+
+      specs_to_keep.each do |spec|
         spec_gem_paths << spec.full_gem_path
         # need to check here in case gems are nested like for the rails git repo
         md = %r{(.+bundler/gems/.+-[a-f0-9]{7,12})}.match(spec.full_gem_path)
@@ -215,10 +233,73 @@ module Bundler
       output
     end
 
+    # Removes the artifacts Bundler keeps for its own bookkeeping and can rebuild
+    # from the lockfile. Gem contents are never touched.
+    def prune(categories)
+      categories = expand_prune_categories(categories)
+      return if categories.empty?
+
+      # Without a bundle path the cache is shared with RubyGems, so it holds gem
+      # files Bundler never put there.
+      if Bundler.use_system_gems?
+        Bundler.ui.warn "The `prune` setting was ignored because this bundle installs into the system gem " \
+                        "directory, which Bundler shares with RubyGems. Run " \
+                        "`bundle config set --local path vendor/bundle` to prune.", wrap: true
+        return
+      end
+
+      # Git metadata first, because resolving a checkout's install path can need
+      # the mirror that pruning the cache removes.
+      prune_git_metadata if categories.include?(:git)
+      prune_download_cache if categories.include?(:cache)
+    end
+
     private
 
+    # Anything that is not a category name is read as a boolean with Bundler's
+    # usual vocabulary, so `BUNDLE_PRUNE=1` selects every category and keeps
+    # doing so as categories are added. That way a tool can set the flag without
+    # tracking this list.
+    def expand_prune_categories(categories)
+      Array(categories).flat_map do |category|
+        name = category.to_s
+        next name.to_sym if PRUNE_CATEGORIES.include?(name.to_sym)
+
+        Settings.to_bool(name) ? PRUNE_CATEGORIES : []
+      end.uniq
+    end
+
+    def prune_download_cache
+      cache_path = File.join(Bundler.bundle_path, "cache")
+      return unless File.exist?(cache_path)
+
+      Bundler.ui.info "Removing the download cache at #{cache_path}"
+      SharedHelpers.filesystem_access(cache_path) do |p|
+        FileUtils.rm_rf(p)
+      end
+    end
+
+    def prune_git_metadata
+      owned = "#{Bundler.install_path}#{File::SEPARATOR}"
+      git_dirs = @definition.sources.git_sources.reject(&:local?).filter_map do |source|
+        install_path = source.install_path.to_s
+        next unless install_path.start_with?(owned)
+
+        git_dir = File.join(install_path, ".git")
+        git_dir if File.exist?(git_dir)
+      end
+      return if git_dirs.empty?
+
+      Bundler.ui.info "Removing git metadata from checked out git gems"
+      git_dirs.each do |git_dir|
+        SharedHelpers.filesystem_access(git_dir) do |p|
+          FileUtils.rm_rf(p)
+        end
+      end
+    end
+
     def prune_gem_cache(resolve, cache_path)
-      cached = Dir["#{cache_path}/*.gem"]
+      cached = SharedHelpers.glob_files_in_dir("*.gem", cache_path.to_s)
 
       cached = cached.delete_if do |path|
         spec = Bundler.rubygems.spec_from_gem path
@@ -233,13 +314,17 @@ module Bundler
 
         cached.each do |path|
           Bundler.ui.info "  * #{File.basename(path)}"
-          File.delete(path)
+
+          begin
+            File.delete(path)
+          rescue Errno::ENOENT
+          end
         end
       end
     end
 
     def prune_git_and_path_cache(resolve, cache_path)
-      cached = Dir["#{cache_path}/*/.bundlecache"]
+      cached = SharedHelpers.glob_files_in_dir("*/.bundlecache", cache_path.to_s)
 
       cached = cached.delete_if do |path|
         name = File.basename(File.dirname(path))
@@ -263,10 +348,10 @@ module Bundler
 
     def setup_manpath
       # Add man/ subdirectories from activated bundles to MANPATH for man(1)
-      manuals = $LOAD_PATH.map do |path|
+      manuals = $LOAD_PATH.filter_map do |path|
         man_subdir = path.sub(/lib$/, "man")
-        man_subdir unless Dir[man_subdir + "/man?/"].empty?
-      end.compact
+        man_subdir unless SharedHelpers.glob_files_in_dir("man?/", man_subdir).empty?
+      end
 
       return if manuals.empty?
       Bundler::SharedHelpers.set_env "MANPATH", manuals.concat(

@@ -1,15 +1,14 @@
 # frozen_string_literal: false
 require 'test/unit'
-require '-test-/time'
 
 class TestTimeTZ < Test::Unit::TestCase
   has_right_tz = true
   has_lisbon_tz = true
   force_tz_test = ENV["RUBY_FORCE_TIME_TZ_TEST"] == "yes"
   case RUBY_PLATFORM
-  when /darwin|linux/
+  when /darwin|linux|freebsd/
     force_tz_test = true
-  when /freebsd|openbsd/
+  when /openbsd/
     has_lisbon_tz = false
     force_tz_test = true
   end

@@ -2,7 +2,6 @@
 require 'test/unit'
 require 'stringio'
 require 'tempfile'
-require 'date'
 
 require 'psych'
 
@@ -13,6 +12,13 @@ module Psych
       yield
     ensure
       $VERBOSE = verbose
+    end
+
+    # True when psych was built with the experimental libfyaml backend
+    # (--enable-libfyaml), which follows YAML 1.2 and formats output
+    # differently from the default libyaml backend.
+    def libfyaml?
+      defined?(Psych::BACKEND) && Psych::BACKEND == 'libfyaml'
     end
 
     def with_default_external(enc)

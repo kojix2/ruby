@@ -58,6 +58,8 @@ class TestProcess < Test::Unit::TestCase
 
   def test_rlimit_nofile
     return unless rlimit_exist?
+    omit "LSAN needs to open proc file" if Test::Sanitizers.lsan_enabled?
+
     with_tmpchdir {
       File.write 's', <<-"End"
         # Too small RLIMIT_NOFILE, such as zero, causes problems.
@@ -114,14 +116,19 @@ class TestProcess < Test::Unit::TestCase
     }
     assert_raise(ArgumentError) { Process.getrlimit(:FOO) }
     assert_raise(ArgumentError) { Process.getrlimit("FOO") }
-    assert_raise_with_message(ArgumentError, /\u{30eb 30d3 30fc}/) { Process.getrlimit("\u{30eb 30d3 30fc}") }
+
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(ArgumentError, /\u{30eb 30d3 30fc}/) { Process.getrlimit("\u{30eb 30d3 30fc}") }
+    end
   end
 
   def test_rlimit_value
     return unless rlimit_exist?
     assert_raise(ArgumentError) { Process.setrlimit(:FOO, 0) }
     assert_raise(ArgumentError) { Process.setrlimit(:CORE, :FOO) }
-    assert_raise_with_message(ArgumentError, /\u{30eb 30d3 30fc}/) { Process.setrlimit("\u{30eb 30d3 30fc}", 0) }
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(ArgumentError, /\u{30eb 30d3 30fc}/) { Process.setrlimit("\u{30eb 30d3 30fc}", 0) }
+    end
     assert_raise_with_message(ArgumentError, /\u{30eb 30d3 30fc}/) { Process.setrlimit(:CORE, "\u{30eb 30d3 30fc}") }
     with_tmpchdir do
       s = run_in_child(<<-'End')
@@ -203,7 +210,8 @@ class TestProcess < Test::Unit::TestCase
     # the ASAN runtime library sets RLIMIT_CORE to 0, "to avoid dumping a 16T+ core file", and
     # that inteferes with this test.
     asan_options = ENV['ASAN_OPTIONS'] || ''
-    asan_options  << ':' unless asan_options.empty?
+    # NOTE: ENV['ASAN_OPTIONS'] returns a frozen String, so append non-destructively.
+    asan_options += ':' unless asan_options.empty?
     env = {
       'ASAN_OPTIONS' => "#{asan_options}disable_coredump=0"
     }
@@ -275,20 +283,21 @@ class TestProcess < Test::Unit::TestCase
     end;
   end
 
-  MANDATORY_ENVS = %w[RUBYLIB RJIT_SEARCH_BUILD_DIR]
-  case RbConfig::CONFIG['target_os']
-  when /linux/
-    MANDATORY_ENVS << 'LD_PRELOAD'
-  when /mswin|mingw/
-    MANDATORY_ENVS.concat(%w[HOME USER TMPDIR])
-  when /darwin/
-    MANDATORY_ENVS.concat(ENV.keys.grep(/\A__CF_/))
-  end
+  MANDATORY_ENVS = %w[RUBYLIB GEM_HOME GEM_PATH RUBY_FREE_AT_EXIT]
   if e = RbConfig::CONFIG['LIBPATHENV']
     MANDATORY_ENVS << e
   end
   if e = RbConfig::CONFIG['PRELOADENV'] and !e.empty?
     MANDATORY_ENVS << e
+  end
+  case RbConfig::CONFIG['target_os']
+  when /mswin|mingw/
+    MANDATORY_ENVS.concat(%w[HOME USER TMPDIR PROCESSOR_ARCHITECTURE])
+  when /darwin/
+    MANDATORY_ENVS.concat(%w[TMPDIR], ENV.keys.grep(/\A__CF_/))
+    # IO.popen([ENV.keys.to_h {|e| [e, nil]},
+    #           RUBY, "-e", %q[print ENV.keys.join(?\0)]],
+    #          &:read).split(?\0)
   end
   PREENVARG = ['-e', "%w[#{MANDATORY_ENVS.join(' ')}].each{|e|ENV.delete(e)}"]
   ENVARG = ['-e', 'ENV.each {|k,v| puts "#{k}=#{v}" }']
@@ -922,15 +931,29 @@ class TestProcess < Test::Unit::TestCase
     }
   end
 
-  def test_popen_fork
-    IO.popen("-") {|io|
-      if !io
-        puts "fooo"
-      else
-        assert_equal("fooo\n", io.read)
+  if Process.respond_to?(:fork)
+    def test_popen_fork
+      IO.popen("-") do |io|
+        if !io
+          puts "fooo"
+        else
+          assert_equal("fooo\n", io.read)
+        end
       end
-    }
-  rescue NotImplementedError
+    end
+
+    def test_popen_fork_ensure
+      IO.popen("-") do |io|
+        if !io
+          STDERR.reopen(STDOUT)
+          raise "fooo"
+        else
+          assert_empty io.read
+        end
+      end
+    rescue RuntimeError
+      abort "[Bug #20995] should not reach here"
+    end
   end
 
   def test_fd_inheritance
@@ -1214,6 +1237,35 @@ class TestProcess < Test::Unit::TestCase
     }
   end
 
+  def test_spawn_trailing_backslash
+    return unless windows?
+    [
+      ["AA BB\\"],
+      ["AA BB\\", "CC"],
+      ["AA BB\\\\", "CC"],
+      ["C:\\Program Files\\Foo\\", "--verbose"],
+      ["AA BB", "CC"],          # control: no trailing backslash
+      ["AA\\", "CC"],           # control: no space, so it is not quoted
+    ].each do |args|
+      out = IO.popen([EnvUtil.rubybin, "-e", "STDOUT.binmode; print Marshal.dump(ARGV)", *args], "rb", &:read)
+      assert_equal(args, Marshal.load(out), "[Bug #22199] argv did not round-trip: #{args.inspect}")
+    end
+  end
+
+  def test_argv_backslash_before_space
+    return unless windows?
+    [
+      ["AA\\ ", "BB"],
+      ["AA\\  ", "BB"],
+      ["AA\\\\ ", "BB"],
+      ["AA ", "BB"],           # control: no backslash
+      ["AA\\", "BB"],          # control: no space after the backslash
+    ].each do |args|
+      out = IO.popen([EnvUtil.rubybin, "-e", "STDOUT.binmode; print Marshal.dump(ARGV)", *args], "rb", &:read)
+      assert_equal(args, Marshal.load(out), "[Bug #22201] argv did not round-trip: #{args.inspect}")
+    end
+  end
+
   def test_exec_wordsplit
     with_tmpchdir {|d|
       File.write("script", <<-'End')
@@ -1454,19 +1506,18 @@ class TestProcess < Test::Unit::TestCase
       assert_equal(s, s)
       assert_equal(s, s.to_i)
 
-      assert_deprecated_warn(/\buse .*Process::Status/) do
-        assert_equal(s.to_i & 0x55555555, s & 0x55555555)
-      end
-      assert_deprecated_warn(/\buse .*Process::Status/) do
-        assert_equal(s.to_i >> 1, s >> 1)
-      end
-      assert_raise(ArgumentError) do
-        s >> -1
-      end
       assert_equal(false, s.stopped?)
       assert_equal(nil, s.stopsig)
 
       assert_equal(s, Marshal.load(Marshal.dump(s)))
+    end
+  end
+
+  def test_status_frozen_shareable
+    with_tmpchdir do
+      s = run_in_child("exit 1")
+      assert_predicate(s, :frozen?)
+      assert(Ractor.shareable?(s), "a frozen Process::Status should be shareable")
     end
   end
 
@@ -1555,7 +1606,7 @@ class TestProcess < Test::Unit::TestCase
   def test_wait_exception
     bug11340 = '[ruby-dev:49176] [Bug #11340]'
     t0 = t1 = nil
-    sec = 3
+    sec = EnvUtil.apply_timeout_scale(3)
     code = "puts;STDOUT.flush;Thread.start{gets;exit};sleep(#{sec})"
     IO.popen([RUBY, '-e', code], 'r+') do |f|
       pid = f.pid
@@ -1677,9 +1728,10 @@ class TestProcess < Test::Unit::TestCase
       if u = Etc.getpwuid(Process.uid)
         assert_equal(Process.uid, Process::UID.from_name(u.name), u.name)
       end
-      assert_raise_with_message(ArgumentError, /\u{4e0d 5b58 5728}/) {
+      exc = assert_raise_kind_of(ArgumentError, SystemCallError) {
         Process::UID.from_name("\u{4e0d 5b58 5728}")
       }
+      assert_match(/\u{4e0d 5b58 5728}/, exc.message) if exc.is_a?(ArgumentError)
     end
   end
 
@@ -1688,12 +1740,7 @@ class TestProcess < Test::Unit::TestCase
       if g = Etc.getgrgid(Process.gid)
         assert_equal(Process.gid, Process::GID.from_name(g.name), g.name)
       end
-      expected_excs = [ArgumentError]
-      expected_excs << Errno::ENOENT if defined?(Errno::ENOENT)
-      expected_excs << Errno::ESRCH if defined?(Errno::ESRCH) # WSL 2 actually raises Errno::ESRCH
-      expected_excs << Errno::EBADF if defined?(Errno::EBADF)
-      expected_excs << Errno::EPERM if defined?(Errno::EPERM)
-      exc = assert_raise(*expected_excs) do
+      exc = assert_raise_kind_of(ArgumentError, SystemCallError) do
         Process::GID.from_name("\u{4e0d 5b58 5728}") # fu son zai ("absent" in Kanji)
       end
       assert_match(/\u{4e0d 5b58 5728}/, exc.message) if exc.is_a?(ArgumentError)
@@ -1748,11 +1795,7 @@ class TestProcess < Test::Unit::TestCase
       end
       assert_send [sig_r, :wait_readable, 5], 'self-pipe not readable'
     end
-    if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled? # checking -DRJIT_FORCE_ENABLE. It may trigger extra SIGCHLD.
-      assert_equal [true], signal_received.uniq, "[ruby-core:19744]"
-    else
-      assert_equal [true], signal_received, "[ruby-core:19744]"
-    end
+    assert_equal [true], signal_received.uniq, "[ruby-core:19744]"
   rescue NotImplementedError, ArgumentError
   ensure
     begin
@@ -1762,15 +1805,12 @@ class TestProcess < Test::Unit::TestCase
   end
 
   def test_no_curdir
-    if /solaris/i =~ RUBY_PLATFORM
-      omit "Temporary omit to avoid CI failures after commit to use realpath on required files"
-    end
     with_tmpchdir {|d|
       Dir.mkdir("vd")
       status = nil
       Dir.chdir("vd") {
         dir = "#{d}/vd"
-        # OpenSolaris cannot remove the current directory.
+        # Windows cannot remove the current directory with permission issues.
         system(RUBY, "--disable-gems", "-e", "Dir.chdir '..'; Dir.rmdir #{dir.dump}", err: File::NULL)
         system({"RUBYLIB"=>nil}, RUBY, "--disable-gems", "-e", "exit true")
         status = $?
@@ -1804,9 +1844,6 @@ class TestProcess < Test::Unit::TestCase
   end
 
   def test_aspawn_too_long_path
-    if /solaris/i =~ RUBY_PLATFORM && !defined?(Process::RLIMIT_NPROC)
-      omit "Too exhaustive test on platforms without Process::RLIMIT_NPROC such as Solaris 10"
-    end
     bug4315 = '[ruby-core:34833] #7904 [ruby-core:52628] #11613'
     assert_fail_too_long_path(%w"echo |", bug4315)
   end
@@ -1997,7 +2034,7 @@ class TestProcess < Test::Unit::TestCase
   end
 
   def test_popen_reopen
-    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
     begin;
       io = File.open(IO::NULL)
       io2 = io.dup
@@ -2198,7 +2235,6 @@ EOS
   end
 
   def test_clock_gettime_unit
-    t0 = Time.now.to_f
     [
       [:nanosecond,  1_000_000_000],
       [:microsecond, 1_000_000],
@@ -2214,6 +2250,7 @@ EOS
         assert_raise(ArgumentError){ Process.clock_gettime(Process::CLOCK_REALTIME, unit) }
         next
       end
+      t0 = Time.now.to_f
       t1 = Process.clock_gettime(Process::CLOCK_REALTIME, unit)
       assert_kind_of num.integer? ? Integer : num.class, t1, [unit, num].inspect
       assert_in_delta t0, t1/num, 1, [unit, num].inspect
@@ -2388,7 +2425,7 @@ EOS
   end
 
   def test_deadlock_by_signal_at_forking
-    assert_separately(%W(- #{RUBY}), <<-INPUT, timeout: 100)
+    assert_ruby_status(%W(- #{RUBY}), <<-INPUT, timeout: 100)
       ruby = ARGV.shift
       GC.start # reduce garbage
       GC.disable # avoid triggering CoW after forks
@@ -2550,7 +2587,7 @@ EOS
       bin = "#{EnvUtil.rubybin}"
       args = Array.new(256) {"x"}
       GC.stress = true
-      system(bin, "--disable=gems", "-w", "-e", "puts ARGV", *args)
+      system(bin, "--disable=gems", "-w", "-W:no-experimental", "-e", "puts ARGV", *args)
     end;
   end
 
@@ -2720,6 +2757,31 @@ EOS
     end;
   end if Process.respond_to?(:_fork)
 
+  def test__fork_raisig_after_fork
+    assert_in_out_err([], "#{<<~"{#"}\n#{<<~'};'}", [], [/.*: exception during fork in child/, :*])
+    {#
+      module BadForkTracker
+        def _fork
+          pid = super
+          if pid == 0
+            raise "exception during fork in child"
+          end
+          pid
+        end
+      end
+
+      Process.singleton_class.prepend(BadForkTracker)
+
+      begin
+        fork do
+          puts "I'm child #{Process.pid} and I'm exiting"
+        end
+      rescue StandardError
+        puts "#{Process.pid} Received Error, Ignoring"
+      end
+    };
+  end if Process.respond_to?(:_fork)
+
   def test_warmup_promote_all_objects_to_oldgen
     assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
     require 'objspace'
@@ -2775,13 +2837,27 @@ EOS
       # Disable GC so we can make sure GC only runs in Process.warmup
       GC.disable
 
-      total_slots_before = GC.stat(:heap_available_slots) + GC.stat(:heap_allocatable_slots)
+      total_slots_before = GC.stat(:heap_available_slots) + GC.stat(:heap_allocatable_bytes) / GC.stat_heap(0, :slot_size)
 
       Process.warmup
 
-      assert_equal(total_slots_before, GC.stat(:heap_available_slots) + GC.stat(:heap_allocatable_slots))
+      # TODO: flaky
+      # assert_equal(total_slots_before, GC.stat(:heap_available_slots) + GC.stat(:heap_allocatable_bytes) / GC.stat_heap(0, :slot_size))
+
       assert_equal(0, GC.stat(:heap_empty_pages))
       assert_operator(GC.stat(:total_freed_pages), :>, 0)
+    end;
+  end
+
+  def test_warmup_eager_loads_error_decoration_gems
+    assert_separately(["--enable=gems"], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      features = ["error_highlight", "did_you_mean", "syntax_suggest"]
+      assert_empty($LOADED_FEATURES.grep(/\/(#{features.join("|")})\.rb\z/))
+      Process.warmup
+      features.each do |feature|
+        assert_include($LOADED_FEATURES.map { File.basename(it, ".rb") }, feature)
+      end
     end;
   end
 

@@ -23,7 +23,8 @@ Gem::Specification.new do |s|
   s.require_path = %[lib]
   s.files = %w[
     .document
-    LICENSE.txt
+    BSDL
+    COPYING
     README.md
     ext/io/console/console.c
     ext/io/console/extconf.rb
@@ -35,16 +36,18 @@ Gem::Specification.new do |s|
   if Gem::Platform === s.platform and s.platform =~ 'java'
     s.files.delete_if {|f| f.start_with?("ext/")}
     s.extensions.clear
-    s.require_paths.unshift('lib/ffi')
+    s.require_paths.unshift('jruby/lib')
     s.files.concat(%w[
-      lib/ffi/io/console.rb
-      lib/ffi/io/console/bsd_console.rb
-      lib/ffi/io/console/common.rb
-      lib/ffi/io/console/linux_console.rb
-      lib/ffi/io/console/native_console.rb
-      lib/ffi/io/console/stty_console.rb
-      lib/ffi/io/console/stub_console.rb
-      lib/ffi/io/console/version.rb
+      jruby/lib/io/console.rb
+      jruby/lib/io/console/backend/ffi/termios.rb
+      jruby/lib/io/console/backend/ffi/windows.rb
+      jruby/lib/io/console/backend/stty.rb
+      jruby/lib/io/console/backend/stub.rb
+      jruby/lib/io/console/common.rb
+      jruby/lib/io/console/constants/bsd.rb
+      jruby/lib/io/console/constants/linux.rb
+      jruby/lib/io/console/constants/windows.rb
+      jruby/lib/io/console/version.rb
     ])
   end
 

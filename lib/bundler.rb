@@ -1,16 +1,15 @@
 # frozen_string_literal: true
 
+require_relative "bundler/rubygems_ext"
 require_relative "bundler/vendored_fileutils"
-require "pathname"
+autoload :Pathname, "pathname" unless defined?(Pathname)
 require "rbconfig"
 
 require_relative "bundler/errors"
 require_relative "bundler/environment_preserver"
 require_relative "bundler/plugin"
-require_relative "bundler/rubygems_ext"
 require_relative "bundler/rubygems_integration"
 require_relative "bundler/version"
-require_relative "bundler/constants"
 require_relative "bundler/current_ruby"
 require_relative "bundler/build_metadata"
 
@@ -27,7 +26,7 @@ require_relative "bundler/build_metadata"
 # or Bundler.setup to setup environment where only specified gems and their
 # specified versions could be used.
 #
-# See {Bundler website}[https://bundler.io/docs.html] for extensive documentation
+# See {Bundler documentation}[https://guides.rubygems.org/command-reference/bundle/] for extensive documentation
 # on gemfiles creation and Bundler usage.
 #
 # As a standard library inside project, Bundler could be used for introspection
@@ -42,7 +41,6 @@ module Bundler
   autoload :Checksum,               File.expand_path("bundler/checksum", __dir__)
   autoload :CLI,                    File.expand_path("bundler/cli", __dir__)
   autoload :CIDetector,             File.expand_path("bundler/ci_detector", __dir__)
-  autoload :CompactIndexClient,     File.expand_path("bundler/compact_index_client", __dir__)
   autoload :Definition,             File.expand_path("bundler/definition", __dir__)
   autoload :Dependency,             File.expand_path("bundler/dependency", __dir__)
   autoload :Deprecate,              File.expand_path("bundler/deprecate", __dir__)
@@ -52,16 +50,18 @@ module Bundler
   autoload :Env,                    File.expand_path("bundler/env", __dir__)
   autoload :Fetcher,                File.expand_path("bundler/fetcher", __dir__)
   autoload :FeatureFlag,            File.expand_path("bundler/feature_flag", __dir__)
+  autoload :FREEBSD,                File.expand_path("bundler/constants", __dir__)
   autoload :GemHelper,              File.expand_path("bundler/gem_helper", __dir__)
-  autoload :GemHelpers,             File.expand_path("bundler/gem_helpers", __dir__)
   autoload :GemVersionPromoter,     File.expand_path("bundler/gem_version_promoter", __dir__)
-  autoload :Graph,                  File.expand_path("bundler/graph", __dir__)
   autoload :Index,                  File.expand_path("bundler/index", __dir__)
   autoload :Injector,               File.expand_path("bundler/injector", __dir__)
   autoload :Installer,              File.expand_path("bundler/installer", __dir__)
   autoload :LazySpecification,      File.expand_path("bundler/lazy_specification", __dir__)
   autoload :LockfileParser,         File.expand_path("bundler/lockfile_parser", __dir__)
   autoload :MatchRemoteMetadata,    File.expand_path("bundler/match_remote_metadata", __dir__)
+  autoload :Materialization,        File.expand_path("bundler/materialization", __dir__)
+  autoload :NULL,                   File.expand_path("bundler/constants", __dir__)
+  autoload :Override,               File.expand_path("bundler/override", __dir__)
   autoload :ProcessLock,            File.expand_path("bundler/process_lock", __dir__)
   autoload :RemoteSpecification,    File.expand_path("bundler/remote_specification", __dir__)
   autoload :Resolver,               File.expand_path("bundler/resolver", __dir__)
@@ -80,6 +80,7 @@ module Bundler
   autoload :UI,                     File.expand_path("bundler/ui", __dir__)
   autoload :URICredentialsFilter,   File.expand_path("bundler/uri_credentials_filter", __dir__)
   autoload :URINormalizer,          File.expand_path("bundler/uri_normalizer", __dir__)
+  autoload :WINDOWS,                File.expand_path("bundler/constants", __dir__)
   autoload :SafeMarshal,            File.expand_path("bundler/safe_marshal", __dir__)
 
   class << self
@@ -111,13 +112,13 @@ module Bundler
     end
 
     def configured_bundle_path
-      @configured_bundle_path ||= settings.path.tap(&:validate!)
+      @configured_bundle_path ||= Bundler.settings.path.tap(&:validate!)
     end
 
     # Returns absolute location of where binstubs are installed to.
     def bin_path
       @bin_path ||= begin
-        path = settings[:bin] || "bin"
+        path = Bundler.settings[:bin] || "bin"
         path = Pathname.new(path).expand_path(root).expand_path
         mkdir_p(path)
         path
@@ -155,6 +156,7 @@ module Bundler
       # Return if all groups are already loaded
       return @setup if defined?(@setup) && @setup
 
+      configure_custom_gemfile
       definition.validate_runtime!
 
       SharedHelpers.print_major_deprecations!
@@ -171,14 +173,14 @@ module Bundler
       self_manager.restart_with_locked_bundler_if_needed
     end
 
-    # Automatically install dependencies if Bundler.settings[:auto_install] exists.
+    # Automatically install dependencies if <tt>settings[:auto_install]</tt> exists.
     # This is set through config cmd `bundle config set --global auto_install 1`.
     #
     # Note that this method `nil`s out the global Definition object, so it
     # should be called first, before you instantiate anything like an
     # `Installer` that'll keep a reference to the old one instead.
     def auto_install
-      return unless settings[:auto_install]
+      return unless Bundler.settings[:auto_install]
 
       begin
         definition.specs
@@ -209,7 +211,6 @@ module Bundler
     #    Bundler.require(:test)   # requires second_gem
     #
     def require(*groups)
-      load_plugins
       setup(*groups).require(*groups)
     end
 
@@ -218,8 +219,7 @@ module Bundler
     end
 
     def environment
-      SharedHelpers.major_deprecation 2, "Bundler.environment has been removed in favor of Bundler.load", print_caller_location: true
-      load
+      SharedHelpers.feature_removed! "Bundler.environment has been removed in favor of Bundler.load"
     end
 
     # Returns an instance of Bundler::Definition for given Gemfile and lockfile
@@ -237,10 +237,10 @@ module Bundler
     end
 
     def frozen_bundle?
-      frozen = settings[:frozen]
+      frozen = Bundler.settings[:frozen]
       return frozen unless frozen.nil?
 
-      settings[:deployment]
+      Bundler.settings[:deployment]
     end
 
     def locked_gems
@@ -251,12 +251,6 @@ module Bundler
           lock = Bundler.read_file(Bundler.default_lockfile)
           LockfileParser.new(lock)
         end
-    end
-
-    def most_specific_locked_platform?(platform)
-      return false unless defined?(@definition) && @definition
-
-      definition.most_specific_locked_platform == platform
     end
 
     def ruby_scope
@@ -347,7 +341,7 @@ module Bundler
 
     def app_cache(custom_path = nil)
       path = custom_path || root
-      Pathname.new(path).join(settings.app_cache_path)
+      Pathname.new(path).join(Bundler.settings.app_cache_path)
     end
 
     def tmp(name = Process.pid.to_s)
@@ -370,16 +364,11 @@ module Bundler
       ORIGINAL_ENV.clone
     end
 
-    # @deprecated Use `unbundled_env` instead
     def clean_env
-      message =
-        "`Bundler.clean_env` has been deprecated in favor of `Bundler.unbundled_env`. " \
-        "If you instead want the environment before bundler was originally loaded, use `Bundler.original_env`"
       removed_message =
         "`Bundler.clean_env` has been removed in favor of `Bundler.unbundled_env`. " \
         "If you instead want the environment before bundler was originally loaded, use `Bundler.original_env`"
-      Bundler::SharedHelpers.major_deprecation(2, message, removed_message: removed_message, print_caller_location: true)
-      unbundled_env
+      Bundler::SharedHelpers.feature_removed!(removed_message)
     end
 
     # @return [Hash] Environment with all bundler-related variables removed
@@ -397,16 +386,11 @@ module Bundler
       with_env(original_env) { yield }
     end
 
-    # @deprecated Use `with_unbundled_env` instead
     def with_clean_env
-      message =
-        "`Bundler.with_clean_env` has been deprecated in favor of `Bundler.with_unbundled_env`. " \
-        "If you instead want the environment before bundler was originally loaded, use `Bundler.with_original_env`"
       removed_message =
         "`Bundler.with_clean_env` has been removed in favor of `Bundler.with_unbundled_env`. " \
         "If you instead want the environment before bundler was originally loaded, use `Bundler.with_original_env`"
-      Bundler::SharedHelpers.major_deprecation(2, message, removed_message: removed_message, print_caller_location: true)
-      with_env(unbundled_env) { yield }
+      Bundler::SharedHelpers.feature_removed!(removed_message)
     end
 
     # Run block with all bundler-related variables removed
@@ -419,16 +403,11 @@ module Bundler
       with_original_env { Kernel.system(*args) }
     end
 
-    # @deprecated Use `unbundled_system` instead
     def clean_system(*args)
-      message =
-        "`Bundler.clean_system` has been deprecated in favor of `Bundler.unbundled_system`. " \
-        "If you instead want to run the command in the environment before bundler was originally loaded, use `Bundler.original_system`"
       removed_message =
         "`Bundler.clean_system` has been removed in favor of `Bundler.unbundled_system`. " \
         "If you instead want to run the command in the environment before bundler was originally loaded, use `Bundler.original_system`"
-      Bundler::SharedHelpers.major_deprecation(2, message, removed_message: removed_message, print_caller_location: true)
-      with_env(unbundled_env) { Kernel.system(*args) }
+      Bundler::SharedHelpers.feature_removed!(removed_message)
     end
 
     # Run subcommand in an environment with all bundler related variables removed
@@ -441,16 +420,11 @@ module Bundler
       with_original_env { Kernel.exec(*args) }
     end
 
-    # @deprecated Use `unbundled_exec` instead
     def clean_exec(*args)
-      message =
-        "`Bundler.clean_exec` has been deprecated in favor of `Bundler.unbundled_exec`. " \
-        "If you instead want to exec to a command in the environment before bundler was originally loaded, use `Bundler.original_exec`"
       removed_message =
         "`Bundler.clean_exec` has been removed in favor of `Bundler.unbundled_exec`. " \
         "If you instead want to exec to a command in the environment before bundler was originally loaded, use `Bundler.original_exec`"
-      Bundler::SharedHelpers.major_deprecation(2, message, removed_message: removed_message, print_caller_location: true)
-      with_env(unbundled_env) { Kernel.exec(*args) }
+      Bundler::SharedHelpers.feature_removed!(removed_message)
     end
 
     # Run a `Kernel.exec` to a subcommand in an environment with all bundler related variables removed
@@ -459,8 +433,12 @@ module Bundler
     end
 
     def local_platform
-      return Gem::Platform::RUBY if settings[:force_ruby_platform]
+      return Gem::Platform::RUBY if Bundler.settings[:force_ruby_platform]
       Gem::Platform.local
+    end
+
+    def generic_local_platform
+      Gem::Platform.generic(local_platform)
     end
 
     def default_gemfile
@@ -499,16 +477,25 @@ module Bundler
     end
 
     def which(executable)
-      if File.file?(executable) && File.executable?(executable)
-        executable
-      elsif paths = ENV["PATH"]
+      executable_path = find_executable(executable)
+      return executable_path if executable_path
+
+      if (paths = ENV["PATH"])
         quote = '"'
         paths.split(File::PATH_SEPARATOR).find do |path|
           path = path[1..-2] if path.start_with?(quote) && path.end_with?(quote)
-          executable_path = File.expand_path(executable, path)
-          return executable_path if File.file?(executable_path) && File.executable?(executable_path)
+          executable_path = find_executable(File.expand_path(executable, path))
+          return executable_path if executable_path
         end
       end
+    end
+
+    def find_executable(path)
+      extensions = RbConfig::CONFIG["EXECUTABLE_EXTS"]&.split
+      extensions = [RbConfig::CONFIG["EXEEXT"]] unless extensions&.any?
+      candidates = extensions.map {|ext| "#{path}#{ext}" }
+
+      candidates.find {|candidate| File.file?(candidate) && File.executable?(candidate) }
     end
 
     def read_file(file)
@@ -540,19 +527,11 @@ module Bundler
     end
 
     def load_gemspec_uncached(file, validate = false)
-      path = Pathname.new(file)
-      contents = read_file(file)
-      spec = if contents.start_with?("---") # YAML header
-        eval_yaml_gemspec(path, contents)
-      else
-        # Eval the gemspec from its parent directory, because some gemspecs
-        # depend on "./" relative paths.
-        SharedHelpers.chdir(path.dirname.to_s) do
-          eval_gemspec(path, contents)
-        end
-      end
+      path = Pathname.new(file).expand_path
+      contents = read_file(path.to_s)
+      spec = eval_gemspec(path, contents)
       return unless spec
-      spec.loaded_from = path.expand_path.to_s
+      spec.loaded_from = path.to_s
       Bundler.rubygems.validate(spec) if validate
       spec
     end
@@ -563,28 +542,11 @@ module Bundler
 
     def git_present?
       return @git_present if defined?(@git_present)
-      @git_present = Bundler.which("git#{RbConfig::CONFIG["EXEEXT"]}")
+      @git_present = Bundler.which("git")
     end
 
     def feature_flag
-      @feature_flag ||= FeatureFlag.new(VERSION)
-    end
-
-    def load_plugins(definition = Bundler.definition)
-      return if defined?(@load_plugins_ran)
-
-      Bundler.rubygems.load_plugins
-
-      requested_path_gems = definition.requested_specs.select {|s| s.source.is_a?(Source::Path) }
-      path_plugin_files = requested_path_gems.map do |spec|
-        spec.matches_for_glob("rubygems_plugin#{Bundler.rubygems.suffix_pattern}")
-      rescue TypeError
-        error_message = "#{spec.name} #{spec.version} has an invalid gemspec"
-        raise Gem::InvalidSpecificationException, error_message
-      end.flatten
-      Bundler.rubygems.load_plugin_files(path_plugin_files)
-      Bundler.rubygems.load_env_plugins
-      @load_plugins_ran = true
+      @feature_flag ||= FeatureFlag.new(Bundler.settings[:simulate_version] || VERSION)
     end
 
     def reset!
@@ -600,7 +562,6 @@ module Bundler
 
     def reset_paths!
       @bin_path = nil
-      @bundler_major_version = nil
       @bundle_path = nil
       @configure = nil
       @configured_bundle_path = nil
@@ -624,6 +585,15 @@ module Bundler
       configure_gem_path
       configure_gem_home(path)
       Bundler.rubygems.clear_paths
+    end
+
+    def configure_custom_gemfile(custom_gemfile = nil)
+      custom_gemfile ||= Bundler.settings[:gemfile]
+
+      if custom_gemfile && !custom_gemfile.empty?
+        Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", File.expand_path(custom_gemfile)
+        reset_settings_and_root!
+      end
     end
 
     def self_manager
@@ -669,12 +639,28 @@ module Bundler
       Kernel.require "psych"
 
       Gem::Specification.from_yaml(contents)
-    rescue ::Psych::SyntaxError, ArgumentError, Gem::EndOfYAMLException, Gem::Exception
-      eval_gemspec(path, contents)
     end
 
     def eval_gemspec(path, contents)
-      eval(contents, TOPLEVEL_BINDING.dup, path.expand_path.to_s)
+      if contents.start_with?("---") # YAML header
+        eval_yaml_gemspec(path, contents)
+      else
+        # Eval the gemspec from its parent directory, because some gemspecs
+        # depend on "./" relative paths. The caller expands `path` first, since
+        # expanding it here would resolve against the gemspec directory once
+        # the chdir is active.
+        SharedHelpers.chdir(path.dirname.to_s) do
+          # TOPLEVEL_BINDING always belongs to the main box, so inside a
+          # Ruby::Box use a binding from the box Bundler is loaded in, where
+          # Gem::Specification carries Bundler's own monkey patches.
+          eval_binding = if defined?(Ruby::Box) && Ruby::Box.enabled?
+            Ruby::Box.current.eval("binding")
+          else
+            TOPLEVEL_BINDING.dup
+          end
+          eval(contents, eval_binding, path.to_s)
+        end
+      end
     rescue ScriptError, StandardError => e
       msg = "There was an error while loading `#{path.basename}`: #{e.message}"
 

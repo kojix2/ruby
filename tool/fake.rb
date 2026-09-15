@@ -27,7 +27,15 @@ posthook = proc do
   if $extmk
     $ruby = "$(topdir)/miniruby -I'$(topdir)' -I'$(top_srcdir)/lib' -I'$(extout)/$(arch)' -I'$(extout)/common'"
   else
-    $ruby = baseruby
+    # `CROSS_COMPILING` holds the platform of the ruby that loaded this fake.
+    # When it matches the built ruby's platform we are not really cross
+    # compiling, so the just-built ruby runs on this host and matches the build
+    # tree. Prefer it over baseruby, which may be an older release whose version
+    # check rejects the freshly built standard library when building gems with
+    # native extensions (e.g. the bundler spec's test gems run via
+    # `make test-bundler[-parallel]`).
+    native = defined?(CROSS_COMPILING) && CROSS_COMPILING == RUBY_PLATFORM
+    $ruby = native && File.exist?($builtruby) ? $builtruby : baseruby
   end
   $static = static
   untrace_var(:$ruby, posthook)
@@ -63,6 +71,8 @@ prehook = proc do |extmk|
   RbConfig.fire_update!("extout", $extout)
   RbConfig.fire_update!("rubyhdrdir", "$(top_srcdir)/include")
   RbConfig.fire_update!("rubyarchhdrdir", "$(extout)/include/$(arch)")
+  RbConfig.fire_update!("rubyarchdir", "$(extout)/$(arch)")
+  RbConfig.fire_update!("rubylibdir", "$(extout)/common")
   RbConfig.fire_update!("libdirname", "buildlibdir")
   trace_var(:$ruby, posthook)
   untrace_var(:$extmk, prehook)

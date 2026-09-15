@@ -15,69 +15,72 @@
 #   $(test-class-name) ` ` $(optional comment)   # Skipping a test class
 #
 
-test_replicate(EncodingTest) the method was removed in 3.3
-test_step(RangeTest) the method protocol was changed in 3.4
+## Failed tests because of testing environment
 
 test_collection_install(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__bundled(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__config__bundled(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__config__no_bundled(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__config__stdlib_source(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__dependency_no_bundled(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__no_bundled(RBS::CliTest) running tests without Bundler
+test_collection_install__mutex_m__rbs_dependency_and__gem_dependency(RBS::CliTest) running tests without Bundler
+test_collection_install__nongem_stdlib_no_warning(RBS::CliTest) running tests without Bundler
 test_collection_install_frozen(RBS::CliTest) running tests without Bundler
 test_collection_install_gemspec(RBS::CliTest) running tests without Bundler
 test_collection_update(RBS::CliTest) running tests without Bundler
-
-test_loading_from_rbs_collection__gem_version_mismatch(RBS::EnvironmentLoaderTest) running test without rbs-amber testing gem
-
-test_defs(RBS::RbPrototypeTest) Numeric Nodes are added
-test_defs_return_type(RBS::RbPrototypeTest) Numeric Nodes are added
-test_defs_return_type_with_block(RBS::RbPrototypeTest) Numeric Nodes are added
-test_defs_return_type_with_if(RBS::RbPrototypeTest) Numeric Nodes are added
-test_endless_method_definition(RBS::RbPrototypeTest) Numeric Nodes are added
-test_literal_to_type(RBS::RbPrototypeTest) Numeric Nodes are added
-test_literal_types(RBS::RbPrototypeTest) Numeric Nodes are added
-test_accessibility(RBS::RbPrototypeTest) Symbol Node is added
-test_aliases(RBS::RbPrototypeTest) Symbol Node is added
-test_comments(RBS::RbPrototypeTest) Symbol Node is added
-test_const(RBS::RbPrototypeTest) Symbol Node is added
-test_meta_programming(RBS::RbPrototypeTest) Symbol Node is added
-test_module_function(RBS::RbPrototypeTest) Symbol Node is added
-test_all(RBS::RbiPrototypeTest) Symbol Node is added
-test_block_args(RBS::RbiPrototypeTest) Symbol Node is added
-test_implicit_block(RBS::RbiPrototypeTest) Symbol Node is added
-test_non_parameter_type_member(RBS::RbiPrototypeTest) Symbol Node is added
-test_noreturn(RBS::RbiPrototypeTest) Symbol Node is added
-test_optional_block(RBS::RbiPrototypeTest) Symbol Node is added
-test_overloading(RBS::RbiPrototypeTest) Symbol Node is added
-test_parameter(RBS::RbiPrototypeTest) Symbol Node is added
-test_parameter_type_member_variance(RBS::RbiPrototypeTest) Symbol Node is added
-test_tuple(RBS::RbiPrototypeTest) Symbol Node is added
-test_untyped_block(RBS::RbiPrototypeTest) Symbol Node is added
-test_argument_forwarding(RBS::RbPrototypeTest) `...` args handling is changed
-
-test_TOPDIR(RbConfigSingletonTest) `TOPDIR` is `nil` during CI while RBS type is declared as `String`
-
-test_aref(FiberSingletonTest) the method should not accept String keys
 
 NetSingletonTest depending on external resources
 NetInstanceTest depending on external resources
 TestHTTPRequest depending on external resources
 TestSingletonNetHTTPResponse depending on external resources
 TestInstanceNetHTTPResponse depending on external resources
+test_URI_open(OpenURISingletonTest) depending on external resources
 
-test_initialize(TempfileRemoverSingletonTest) Remover class is removed at https://github.com/ruby/tempfile/commit/753ab16642fdc3cf92e1cf3dd1d80e8f75128735
-test_call(TempfileRemoverTest) Remover class is removed at https://github.com/ruby/tempfile/commit/753ab16642fdc3cf92e1cf3dd1d80e8f75128735
+test_TOPDIR(RbConfigSingletonTest) `TOPDIR` is `nil` during CI while RBS type is declared as `String`
 
-# Switching to prism resulted in an unexpected error, `RuntimeError: cannot get AST for ISEQ compiled by prism`, raised by `RubyVM::AbstractSyntax.of(method)`
-test_1(RBS::RuntimePrototypeTest)
-test_decls_for_anonymous_class_or_module(RBS::RuntimePrototypeTest)
-test_decls_structure(RBS::RuntimePrototypeTest)
-test_define_method_alias(RBS::RuntimePrototypeTest)
-test_for_initialize_type(RBS::RuntimePrototypeTest)
-test_for_overwritten_module_name(RBS::RuntimePrototypeTest)
-test_for_yield(RBS::RuntimePrototypeTest)
-test_include_owner(RBS::RuntimePrototypeTest)
-test_merge_types(RBS::RuntimePrototypeTest)
-test_reflection(RBS::RuntimePrototypeTest)
-test_todo(RBS::RuntimePrototypeTest)
-test_of(RubyVM::AbstractSyntaxTreeSingletonTest)
+# Failing because ObjectSpace.count_nodes has been removed
+test_count_nodes(ObjectSpaceTest)
 
-# Pathname#mkpath and #rmtree https://github.com/ruby/ruby/pull/3705
-test_mkpath(PathnameInstanceTest)
-test_rmtree(PathnameInstanceTest)
+## Unknown failures
+
+# NoMethodError: undefined method 'inspect' for an instance of RBS::UnitTest::Convertibles::ToInt
+test_compile(RegexpSingletonTest)
+test_linear_time?(RegexpSingletonTest)
+test_new(RegexpSingletonTest)
+
+# Errno::ENOENT: No such file or directory - bundle
+test_collection_install__pathname_set(RBS::CliTest)
+test_collection_install__set_pathname__manifest(RBS::CliTest)
+
+# json-schema passes the obsolete `quirks_mode` parameter, but json gem v3 rejects it
+RBS::SchemaTest
+
+# RBS 4.0.3's JSON tests use APIs removed or changed in json gem v3
+test_dump(JSONInstanceTest)
+test_parse(JSONInstanceTest)
+test_parse!(JSONInstanceTest)
+test_create_id(JSONSingletonTest)
+test_create_id_eq(JSONSingletonTest)
+test_dump(JSONSingletonTest)
+test_load(JSONSingletonTest)
+test_load_file(JSONSingletonTest)
+test_load_file!(JSONSingletonTest)
+test_parse(JSONSingletonTest)
+test_parse!(JSONSingletonTest)
+
+# RBS 4.0.3's RDoc plugin is incompatible with the RDoc 7.2.0 development revision
+test_attr_decl_1(RDocPluginParserTest)
+test_attr_decl_2(RDocPluginParserTest)
+test_instance_method_1(RDocPluginParserTest)
+test_instance_method_comment_and_tokens(RDocPluginParserTest)
+test_instance_method_generic(RDocPluginParserTest)
+test_instance_method_with_block(RDocPluginParserTest)
+test_method_alias_decl_1(RDocPluginParserTest)
+test_method_alias_decl_2(RDocPluginParserTest)
+
+## Restore-state bug in the test itself (fixed in ruby/rbs after 4.0.3)
+
+test_enable(GCSingletonTest) leaves GC disabled for the rest of the process (GC.enable return value misread); every later stdlib test then runs with GC off and the process peaks multi-GB (NoMemoryError on Windows CI)
+test_stress_and_stress=(GCSingletonTest) runs assert_send_type with GC.stress enabled; the type check allocates heavily and cannot finish in CI time (was hidden while test_enable left GC disabled)
+test_reachable_objects_from_root(ObjectSpaceTest) assert_send_type eagerly builds trace.inspect of the whole roots hash; with per-Ractor GC roots the inspect is huge and the process peaks multi-GB (NoMemoryError on Windows CI)

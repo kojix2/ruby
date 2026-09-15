@@ -72,11 +72,8 @@ def save_coverage_data(res1)
 end
 
 def invoke_simplecov_formatter
-  # XXX docile-x.y.z and simplecov-x.y.z, simplecov-html-x.y.z, simplecov_json_formatter-x.y.z
-  %w[simplecov simplecov-html simplecov_json_formatter docile].each do |f|
-    Dir.glob("#{__dir__}/../.bundle/gems/#{f}-*/lib").each do |d|
-      $LOAD_PATH.unshift d
-    end
+  Dir.glob("#{__dir__}/../.bundle/gems/simplecov-*/lib").each do |d|
+    $LOAD_PATH.unshift d
   end
 
   require "simplecov"
@@ -114,6 +111,10 @@ pid = $$
 pwd = Dir.pwd
 
 at_exit do
+  # Some tests leave GC.stress enabled, causing slow coverage processing.
+  # Reset it here to avoid performance issues.
+  GC.stress = false
+
   exit_exc = $!
 
   Dir.chdir(pwd) do

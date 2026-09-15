@@ -7,8 +7,8 @@
 #++
 
 class Gem::Ext::ExtConfBuilder < Gem::Ext::Builder
-  def self.build(extension, dest_path, results, args=[], lib_dir=nil, extension_dir=Dir.pwd,
-    target_rbconfig=Gem.target_rbconfig)
+  def self.build(extension, dest_path, results, args = [], lib_dir = nil, extension_dir = Dir.pwd,
+    target_rbconfig = Gem.target_rbconfig, n_jobs: nil)
     require "fileutils"
     require "tempfile"
 
@@ -27,21 +27,18 @@ class Gem::Ext::ExtConfBuilder < Gem::Ext::Builder
       cmd << "--target-rbconfig=#{target_rbconfig.path}" if target_rbconfig.path
       cmd.push(*args)
 
-      run(cmd, results, class_name, extension_dir) do |s, r|
-        mkmf_log = File.join(extension_dir, "mkmf.log")
-        if File.exist? mkmf_log
-          unless s.success?
-            r << "To see why this extension failed to compile, please check" \
-              " the mkmf.log which can be found here:\n"
-            r << "  " + File.join(dest_path, "mkmf.log") + "\n"
-          end
-          FileUtils.mv mkmf_log, dest_path
-        end
-      end
+      run(cmd, results, class_name, extension_dir)
+
+      # "clean" is the first make target, and mkmf puts mkmf.log in CLEANFILES,
+      # so park the log next to the built extension before make can delete it.
+      # Whether it is then dropped or kept for inspection is decided by
+      # Gem::Ext::Builder#build_extension.
+      mkmf_log = File.join(extension_dir, "mkmf.log")
+      FileUtils.mv mkmf_log, dest_path if File.exist?(mkmf_log)
 
       ENV["DESTDIR"] = nil
 
-      make dest_path, results, extension_dir, tmp_dest_relative, target_rbconfig: target_rbconfig
+      make dest_path, results, extension_dir, tmp_dest_relative, target_rbconfig: target_rbconfig, n_jobs: n_jobs
 
       full_tmp_dest = File.join(extension_dir, tmp_dest_relative)
 

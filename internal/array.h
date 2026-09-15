@@ -21,6 +21,7 @@
 #define RARRAY_SHARED_FLAG      ELTS_SHARED
 #define RARRAY_SHARED_ROOT_FLAG FL_USER12
 #define RARRAY_PTR_IN_USE_FLAG  FL_USER14
+#define RARRAY_FAKEARY          FL_USER19
 
 /* array.c */
 VALUE rb_ary_hash_values(long len, const VALUE *elements);
@@ -36,7 +37,10 @@ void rb_ary_cancel_sharing(VALUE ary);
 size_t rb_ary_size_as_embedded(VALUE ary);
 void rb_ary_make_embedded(VALUE ary);
 bool rb_ary_embeddable_p(VALUE ary);
+bool rb_ary_embedded_shared_root_p(VALUE ary);
 VALUE rb_ary_diff(VALUE ary1, VALUE ary2);
+VALUE rb_ary_compact_bang(VALUE ary);
+VALUE rb_ary_modify_expand(VALUE ary, long expand);
 RUBY_EXTERN VALUE rb_cArray_empty_frozen;
 
 static inline VALUE rb_ary_entry_internal(VALUE ary, long offset);
@@ -139,6 +143,8 @@ RARRAY_AREF(VALUE ary, long i)
 {
     VALUE val;
     RBIMPL_ASSERT_TYPE(ary, RUBY_T_ARRAY);
+
+    RUBY_ASSERT(i < RARRAY_LEN(ary));
 
     RBIMPL_WARNING_PUSH();
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 13

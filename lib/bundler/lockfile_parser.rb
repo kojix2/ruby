@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "shared_helpers"
+
 module Bundler
   class LockfileParser
     class Position
@@ -26,9 +28,11 @@ module Bundler
 
     attr_reader(
       :sources,
+      :metadata_source,
       :dependencies,
       :specs,
       :platforms,
+      :most_specific_locked_platform,
       :bundler_version,
       :ruby_version,
       :checksums,
@@ -37,6 +41,7 @@ module Bundler
     BUNDLED      = "BUNDLED WITH"
     DEPENDENCIES = "DEPENDENCIES"
     CHECKSUMS    = "CHECKSUMS"
+    CONTENT_ADDRESSES = "CONTENT ADDRESSES"
     PLATFORMS    = "PLATFORMS"
     RUBY         = "RUBY VERSION"
     GIT          = "GIT"
@@ -53,6 +58,7 @@ module Bundler
       Gem::Version.create("1.12") => [RUBY].freeze,
       Gem::Version.create("1.13") => [PLUGIN].freeze,
       Gem::Version.create("2.5.0") => [CHECKSUMS].freeze,
+      Gem::Version.create("4.1.0") => [CONTENT_ADDRESSES].freeze,
     }.freeze
 
     KNOWN_SECTIONS = SECTIONS_BY_VERSION_INTRODUCED.values.flatten!.freeze
@@ -91,22 +97,35 @@ module Bundler
       lockfile_contents.split(BUNDLED).last.strip
     end
 
-    def initialize(lockfile)
+    def initialize(lockfile, strict: false, lockfile_path: nil)
       @platforms    = []
       @sources      = []
+      @metadata_source = Source::Metadata.new
       @dependencies = {}
       @parse_method = nil
       @specs        = {}
-      @lockfile_path = begin
+      @lockfile_path = lockfile_path || begin
         SharedHelpers.relative_lockfile_path
       rescue GemfileNotFound
         "Gemfile.lock"
       end
       @pos = Position.new(1, 1)
+      @strict = strict
 
       if lockfile.match?(/<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|/)
         raise LockfileError, "Your #{@lockfile_path} contains merge conflicts.\n" \
           "Run `git checkout HEAD -- #{@lockfile_path}` first to get a clean lock."
+      end
+
+      @valid = lockfile.strip.empty? ||
+               lockfile.split(/(?:\r?\n)+/).any? {|l| KNOWN_SECTIONS.include?(l) }
+
+      unless @valid
+        SharedHelpers.feature_deprecated!(
+          "Your #{@lockfile_path} does not appear to be a valid lockfile. " \
+          "Run `rm #{@lockfile_path}` and then `bundle install` to generate a new lockfile. " \
+          "This will raise a LockfileError in a future version of Bundler."
+        )
       end
 
       lockfile.split(/((?:\r?\n)+)/) do |line|
@@ -123,6 +142,8 @@ module Bundler
           # for all gemfiles that don't already explicitly include the feature.
           @checksums = true
           @parse_method = :parse_checksum
+        elsif line == CONTENT_ADDRESSES
+          @parse_method = :parse_content_address
         elsif line == PLATFORMS
           @parse_method = :parse_platform
         elsif line == RUBY
@@ -136,7 +157,17 @@ module Bundler
         end
         @pos.advance!(line)
       end
-      @specs = @specs.values.sort_by!(&:full_name)
+
+      if @platforms.include?(Gem::Platform::X64_MINGW_LEGACY)
+        SharedHelpers.feature_deprecated!("Found x64-mingw32 in lockfile, which is deprecated and will be removed in the future.")
+      end
+
+      @most_specific_locked_platform = @platforms.min_by do |bundle_platform|
+        Gem::Platform.platform_specificity_match(bundle_platform, Bundler.local_platform)
+      end
+      @specs = @specs.values.sort_by!(&:full_name).each do |spec|
+        spec.most_specific_locked_platform = @most_specific_locked_platform
+      end
     rescue ArgumentError => e
       Bundler.ui.debug(e)
       raise LockfileError, "Your lockfile is unreadable. Run `rm #{@lockfile_path}` " \
@@ -146,6 +177,10 @@ module Bundler
 
     def may_include_redundant_platform_specific_gems?
       bundler_version.nil? || bundler_version < Gem::Version.new("1.16.2")
+    end
+
+    def valid?
+      @valid
     end
 
     private
@@ -196,6 +231,16 @@ module Bundler
       $                                                  # Line end
     /xo
 
+    NAME_VERSION_CONTENT_ADDRESS = /
+      ^#{space}{2}(?!#{space})                           # Exactly 2 spaces at the start of the line
+      (.*?)                                              # Name
+      #{space}\(([^-]*)                                  # Space, followed by version
+      -(.*)\)                                            # Platform, always present for content-addressable gems
+      #{space}([0-9a-f]{8,64})                           # Content address
+      (?:#{space}([^ ]+))?                               # Optional checksums
+      $                                                  # Line end
+    /xo
+
     def parse_dependency(line)
       return unless line =~ NAME_VERSION
       spaces = $1
@@ -231,15 +276,47 @@ module Bundler
       spaces = $1
       return unless spaces.size == 2
       checksums = $6
-      return unless checksums
       name = $2
       version = $3
       platform = $4
 
       version = Gem::Version.new(version)
       platform = platform ? Gem::Platform.new(platform) : Gem::Platform::RUBY
-      full_name = Gem::NameTuple.new(name, version, platform).full_name
-      return unless spec = @specs[full_name]
+      name_tuple = Gem::NameTuple.new(name, version, platform)
+      full_name = name_tuple.full_name
+      spec = @specs[full_name]
+
+      if name == "bundler"
+        spec ||= LazySpecification.new(name, version, platform, @metadata_source)
+      end
+      return unless spec
+
+      if checksums
+        checksums.split(",") do |lock_checksum|
+          column = line.index(lock_checksum) + 1
+          checksum = Checksum.from_lock(lock_checksum, "#{@lockfile_path}:#{@pos.line}:#{column}")
+          spec.source.checksum_store.register(name_tuple, checksum)
+        end
+      else
+        spec.source.checksum_store.register(name_tuple, nil)
+      end
+    end
+
+    def parse_content_address(line)
+      return unless line =~ NAME_VERSION_CONTENT_ADDRESS
+
+      name = -$1
+      version = Gem::Version.new($2)
+      platform = Gem::Platform.new($3)
+      content_address = $4
+      checksums = $5
+
+      spec = @specs[Gem::NameTuple.new(name, version, platform).full_name]
+      return unless spec
+
+      spec.content_address = content_address
+
+      return unless checksums
 
       checksums.split(",") do |lock_checksum|
         column = line.index(lock_checksum) + 1
@@ -260,7 +337,7 @@ module Bundler
 
         version = Gem::Version.new(version)
         platform = platform ? Gem::Platform.new(platform) : Gem::Platform::RUBY
-        @current_spec = LazySpecification.new(name, version, platform, @current_source)
+        @current_spec = LazySpecification.new(name, version, platform, @current_source, strict: @strict)
         @current_source.add_dependency_names(name)
 
         @specs[@current_spec.full_name] = @current_spec

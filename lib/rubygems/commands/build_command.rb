@@ -26,12 +26,7 @@ class Gem::Commands::BuildCommand < Gem::Command
       options[:output] = value
     end
 
-    add_option "-C PATH", "Run as if gem build was started in <PATH> instead of the current working directory." do |value, options|
-      options[:build_path] = value
-    end
-    deprecate_option "-C",
-                     version: "4.0",
-                     extra_msg: "-C is a global flag now. Use `gem -C PATH build GEMSPEC_FILE [options]` instead"
+    add_ruby_abi_option("build", "  (builds a content addressable gem)")
   end
 
   def arguments # :nodoc:
@@ -58,6 +53,10 @@ with gem spec:
 Gems can be saved to a specified filename with the output option:
 
   $ gem build my_gem-1.0.gemspec --output=release.gem
+
+Platform gems can be built for a single Ruby ABI with the --ruby-abi option:
+
+  $ gem build my_gem-1.0.gemspec --ruby-abi=3.4
 
     EOF
   end
@@ -95,7 +94,8 @@ Gems can be saved to a specified filename with the output option:
         spec,
         options[:force],
         options[:strict],
-        options[:output]
+        options[:output],
+        options[:ruby_abi]
       )
     else
       alert_error "Error loading gemspec. Aborting."

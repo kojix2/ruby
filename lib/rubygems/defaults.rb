@@ -13,7 +13,7 @@ module Gem
   # An Array of the default sources that come with RubyGems
 
   def self.default_sources
-    %w[https://rubygems.org/]
+    @default_sources ||= %w[https://rubygems.org/]
   end
 
   ##
@@ -149,6 +149,15 @@ module Gem
   end
 
   ##
+  # The path to the global gem cache directory.
+  # This is used when global_gem_cache is enabled to share .gem files
+  # across all Ruby installations.
+
+  def self.global_gem_cache_path
+    File.join(cache_home, "gem", "gems")
+  end
+
+  ##
   # The path to standard location of the user's data directory.
 
   def self.data_home
@@ -239,7 +248,7 @@ module Gem
   # Enables automatic installation into user directory
 
   def self.default_user_install # :nodoc:
-    if !ENV.key?("GEM_HOME") && (File.exist?(Gem.dir) && !File.writable?(Gem.dir))
+    if !ENV.key?("GEM_HOME") && File.exist?(Gem.dir) && !File.writable?(Gem.dir)
       Gem.ui.say "Defaulting to user installation because default installation directory (#{Gem.dir}) is not writable."
       return true
     end

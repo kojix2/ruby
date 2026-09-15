@@ -56,12 +56,12 @@ RSpec.describe "bundle info" do
       expect(out).to eq("2.3.2")
     end
 
-    it "doesn't claim that bundler has been deleted, even if using a custom path without bundler there" do
-      bundle "config set --local path vendor/bundle"
+    it "doesn't claim that bundler is missing, even if using a custom path without bundler there" do
+      bundle_config "path vendor/bundle"
       bundle "install"
       bundle "info bundler"
       expect(out).to include("\tPath: #{root}")
-      expect(err).not_to match(/The gem bundler has been deleted/i)
+      expect(err).not_to match(/The gem bundler is missing/i)
     end
 
     it "complains if gem not in bundle" do
@@ -69,27 +69,27 @@ RSpec.describe "bundle info" do
       expect(err).to eq("Could not find gem 'missing'.")
     end
 
-    it "warns if path no longer exists on disk" do
-      FileUtils.rm_rf(default_bundle_path("gems", "rails-2.3.2"))
+    it "warns if path does not exist on disk, but specification is there" do
+      FileUtils.rm_r(default_bundle_path("gems", "rails-2.3.2"))
 
       bundle "info rails --path"
 
-      expect(err).to include("The gem rails has been deleted.")
+      expect(err).to include("The gem rails is missing.")
       expect(err).to include(default_bundle_path("gems", "rails-2.3.2").to_s)
 
       bundle "info rail --path"
-      expect(err).to include("The gem rails has been deleted.")
+      expect(err).to include("The gem rails is missing.")
       expect(err).to include(default_bundle_path("gems", "rails-2.3.2").to_s)
 
       bundle "info rails"
-      expect(err).to include("The gem rails has been deleted.")
+      expect(err).to include("The gem rails is missing.")
       expect(err).to include(default_bundle_path("gems", "rails-2.3.2").to_s)
     end
 
-    context "given a default gem shippped in ruby", :ruby_repo do
+    context "given a default gem shipped in ruby", :ruby_repo do
       it "prints information about the default gem" do
-        bundle "info rdoc"
-        expect(out).to include("* rdoc")
+        bundle "info json"
+        expect(out).to include("* json")
         expect(out).to include("Default Gem: yes")
       end
     end
@@ -207,7 +207,31 @@ RSpec.describe "bundle info" do
   end
 
   context "with a valid regexp for gem name" do
-    it "presents alternatives", :readline do
+    it "returns the exact match without prompting when requested" do
+      install_gemfile <<-G
+        source "https://gem.repo1"
+        gem "myrack"
+        gem "myrack-obama"
+      G
+
+      bundle "info myrack --exact-match"
+      expect(out).to include("* myrack (1.0.0)")
+      expect(out).not_to include("0 : - exit -")
+    end
+
+    it "does not fall back to regexp matching when exact matching is requested" do
+      install_gemfile <<-G
+        source "https://gem.repo1"
+        gem "myrack"
+        gem "myrack-obama"
+      G
+
+      bundle "info rac --exact-match", raise_on_error: false
+      expect(err).to include("Could not find gem 'rac'.")
+      expect(out).not_to include("0 : - exit -")
+    end
+
+    it "presents alternatives without the exact match flag", :readline do
       install_gemfile <<-G
         source "https://gem.repo1"
         gem "myrack"
@@ -215,7 +239,9 @@ RSpec.describe "bundle info" do
       G
 
       bundle "info rac"
-      expect(out).to match(/\A1 : myrack\n2 : myrack-obama\n0 : - exit -(\n>|\z)/)
+      expect(out).to include("1 : myrack")
+      expect(out).to include("2 : myrack-obama")
+      expect(out).to include("0 : - exit -")
     end
   end
 
@@ -235,7 +261,7 @@ RSpec.describe "bundle info" do
 
   context "with without configured" do
     it "does not find the gem, but gives a helpful error" do
-      bundle "config without test"
+      bundle_config "without test"
 
       install_gemfile <<-G
         source "https://gem.repo1"

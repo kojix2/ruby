@@ -10,7 +10,7 @@ RSpec.describe "bundle install" do
         gem "foo", :git => "#{lib_path("foo")}"
       G
 
-      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at main@#{revision_for(lib_path("foo"))[0..6]})")
+      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at #{revision_for(lib_path("foo"))[0..6]})")
       expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
     end
 
@@ -23,25 +23,23 @@ RSpec.describe "bundle install" do
         gem "foo", :git => "#{relative_path}"
       G
 
-      expect(out).to include("Using foo 1.0 from #{relative_path} (at main@#{revision_for(lib_path("foo"))[0..6]})")
+      expect(out).to include("Using foo 1.0 from #{relative_path} (at #{revision_for(lib_path("foo"))[0..6]})")
       expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
     end
 
     it "displays the correct default branch", git: ">= 2.28.0" do
-      build_git "foo", "1.0", path: lib_path("foo"), default_branch: "main"
+      build_git "foo", "1.0", path: lib_path("foo"), default_branch: "non-standard"
 
       install_gemfile <<-G, verbose: true
         source "https://gem.repo1"
         gem "foo", :git => "#{lib_path("foo")}"
       G
 
-      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at main@#{revision_for(lib_path("foo"))[0..6]})")
+      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at #{revision_for(lib_path("foo"))[0..6]})")
       expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
     end
 
     it "displays the ref of the gem repository when using branch~num as a ref" do
-      skip "maybe branch~num notation doesn't work on Windows' git" if Gem.win_platform?
-
       build_git "foo", "1.0", path: lib_path("foo")
       rev = revision_for(lib_path("foo"))[0..6]
       update_git "foo", "2.0", path: lib_path("foo"), gemspec: true
@@ -85,8 +83,8 @@ RSpec.describe "bundle install" do
           foo!
       L
 
-      bundle "config set --local path vendor/bundle"
-      bundle "config set --local without development"
+      bundle_config "path vendor/bundle"
+      bundle_config "without development"
       bundle :install
 
       expect(out).to include("Bundle complete!")
@@ -157,7 +155,7 @@ RSpec.describe "bundle install" do
           test!
 
         BUNDLED WITH
-           #{Bundler::VERSION}
+          #{Bundler::VERSION}
       L
 
       # If GH#6743 is present, the first `bundle install` will change the
@@ -188,14 +186,14 @@ RSpec.describe "bundle install" do
       build_git "foo", "1.0", path: lib_path("foo")
       rev = revision_for(lib_path("foo"))
 
-      bundle "config set path vendor/bundle"
-      bundle "config set clean true"
+      bundle_config "path vendor/bundle"
+      bundle_config "clean true"
       install_gemfile <<-G, verbose: true
         source "https://gem.repo1"
         gem "foo", :git => "#{lib_path("foo")}"
       G
 
-      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at main@#{rev[0..6]})")
+      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at #{rev[0..6]})")
       expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
 
       old_lockfile = lockfile
@@ -204,15 +202,166 @@ RSpec.describe "bundle install" do
       rev2 = revision_for(lib_path("foo"))
 
       bundle :update, all: true, verbose: true
-      expect(out).to include("Using foo 2.0 (was 1.0) from #{lib_path("foo")} (at main@#{rev2[0..6]})")
+      expect(out).to include("Using foo 2.0 (was 1.0) from #{lib_path("foo")} (at #{rev2[0..6]})")
       expect(out).to include("Removing foo (#{rev[0..11]})")
       expect(the_bundle).to include_gems "foo 2.0", source: "git@#{lib_path("foo")}"
 
       lockfile(old_lockfile)
 
       bundle :install, verbose: true
-      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at main@#{rev[0..6]})")
+      expect(out).to include("Using foo 1.0 from #{lib_path("foo")} (at #{rev[0..6]})")
       expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
+    end
+
+    context "when install directory exists" do
+      let(:checkout_confirmation_log_message) { "Checking out revision" }
+      let(:using_foo_confirmation_log_message) { "Using foo 1.0 from #{lib_path("foo")} (at #{revision_for(lib_path("foo"))[0..6]})" }
+
+      context "and no contents besides .git directory are present" do
+        it "reinstalls gem" do
+          build_git "foo", "1.0", path: lib_path("foo")
+
+          gemfile = <<-G
+            source "https://gem.repo1"
+            gem "foo", :git => "#{lib_path("foo")}"
+          G
+
+          install_gemfile gemfile, verbose: true
+
+          expect(out).to include(checkout_confirmation_log_message)
+          expect(out).to include(using_foo_confirmation_log_message)
+          expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
+
+          # validate that the installed directory exists and has some expected contents
+          install_directory = default_bundle_path("bundler/gems/foo-#{revision_for(lib_path("foo"))[0..11]}")
+          dot_git_directory = install_directory.join(".git")
+          lib_directory = install_directory.join("lib")
+          gemspec = install_directory.join("foo.gemspec")
+          expect([install_directory, dot_git_directory, lib_directory, gemspec]).to all exist
+
+          # remove all elements in the install directory except .git directory
+          FileUtils.rm_r(lib_directory)
+          gemspec.delete
+
+          expect(dot_git_directory).to exist
+          expect(lib_directory).not_to exist
+          expect(gemspec).not_to exist
+
+          # rerun bundle install
+          install_gemfile gemfile, verbose: true
+
+          expect(out).to include(checkout_confirmation_log_message)
+          expect(out).to include(using_foo_confirmation_log_message)
+          expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
+
+          # validate that it reinstalls all components
+          expect([install_directory, dot_git_directory, lib_directory, gemspec]).to all exist
+        end
+      end
+
+      context "and contents besides .git directory are present" do
+        # we want to confirm that the change to try to detect partial installs and reinstall does not
+        # result in repeatedly reinstalling the gem when it is fully installed
+        it "does not reinstall gem" do
+          build_git "foo", "1.0", path: lib_path("foo")
+
+          gemfile = <<-G
+            source "https://gem.repo1"
+            gem "foo", :git => "#{lib_path("foo")}"
+          G
+
+          install_gemfile gemfile, verbose: true
+
+          expect(out).to include(checkout_confirmation_log_message)
+          expect(out).to include(using_foo_confirmation_log_message)
+          expect(the_bundle).to include_gems "foo 1.0", source: "git@#{lib_path("foo")}"
+
+          # rerun bundle install
+          install_gemfile gemfile, verbose: true
+
+          # it isn't altogether straight-forward to validate that bundle didn't do soething on the second run, however,
+          # the presence of the 2nd log message confirms install got past the point that it would have logged the above if
+          # it was going to
+          expect(out).not_to include(checkout_confirmation_log_message)
+          expect(out).to include(using_foo_confirmation_log_message)
+        end
+      end
+    end
+  end
+
+  describe "with excluded groups" do
+    it "works if you exclude a group with a git gem", ruby: ">= 3.3" do
+      build_git "production_gem", "1.0"
+      build_git "development_gem", "1.0"
+
+      gemfile <<-G
+        source "https://gem.repo1"
+
+        gem "production_gem", :git => "#{lib_path("production_gem-1.0")}"
+
+        group :development do
+          gem "development_gem", :git => "#{lib_path("development_gem-1.0")}"
+        end
+      G
+
+      # First install all groups to create lockfile
+      bundle :install
+
+      # Set without and reinstall
+      bundle_config "without development"
+      bundle :install
+
+      # Verify only production gem is available
+      expect(the_bundle).to include_gems("production_gem 1.0")
+      expect(the_bundle).not_to include_gems("development_gem 1.0")
+    end
+
+    it "resolves indirect dependencies from a git source not in the requested groups" do
+      build_lib "activesupport", "1.0", path: lib_path("rails/activesupport")
+      build_git "activerecord", "1.0", path: lib_path("rails") do |s|
+        s.add_dependency "activesupport", "= 1.0"
+      end
+
+      gemfile <<-G
+        source "https://gem.repo1"
+
+        gem "activerecord", :git => "#{lib_path("rails")}"
+
+        group :ci do
+          gem "myrack"
+        end
+      G
+
+      bundle_config "only ci"
+      bundle :install
+
+      expect(the_bundle).to include_gems("myrack 1.0.0")
+      expect(the_bundle).not_to include_gems("activerecord 1.0")
+    end
+
+    it "resolves indirect dependencies from a git source not in the requested groups (without compact_index dependency API)" do
+      build_lib "activesupport", "1.0", path: lib_path("rails/activesupport")
+      build_git "activerecord", "1.0", path: lib_path("rails") do |s|
+        s.add_dependency "activesupport", "= 1.0"
+      end
+
+      gemfile <<-G
+        source "https://gem.repo1"
+
+        gem "activerecord", :git => "#{lib_path("rails")}"
+
+        group :ci do
+          gem "myrack"
+        end
+      G
+
+      # Force the RubygemsAggregate code path in find_source_requirements by
+      # making the dependency API unavailable.
+      bundle_config "only ci"
+      bundle :install, artifice: "endpoint_api_forbidden"
+
+      expect(the_bundle).to include_gems("myrack 1.0.0")
+      expect(the_bundle).not_to include_gems("activerecord 1.0")
     end
   end
 end

@@ -473,7 +473,7 @@ rsock_socket(int domain, int type, int proto)
 
 /* emulate blocking connect behavior on EINTR or non-blocking socket */
 static int
-wait_connectable(VALUE self, VALUE timeout)
+wait_connectable(VALUE self, VALUE timeout, const struct sockaddr *sockaddr, int len)
 {
     int sockerr;
     socklen_t sockerrlen;
@@ -514,7 +514,9 @@ wait_connectable(VALUE self, VALUE timeout)
     VALUE result = rb_io_wait(self, RB_INT2NUM(RUBY_IO_READABLE|RUBY_IO_WRITABLE), timeout);
 
     if (result == Qfalse) {
-        rb_raise(rb_eIOTimeoutError, "Connect timed out!");
+        VALUE rai = rsock_addrinfo_new((struct sockaddr *)sockaddr, len, PF_UNSPEC, 0, 0, Qnil, Qnil);
+        VALUE addr_str = rsock_addrinfo_inspect_sockaddr(rai);
+        rb_raise(rb_eIOTimeoutError, "user specified timeout for %" PRIsVALUE, addr_str);
     }
 
     int revents = RB_NUM2INT(result);
@@ -603,7 +605,7 @@ rsock_connect(VALUE self, const struct sockaddr *sockaddr, int len, int socks, V
 #ifdef EINPROGRESS
           case EINPROGRESS:
 #endif
-            return wait_connectable(self, timeout);
+            return wait_connectable(self, timeout, sockaddr, len);
         }
     }
     return status;
@@ -786,7 +788,17 @@ rsock_getfamily(rb_io_t *fptr)
  * call-seq:
  *   error_code     -> integer
  *
- * Returns the raw error code occurred at name resolution.
+ * Returns the raw error code indicating the cause of the hostname resolution failure.
+ *
+ *    begin
+ *      Addrinfo.getaddrinfo("ruby-lang.org", nil)
+ *    rescue Socket::ResolutionError => e
+ *      if e.error_code == Socket::EAI_AGAIN
+ *        puts "Temporary failure in name resolution."
+ *      end
+ *    end
+ *
+ * Note that error codes depend on the operating system.
  */
 static VALUE
 sock_resolv_error_code(VALUE self)
@@ -802,7 +814,7 @@ rsock_init_socket_init(void)
      */
     rb_eSocket = rb_define_class("SocketError", rb_eStandardError);
     /*
-     * ResolutionError is the error class for socket name resolution.
+     * Socket::ResolutionError is the error class for hostname resolution.
      */
     rb_eResolution = rb_define_class_under(rb_cSocket, "ResolutionError", rb_eSocket);
     rb_define_method(rb_eResolution, "error_code", sock_resolv_error_code, 0);

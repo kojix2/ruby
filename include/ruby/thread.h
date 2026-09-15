@@ -21,9 +21,12 @@
  */
 
 /**
- * Passing  this  flag to  rb_nogvl()  prevents  it from  checking  interrupts.
- * Interrupts  can  impact  your  program negatively.   For  instance  consider
- * following callback function:
+ * Passing this flag to `rb_nogvl()` prevents it from processing interrupts after
+ * the given function returns. Instead, `rb_nogvl()` returns without calling the
+ * function if an interrupt is detected before entering the blocking region.
+ * This allows the caller to check interrupts later, after it has accounted for
+ * any side effects of the function. For instance consider following callback
+ * function:
  *
  * ```CXX
  * static inline int fd; // set elsewhere.
@@ -38,14 +41,22 @@
  * }
  * ```
  *
- * Here, if it gets interrupted at (a)  or (b), `read(2)` is cancelled and this
- * function leaks memory (which is not a good thing of course, but...).  But if
- * it gets interrupted at (c), where `read(2)` is already done, interruption is
- * way more catastrophic because what was read gets lost.  To reroute this kind
- * of problem you should set this flag.  And check interrupts elsewhere at your
- * own risk.
+ * Here, if `read(2)` is interrupted at (b), the function can observe `EINTR` and
+ * clean up. But if a Ruby interrupt is processed at (c), where `read(2)` is
+ * already done, the read data can be lost. To reroute this kind of problem you
+ * should set this flag and check interrupts later, at a point where it is safe
+ * to do so with respect to the function's side effects.
  */
 #define RB_NOGVL_INTR_FAIL       (0x1)
+
+/**
+ * Passing this flag to `rb_nogvl()` prevents it from entering the blocking
+ * region if the current thread has pending interrupts, even if they are masked
+ * by `Thread.handle_interrupt`. In that case `rb_nogvl()` returns 0 without
+ * calling the given function; `errno` is 0, the same as the existing skip path
+ * used by `RB_NOGVL_INTR_FAIL` (the function was never called).
+ */
+#define RB_NOGVL_PENDING_INTR_FAIL  (0x8)
 
 /**
  * Passing  this  flag   to  rb_nogvl()  indicates  that  the   passed  UBF  is
@@ -58,6 +69,19 @@
  * This makes sense only in case of POSIX threads.
  */
 #define RB_NOGVL_UBF_ASYNC_SAFE  (0x2)
+
+/**
+ * Passing  this  flag   to  rb_nogvl()  indicates  that  the   passed function
+ * is safe to offload to a background thread or work pool. In other words, the
+ * function is safe to run using a fiber scheduler's `blocking_operation_wait`.
+ * hook.
+ *
+ * If your function depends on thread-local storage, or thread-specific data
+ * operations/data structures, you should not set this flag, as
+ * these operations may behave differently (or fail) when run in a different
+ * thread/context (e.g. unlocking a mutex).
+ */
+#define RB_NOGVL_OFFLOAD_SAFE  (0x4)
 
 /** @} */
 
@@ -319,6 +343,13 @@ void *rb_internal_thread_specific_get(VALUE thread_val, rb_internal_thread_speci
  * This function is async signal safe and thread safe.
  */
 void rb_internal_thread_specific_set(VALUE thread_val, rb_internal_thread_specific_key_t key, void *data);
+
+/**
+ * Whether the current thread is holding the GVL.
+ *
+ * @return true if the current thread is holding the GVL, false otherwise.
+ */
+int ruby_thread_has_gvl_p(void);
 
 RBIMPL_SYMBOL_EXPORT_END()
 

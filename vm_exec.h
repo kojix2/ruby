@@ -67,11 +67,12 @@ error !
 
 #define INSN_ENTRY_SIG(insn) \
   if (0) { \
-      ruby_debug_printf("exec: %s@(%"PRIdPTRDIFF", %"PRIdPTRDIFF")@%s:%u\n", #insn, \
-                        (reg_pc - ISEQ_BODY(reg_cfp->iseq)->iseq_encoded), \
-                        (reg_cfp->pc - ISEQ_BODY(reg_cfp->iseq)->iseq_encoded), \
-                        RSTRING_PTR(rb_iseq_path(reg_cfp->iseq)), \
-                        rb_iseq_line_no(reg_cfp->iseq, reg_pc - ISEQ_BODY(reg_cfp->iseq)->iseq_encoded)); \
+      VALUE path = rb_iseq_path(CFP_ISEQ(reg_cfp)); \
+      ruby_debug_printf("exec: %s@(%"PRIdPTRDIFF", %"PRIdPTRDIFF")@%.*s:%u\n", #insn, \
+                        (reg_pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded), \
+                        (reg_cfp->pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded), \
+                        RSTRING_LENINT(path), RSTRING_PTR(path), \
+                        rb_iseq_line_no(CFP_ISEQ(reg_cfp), reg_pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded)); \
   }
 
 #define INSN_DISPATCH_SIG(insn)
@@ -93,16 +94,7 @@ error !
 /* token threaded code */
 
 /* dispatcher */
-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && __GNUC__ == 3
-#define DISPATCH_ARCH_DEPEND_WAY(addr) \
-  __asm__ __volatile__("jmp *%0;\t# -- inserted by vm.h\t[length = 2]" : : "r" (addr))
-
-#else
-#define DISPATCH_ARCH_DEPEND_WAY(addr) \
-                                /* do nothing */
-#endif
 #define TC_DISPATCH(insn)  \
-  DISPATCH_ARCH_DEPEND_WAY(insns_address_table[GET_CURRENT_INSN()]); \
   INSN_DISPATCH_SIG(insn); \
   RB_GNUC_EXTENSION_BLOCK(goto *insns_address_table[GET_CURRENT_INSN()]); \
   rb_bug("tc error");
@@ -175,11 +167,22 @@ default:                        \
 
 // Run the JIT from the interpreter
 #define JIT_EXEC(ec, val) do { \
-    rb_jit_func_t func; \
     /* don't run tailcalls since that breaks FINISH */ \
-    if (UNDEF_P(val) && GET_CFP() != ec->cfp && (func = jit_compile(ec))) { \
-        val = func(ec, ec->cfp); \
-        if (ec->tag->state) THROW_EXCEPTION(val); \
+    if (UNDEF_P(val) && GET_CFP() != ec->cfp) { \
+        rb_zjit_func_t zjit_entry; \
+        if (rb_yjit_enabled_p) { \
+            rb_jit_func_t func = yjit_compile(ec); \
+            if (func) { \
+                val = func(ec, ec->cfp); \
+                if (ec->tag->state) THROW_EXCEPTION(val); \
+            } \
+        } \
+        else if ((zjit_entry = (rb_zjit_func_t)rb_zjit_entry)) { \
+            rb_jit_func_t func = zjit_compile(ec); \
+            if (func) { \
+                val = zjit_entry(ec, ec->cfp, func); \
+            } \
+        } \
     } \
 } while (0)
 

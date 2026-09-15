@@ -6,7 +6,8 @@ require "socket"
 require '-test-/file'
 
 class TestFileExhaustive < Test::Unit::TestCase
-  DRIVE = Dir.pwd[%r'\A(?:[a-z]:|//[^/]+/[^/]+)'i]
+  ROOT_REGEXP = %r'\A(?:[a-z]:(?=(/))|//[^/]+/[^/]+)'i
+  DRIVE = Dir.pwd[ROOT_REGEXP]
   POSIX = /cygwin|mswin|bccwin|mingw|emx/ !~ RUBY_PLATFORM
   NTFS = !(/mingw|mswin|bccwin/ !~ RUBY_PLATFORM)
 
@@ -196,12 +197,32 @@ class TestFileExhaustive < Test::Unit::TestCase
     [regular_file, utf8_file].each do |file|
       assert_equal(file, File.open(file) {|f| f.path})
       assert_equal(file, File.path(file))
-      o = Object.new
-      class << o; self; end.class_eval do
-        define_method(:to_path) { file }
-      end
+      o = Struct.new(:to_path).new(file)
+      assert_equal(file, File.path(o))
+      o = Struct.new(:to_str).new(file)
       assert_equal(file, File.path(o))
     end
+
+    conv_error = ->(method, msg = "converting with #{method}") {
+      test = ->(&new) do
+        o = new.(42)
+        assert_raise(TypeError, msg) {File.path(o)}
+
+        o = new.("abc".encode(Encoding::UTF_32BE))
+        assert_raise(Encoding::CompatibilityError, msg) {File.path(o)}
+
+        ["\0", "a\0", "a\0c"].each do |path|
+          o = new.(path)
+          assert_raise(ArgumentError, msg) {File.path(o)}
+        end
+      end
+
+      test.call(&:itself)
+      test.call(&Struct.new(method).method(:new))
+    }
+
+    conv_error[:to_path]
+    conv_error[:to_str]
   end
 
   def assert_integer(n)
@@ -694,6 +715,28 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_raise(Errno::EEXIST) { File.symlink(utf8_file, utf8_file) }
   end
 
+  def test_symlink_to_relative_directory
+    # A relative target is interpreted relative to the link's directory, not the
+    # current directory.  A relative target pointing at a directory must produce
+    # a directory symlink even when the current directory differs from the link's
+    # directory; otherwise Dir operations on the link fail (Windows).
+    Dir.mktmpdir(__method__.to_s) do |tmpdir|
+      Dir.chdir(tmpdir) do
+        Dir.mkdir("subdir")
+        Dir.mkdir(File.join("subdir", "target"))
+        link = File.join("subdir", "link")
+        begin
+          File.symlink("target", link)
+        rescue NotImplementedError, Errno::EACCES, Errno::EPERM => e
+          omit e.message
+        end
+        assert_file.symlink?(link)
+        assert_file.directory?(link)
+        assert(Dir.exist?(link), "relative directory symlink should be a directory")
+      end
+    end
+  end
+
   def test_utime
     t = Time.local(2000)
     File.utime(t + 1, t + 2, zerofile)
@@ -784,10 +827,11 @@ class TestFileExhaustive < Test::Unit::TestCase
     def test_realpath_mount_point
       vol = IO.popen(["mountvol", DRIVE, "/l"], &:read).strip
       Dir.mkdir(mnt = File.join(@dir, mntpnt = "mntpnt"))
-      system("mountvol", mntpnt, vol, chdir: @dir)
+      err = IO.popen(%W"mountvol #{mntpnt} #{vol}", chdir: @dir, err: %i[child out], &:read)
+      omit err unless $?.success?
       assert_equal(mnt, File.realpath(mnt))
     ensure
-      system("mountvol", mntpnt, "/d", chdir: @dir)
+      system("mountvol", mntpnt, "/d", chdir: @dir, out: IO::NULL, err: IO::NULL)
     end
   end
 
@@ -876,10 +920,12 @@ class TestFileExhaustive < Test::Unit::TestCase
     bug9934 = '[ruby-core:63114] [Bug #9934]'
     require "objspace"
     path = File.expand_path("/foo")
-    assert_operator(ObjectSpace.memsize_of(path), :<=, path.bytesize + GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE], bug9934)
+    slot_size = Integer(ObjectSpace.dump(path)[/"slot_size":(\d+)/, 1])
+    assert_operator(ObjectSpace.memsize_of(path), :<=, path.bytesize + slot_size, bug9934)
     path = File.expand_path("/a"*25)
+    slot_size = Integer(ObjectSpace.dump(path)[/"slot_size":(\d+)/, 1])
     assert_operator(ObjectSpace.memsize_of(path), :<=,
-                    (path.bytesize + 1) * 2 + GC::INTERNAL_CONSTANTS[:BASE_SLOT_SIZE], bug9934)
+                    (path.bytesize + 1) * 2 + slot_size, bug9934)
   end
 
   def test_expand_path_encoding
@@ -1214,6 +1260,7 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal("foo", File.basename("foo", ".ext"))
     assert_equal("foo", File.basename("foo.ext", ".ext"))
     assert_equal("foo", File.basename("foo.ext", ".*"))
+    assert_raise(ArgumentError) {File.basename("", "\0")}
   end
 
   if NTFS
@@ -1278,9 +1325,10 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal(regular_file, File.dirname(regular_file, 0))
     assert_equal(@dir, File.dirname(regular_file, 1))
     assert_equal(File.dirname(@dir), File.dirname(regular_file, 2))
-    return if /mswin/ =~ RUBY_PLATFORM && ENV.key?('GITHUB_ACTIONS') # rootdir and tmpdir are in different drives
-    assert_equal(rootdir, File.dirname(regular_file, regular_file.count('/')))
     assert_raise(ArgumentError) {File.dirname(regular_file, -1)}
+    root = "#{@dir[ROOT_REGEXP]||?/}#{$1}"
+    assert_equal(root, File.dirname(regular_file, regular_file.count('/')))
+    assert_equal(root, File.dirname(regular_file, regular_file.count('/') + 100))
   end
 
   def test_dirname_encoding
@@ -1335,14 +1383,19 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_join
-    s = "foo" + File::SEPARATOR + "bar" + File::SEPARATOR + "baz"
+    sep = File::SEPARATOR
+    s = "foo" + sep + "bar" + sep + "baz"
     assert_equal(s, File.join("foo", "bar", "baz"))
     assert_equal(s, File.join(["foo", "bar", "baz"]))
+    assert_equal(s, File.join("foo" + sep, "bar", sep + "baz"))
+    assert_equal(s, File.join("foo" + sep, sep + "bar" + sep, sep + "baz"))
 
     o = Object.new
     def o.to_path; "foo"; end
     assert_equal(s, File.join(o, "bar", "baz"))
-    assert_equal(s, File.join("foo" + File::SEPARATOR, "bar", File::SEPARATOR + "baz"))
+
+    s = sep + "foo"
+    assert_equal(s, File.join(sep, s))
   end
 
   def test_join_alt_separator
@@ -1413,8 +1466,6 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_flock_exclusive
-    omit "[Bug #18613]" if /freebsd/ =~ RUBY_PLATFORM
-
     timeout = EnvUtil.apply_timeout_scale(1).to_s
     File.open(regular_file, "r+") do |f|
       f.flock(File::LOCK_EX)
@@ -1444,8 +1495,6 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_flock_shared
-    omit "[Bug #18613]" if /freebsd/ =~ RUBY_PLATFORM
-
     timeout = EnvUtil.apply_timeout_scale(1).to_s
     File.open(regular_file, "r+") do |f|
       f.flock(File::LOCK_SH)
@@ -1475,6 +1524,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_test
+    omit 'timestamp check is unstable on macOS' if RUBY_PLATFORM =~ /darwin/
     fn1 = regular_file
     hardlinkfile
     sleep(1.1)

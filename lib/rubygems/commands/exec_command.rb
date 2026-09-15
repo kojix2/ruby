@@ -79,7 +79,7 @@ to the same gem path as user-installed gems.
   def handle_options(args)
     args = add_extra_args(args)
     check_deprecated_options(args)
-    @options = Marshal.load Marshal.dump @defaults # deep copy
+    @options = Gem::Util.deep_dup @defaults
     parser.order!(args) do |v|
       # put the non-option back at the front of the list of arguments
       args.unshift(v)
@@ -173,6 +173,9 @@ to the same gem path as user-installed gems.
   rescue Gem::InstallError => e
     alert_error "Error installing #{gem_name}:\n\t#{e.message}"
     terminate_interaction 1
+  rescue Gem::DependencyResolutionError => e
+    alert_error "Error installing #{gem_name}:\n\t#{e.message}"
+    terminate_interaction 2
   rescue Gem::GemNotFoundException => e
     show_lookup_failure e.name, e.version, e.errors, false
 
@@ -195,7 +198,7 @@ to the same gem path as user-installed gems.
     argv = ARGV.clone
     ARGV.replace options[:args]
 
-    exe = executable = options[:executable]
+    executable = options[:executable]
 
     contains_executable = Gem.loaded_specs.values.select do |spec|
       spec.executables.include?(executable)
@@ -206,13 +209,22 @@ to the same gem path as user-installed gems.
     end
 
     if contains_executable.empty?
-      if (spec = Gem.loaded_specs[executable]) && (exe = spec.executable)
-        contains_executable << spec
-      else
+      spec = Gem.loaded_specs[executable]
+
+      if spec.nil? || spec.executables.empty?
         alert_error "Failed to load executable `#{executable}`," \
               " are you sure the gem `#{options[:gem_name]}` contains it?"
         terminate_interaction 1
       end
+
+      if spec.executables.size > 1
+        alert_error "Ambiguous which executable from gem `#{executable}` should be run: " \
+              "the options are #{spec.executables.sort}, specify one via COMMAND, and use `-g` and `-v` to specify gem and version"
+        terminate_interaction 1
+      end
+
+      contains_executable << spec
+      executable = spec.executable
     end
 
     if contains_executable.size > 1
@@ -222,8 +234,11 @@ to the same gem path as user-installed gems.
       terminate_interaction 1
     end
 
-    load Gem.activate_bin_path(contains_executable.first.name, exe, ">= 0.a")
+    old_exe = $0
+    $0 = executable
+    load Gem.activate_bin_path(contains_executable.first.name, executable, ">= 0.a")
   ensure
+    $0 = old_exe if old_exe
     ARGV.replace argv
   end
 

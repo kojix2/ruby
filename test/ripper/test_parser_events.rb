@@ -233,7 +233,7 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
 
   def test_arg_ambiguous
     thru_arg_ambiguous = false
-    parse('m //', :on_arg_ambiguous) {thru_arg_ambiguous = true}
+    parse('m +1', :on_arg_ambiguous) {thru_arg_ambiguous = true}
     assert_equal true, thru_arg_ambiguous
   end
 
@@ -479,6 +479,13 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     }
     assert_equal true, thru_call
     assert_equal "[call(vcall(foo),.,call,[])]", tree
+
+    thru_call = false
+    assert_nothing_raised {
+      tree = parse("a b do end.()", :on_call) {thru_call = true}
+    }
+    assert_equal true, thru_call
+    assert_equal "[call(command(a,[vcall(b)],&do_block(,bodystmt([void()]))),.,call,[])]", tree
 
     thru_call = false
     assert_nothing_raised {

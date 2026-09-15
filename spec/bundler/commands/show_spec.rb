@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
-RSpec.describe "bundle show", bundler: "< 3" do
+RSpec.describe "bundle show" do
   context "with a standard Gemfile" do
     before :each do
+      build_repo2
+
       install_gemfile <<-G
-        source "https://gem.repo1"
+        source "https://gem.repo2"
         gem "rails"
       G
     end
@@ -35,12 +37,12 @@ RSpec.describe "bundle show", bundler: "< 3" do
       expect(out).to eq(default_bundle_path("gems", "rails-2.3.2").to_s)
     end
 
-    it "warns if path no longer exists on disk" do
-      FileUtils.rm_rf(default_bundle_path("gems", "rails-2.3.2"))
+    it "warns if specification is installed, but path does not exist on disk" do
+      FileUtils.rm_r(default_bundle_path("gems", "rails-2.3.2"))
 
       bundle "show rails"
 
-      expect(err).to match(/has been deleted/i)
+      expect(err).to match(/is missing/i)
       expect(err).to match(default_bundle_path("gems", "rails-2.3.2").to_s)
     end
 
@@ -85,6 +87,24 @@ RSpec.describe "bundle show", bundler: "< 3" do
         \tHomepage: https://bundler.io
         \tStatus:   Up to date
       MSG
+    end
+
+    it "includes up to date status in summary of gems" do
+      update_repo2 do
+        build_gem "rails", "3.0.0"
+      end
+
+      bundle "show --verbose"
+
+      expect(out).to include <<~MSG
+        * rails (2.3.2)
+        \tSummary:  This is just a fake gem for testing
+        \tHomepage: http://example.com
+        \tStatus:   Outdated - 2.3.2 < 3.0.0
+      MSG
+
+      # check lockfile is not accidentally updated
+      expect(lockfile).to include("actionmailer (2.3.2)")
     end
   end
 
@@ -144,7 +164,13 @@ RSpec.describe "bundle show", bundler: "< 3" do
     before :each do
       build_git "foo", path: lib_path("foo")
       File.open(lib_path("foo/Gemfile"), "w") {|f| f.puts "gemspec" }
-      sys_exec "rm -rf .git && git init", dir: lib_path("foo")
+      # sys_exec does not go through a shell, so this cannot be a single
+      # `rm -rf .git && git init` command: `&&` would be passed to `rm` as a
+      # literal argument, silently skipping the `git init` part and leaving a
+      # non-repository directory from which git would discover the rubygems
+      # checkout itself.
+      FileUtils.rm_rf lib_path("foo/.git")
+      git "init", lib_path("foo")
     end
 
     it "does not output git errors" do
@@ -159,13 +185,36 @@ RSpec.describe "bundle show", bundler: "< 3" do
       gem "foo"
     G
 
-    bundle "config set auto_install 1"
+    bundle_config "auto_install 1"
     bundle :show
     expect(out).to include("Installing foo 1.0")
   end
 
   context "with a valid regexp for gem name" do
-    it "presents alternatives", :readline do
+    it "returns the exact match without prompting when requested" do
+      install_gemfile <<-G
+        source "https://gem.repo1"
+        gem "myrack"
+        gem "myrack-obama"
+      G
+
+      bundle "show myrack --exact-match"
+      expect(out).to include(default_bundle_path("gems", "myrack-1.0.0").to_s)
+    end
+
+    it "does not fall back to regexp matching when exact matching is requested" do
+      install_gemfile <<-G
+        source "https://gem.repo1"
+        gem "myrack"
+        gem "myrack-obama"
+      G
+
+      bundle "show rac --exact-match", raise_on_error: false
+      expect(err).to include("Could not find gem 'rac'.")
+      expect(out).not_to include("0 : - exit -")
+    end
+
+    it "presents alternatives without the exact match flag", :readline do
       install_gemfile <<-G
         source "https://gem.repo1"
         gem "myrack"
@@ -173,7 +222,9 @@ RSpec.describe "bundle show", bundler: "< 3" do
       G
 
       bundle "show rac"
-      expect(out).to match(/\A1 : myrack\n2 : myrack-obama\n0 : - exit -(\n>|\z)/)
+      expect(out).to include("1 : myrack")
+      expect(out).to include("2 : myrack-obama")
+      expect(out).to include("0 : - exit -")
     end
   end
 
@@ -190,35 +241,8 @@ RSpec.describe "bundle show", bundler: "< 3" do
       expect(err).to include("Could not find gem '#{invalid_regexp}'.")
     end
   end
-
-  context "--outdated option" do
-    # Regression test for https://github.com/rubygems/bundler/issues/5375
-    before do
-      build_repo2
-    end
-
-    it "doesn't update gems to newer versions" do
-      install_gemfile <<-G
-        source "https://gem.repo2"
-        gem "rails"
-      G
-
-      expect(the_bundle).to include_gem("rails 2.3.2")
-
-      update_repo2 do
-        build_gem "rails", "3.0.0" do |s|
-          s.executables = "rails"
-        end
-      end
-
-      bundle "show --outdated"
-
-      bundle "install"
-      expect(the_bundle).to include_gem("rails 2.3.2")
-    end
-  end
 end
 
-RSpec.describe "bundle show", bundler: "3" do
+RSpec.describe "bundle show", bundler: "5" do
   pending "shows a friendly error about the command removal"
 end

@@ -17,6 +17,12 @@
 #include <errno.h>
 #include <ruby/io.h>
 #include <ruby/thread.h>
+#ifdef HAVE_RUBY_RACTOR_H
+#include <ruby/ractor.h>
+#else
+#define RUBY_TYPED_FROZEN_SHAREABLE 0
+#endif
+
 #include <openssl/opensslv.h>
 
 #include <openssl/err.h>
@@ -39,6 +45,7 @@
 #include <openssl/dsa.h>
 #include <openssl/evp.h>
 #include <openssl/dh.h>
+#include "openssl_missing.h"
 
 #ifndef LIBRESSL_VERSION_NUMBER
 # define OSSL_IS_LIBRESSL 0
@@ -52,18 +59,17 @@
       (LIBRESSL_VERSION_NUMBER >= ((maj << 28) | (min << 20) | (pat << 12)))
 #endif
 
-#if OSSL_OPENSSL_PREREQ(3, 0, 0)
-# define OSSL_3_const const
-#else
-# define OSSL_3_const /* const */
-#endif
-
 #if !defined(OPENSSL_NO_ENGINE) && !OSSL_OPENSSL_PREREQ(3, 0, 0)
 # define OSSL_USE_ENGINE
 #endif
 
 #if OSSL_OPENSSL_PREREQ(3, 0, 0)
 # define OSSL_USE_PROVIDER
+# include <openssl/provider.h>
+#endif
+
+#if OSSL_OPENSSL_PREREQ(3, 0, 0)
+# define OSSL_HAVE_IMMUTABLE_PKEY
 #endif
 
 /*
@@ -80,11 +86,13 @@ extern VALUE eOSSLError;
  * CheckTypes
  */
 #define OSSL_Check_Kind(obj, klass) do {\
-  if (!rb_obj_is_kind_of((obj), (klass))) {\
-    ossl_raise(rb_eTypeError, "wrong argument (%"PRIsVALUE")! (Expected kind of %"PRIsVALUE")",\
-               rb_obj_class(obj), (klass));\
-  }\
+    if (!rb_obj_is_kind_of((obj), (klass))) {\
+        ossl_raise(rb_eTypeError, "wrong argument (%"PRIsVALUE")! (Expected kind of %"PRIsVALUE")",\
+                   rb_obj_class(obj), (klass));\
+    }\
 } while (0)
+
+void ossl_want_uninitialized(VALUE self, const rb_data_type_t *type);
 
 /*
  * Type conversions
@@ -92,8 +100,10 @@ extern VALUE eOSSLError;
 #if !defined(NUM2UINT64T) /* in case Ruby starts to provide */
 #  if SIZEOF_LONG == 8
 #    define NUM2UINT64T(x) ((uint64_t)NUM2ULONG(x))
+#    define UINT64T2NUM(x) ULONG2NUM(x)
 #  elif defined(HAVE_LONG_LONG) && SIZEOF_LONG_LONG == 8
 #    define NUM2UINT64T(x) ((uint64_t)NUM2ULL(x))
+#    define UINT64T2NUM(x) ULL2NUM(x)
 #  else
 #    error "unknown platform; no 64-bit width integer"
 #  endif
@@ -119,7 +129,7 @@ do{\
  * Convert binary string to hex string. The caller is responsible for
  * ensuring out has (2 * len) bytes of capacity.
  */
-void ossl_bin2hex(unsigned char *in, char *out, size_t len);
+void ossl_bin2hex(const unsigned char *in, char *out, size_t len);
 
 /*
  * Our default PEM callback
@@ -162,38 +172,36 @@ VALUE ossl_to_der_if_possible(VALUE);
 extern VALUE dOSSL;
 
 #define OSSL_Debug(...) do { \
-  if (dOSSL == Qtrue) { \
-    fprintf(stderr, "OSSL_DEBUG: "); \
-    fprintf(stderr, __VA_ARGS__); \
-    fprintf(stderr, " [%s:%d]\n", __FILE__, __LINE__); \
-  } \
+    if (dOSSL == Qtrue) { \
+        fprintf(stderr, "OSSL_DEBUG: "); \
+        fprintf(stderr, __VA_ARGS__); \
+        fprintf(stderr, " [%s:%d]\n", __FILE__, __LINE__); \
+    } \
 } while (0)
 
 /*
  * Include all parts
  */
-#include "openssl_missing.h"
 #include "ossl_asn1.h"
 #include "ossl_bio.h"
 #include "ossl_bn.h"
 #include "ossl_cipher.h"
 #include "ossl_config.h"
 #include "ossl_digest.h"
+#include "ossl_engine.h"
 #include "ossl_hmac.h"
+#include "ossl_hpke.h"
+#include "ossl_kdf.h"
 #include "ossl_ns_spki.h"
 #include "ossl_ocsp.h"
 #include "ossl_pkcs12.h"
 #include "ossl_pkcs7.h"
 #include "ossl_pkey.h"
+#include "ossl_provider.h"
 #include "ossl_rand.h"
 #include "ossl_ssl.h"
-#ifndef OPENSSL_NO_TS
-  #include "ossl_ts.h"
-#endif
+#include "ossl_ts.h"
 #include "ossl_x509.h"
-#include "ossl_engine.h"
-#include "ossl_provider.h"
-#include "ossl_kdf.h"
 
 void Init_openssl(void);
 

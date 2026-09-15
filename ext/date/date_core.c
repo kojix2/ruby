@@ -27,7 +27,7 @@ static VALUE eDateError;
 static VALUE half_days_in_day, day_in_nanoseconds;
 static double positive_inf, negative_inf;
 
-// used by deconstruct_keys
+/* used by deconstruct_keys */
 static VALUE sym_year, sym_month, sym_day, sym_yday, sym_wday;
 static VALUE sym_hour, sym_min, sym_sec, sym_sec_fraction, sym_zone;
 
@@ -248,6 +248,11 @@ f_negative_p(VALUE x)
 #define date_sg_t double
 #endif
 
+#define JULIAN_EPOCH_DATE "-4712-01-01"
+#define JULIAN_EPOCH_DATETIME JULIAN_EPOCH_DATE "T00:00:00+00:00"
+#define JULIAN_EPOCH_DATETIME_RFC3339 "Mon, 1 Jan -4712 00:00:00 +0000"
+#define JULIAN_EPOCH_DATETIME_HTTPDATE "Mon, 01 Jan -4712 00:00:00 GMT"
+
 /* A set of nth, jd, df and sf denote ajd + 1/2.  Each ajd begin at
  * noon of GMT (assume equal to UTC).  However, this begins at
  * midnight.
@@ -447,11 +452,43 @@ do {\
 static int c_valid_civil_p(int, int, int, double,
 			   int *, int *, int *, int *);
 
+/* Check if using pure Gregorian calendar (sg == -Infinity) */
+#define c_gregorian_only_p(sg) (isinf(sg) && (sg) < 0)
+
+/*
+ * Fast path macros for pure Gregorian calendar.
+ * Sets *rjd to the JD value, *ns to 1 (new style), and returns.
+ */
+#define GREGORIAN_JD_FAST_PATH_RET(sg, jd_expr, rjd, ns) \
+    if (c_gregorian_only_p(sg)) { \
+	*(rjd) = (jd_expr); \
+	*(ns) = 1; \
+	return 1; \
+    }
+
+#define GREGORIAN_JD_FAST_PATH(sg, jd_expr, rjd, ns) \
+    if (c_gregorian_only_p(sg)) { \
+	*(rjd) = (jd_expr); \
+	*(ns) = 1; \
+	return; \
+    }
+
+/* Forward declarations for Neri-Schneider optimized functions */
+static int c_gregorian_civil_to_jd(int y, int m, int d);
+static void c_gregorian_jd_to_civil(int jd, int *ry, int *rm, int *rd);
+static int c_gregorian_fdoy(int y);
+static int c_gregorian_ldoy(int y);
+static int c_gregorian_ldom_jd(int y, int m);
+static int ns_jd_in_range(int jd);
+
 static int
 c_find_fdoy(int y, double sg, int *rjd, int *ns)
 {
     int d, rm, rd;
 
+    GREGORIAN_JD_FAST_PATH_RET(sg, c_gregorian_fdoy(y), rjd, ns);
+
+    /* Keep existing loop for Julian/reform period */
     for (d = 1; d < 31; d++)
 	if (c_valid_civil_p(y, 1, d, sg, &rm, &rd, rjd, ns))
 	    return 1;
@@ -463,6 +500,9 @@ c_find_ldoy(int y, double sg, int *rjd, int *ns)
 {
     int i, rm, rd;
 
+    GREGORIAN_JD_FAST_PATH_RET(sg, c_gregorian_ldoy(y), rjd, ns);
+
+    /* Keep existing loop for Julian/reform period */
     for (i = 0; i < 30; i++)
 	if (c_valid_civil_p(y, 12, 31 - i, sg, &rm, &rd, rjd, ns))
 	    return 1;
@@ -488,6 +528,9 @@ c_find_ldom(int y, int m, double sg, int *rjd, int *ns)
 {
     int i, rm, rd;
 
+    GREGORIAN_JD_FAST_PATH_RET(sg, c_gregorian_ldom_jd(y, m), rjd, ns);
+
+    /* Keep existing loop for Julian/reform period */
     for (i = 0; i < 30; i++)
 	if (c_valid_civil_p(y, m, 31 - i, sg, &rm, &rd, rjd, ns))
 	    return 1;
@@ -497,55 +540,69 @@ c_find_ldom(int y, int m, double sg, int *rjd, int *ns)
 static void
 c_civil_to_jd(int y, int m, int d, double sg, int *rjd, int *ns)
 {
-    double a, b, jd;
+    int jd;
 
-    if (m <= 2) {
-	y -= 1;
-	m += 12;
-    }
-    a = floor(y / 100.0);
-    b = 2 - a + floor(a / 4.0);
-    jd = floor(365.25 * (y + 4716)) +
-	floor(30.6001 * (m + 1)) +
-	d + b - 1524;
+    GREGORIAN_JD_FAST_PATH(sg, c_gregorian_civil_to_jd(y, m, d), rjd, ns);
+
+    /* Calculate Gregorian JD using optimized algorithm */
+    jd = c_gregorian_civil_to_jd(y, m, d);
+
     if (jd < sg) {
-	jd -= b;
+	/* Before Gregorian switchover - use Julian calendar */
+	int y2 = y, m2 = m;
+	if (m2 <= 2) {
+	    y2 -= 1;
+	    m2 += 12;
+	}
+	jd = (int)(floor(365.25 * (y2 + 4716)) +
+		   floor(30.6001 * (m2 + 1)) +
+		   d - 1524);
 	*ns = 0;
     }
-    else
+    else {
 	*ns = 1;
+    }
 
-    *rjd = (int)jd;
+    *rjd = jd;
 }
 
 static void
 c_jd_to_civil(int jd, double sg, int *ry, int *rm, int *rdom)
 {
-    double x, a, b, c, d, e, y, m, dom;
-
-    if (jd < sg)
-	a = jd;
-    else {
-	x = floor((jd - 1867216.25) / 36524.25);
-	a = jd + 1 + x - floor(x / 4.0);
-    }
-    b = a + 1524;
-    c = floor((b - 122.1) / 365.25);
-    d = floor(365.25 * c);
-    e = floor((b - d) / 30.6001);
-    dom = b - d - floor(30.6001 * e);
-    if (e <= 13) {
-	m = e - 1;
-	y = c - 4716;
-    }
-    else {
-	m = e - 13;
-	y = c - 4715;
+    /* Fast path: pure Gregorian or date after switchover, within safe range */
+    if ((c_gregorian_only_p(sg) || jd >= sg) && ns_jd_in_range(jd)) {
+	c_gregorian_jd_to_civil(jd, ry, rm, rdom);
+	return;
     }
 
-    *ry = (int)y;
-    *rm = (int)m;
-    *rdom = (int)dom;
+    /* Original algorithm for Julian calendar or extreme dates */
+    {
+	double x, a, b, c, d, e, y, m, dom;
+
+	if (jd < sg)
+	    a = jd;
+	else {
+	    x = floor((jd - 1867216.25) / 36524.25);
+	    a = jd + 1 + x - floor(x / 4.0);
+	}
+	b = a + 1524;
+	c = floor((b - 122.1) / 365.25);
+	d = floor(365.25 * c);
+	e = floor((b - d) / 30.6001);
+	dom = b - d - floor(30.6001 * e);
+	if (e <= 13) {
+	    m = e - 1;
+	    y = c - 4716;
+	}
+	else {
+	    m = e - 13;
+	    y = c - 4715;
+	}
+
+	*ry = (int)y;
+	*rm = (int)m;
+	*rdom = (int)dom;
+    }
 }
 
 static void
@@ -720,6 +777,147 @@ c_gregorian_last_day_of_month(int y, int m)
     return monthtab[c_gregorian_leap_p(y) ? 1 : 0][m];
 }
 
+/*
+ * Neri-Schneider algorithm for optimized Gregorian date conversion.
+ * Reference: Neri & Schneider, "Euclidean Affine Functions and Applications
+ *            to Calendar Algorithms", Software: Practice and Experience, 2023.
+ *            https://arxiv.org/abs/2102.06959
+ *
+ * This algorithm provides ~2-3x speedup over traditional floating-point
+ * implementations by using pure integer arithmetic with multiplication
+ * and bit-shifts instead of expensive division operations.
+ */
+
+/* JDN of March 1, Year 0 in proleptic Gregorian calendar */
+#define NS_EPOCH 1721120
+
+/* Days in a 4-year cycle (3 normal years + 1 leap year) */
+#define NS_DAYS_IN_4_YEARS 1461
+
+/* Days in a 400-year Gregorian cycle (97 leap years in 400 years) */
+#define NS_DAYS_IN_400_YEARS 146097
+
+/* Years per century */
+#define NS_YEARS_PER_CENTURY 100
+
+/*
+ * Multiplier for extracting year within century using fixed-point arithmetic.
+ * This is ceil(2^32 / NS_DAYS_IN_4_YEARS) for the Euclidean affine function.
+ */
+#define NS_YEAR_MULTIPLIER 2939745
+
+/*
+ * Coefficients for month calculation from day-of-year.
+ * Maps day-of-year to month using: month = (NS_MONTH_COEFF * doy + NS_MONTH_OFFSET) >> 16
+ */
+#define NS_MONTH_COEFF 2141
+#define NS_MONTH_OFFSET 197913
+
+/*
+ * Coefficients for civil date to JDN month contribution.
+ * Maps month to accumulated days: days = (NS_CIVIL_MONTH_COEFF * m - NS_CIVIL_MONTH_OFFSET) / 32
+ */
+#define NS_CIVIL_MONTH_COEFF 979
+#define NS_CIVIL_MONTH_OFFSET 2919
+#define NS_CIVIL_MONTH_DIVISOR 32
+
+/* Days from March 1 to December 31 (for Jan/Feb year adjustment) */
+#define NS_DAYS_BEFORE_NEW_YEAR 306
+
+/*
+ * Safe bounds for Neri-Schneider algorithm to avoid integer overflow.
+ * These correspond to approximately years -1,000,000 to +1,000,000.
+ */
+#define NS_JD_MIN -364000000
+#define NS_JD_MAX  538000000
+
+inline static int
+ns_jd_in_range(int jd)
+{
+    return jd >= NS_JD_MIN && jd <= NS_JD_MAX;
+}
+
+/* Optimized: Gregorian date -> Julian Day Number */
+static int
+c_gregorian_civil_to_jd(int y, int m, int d)
+{
+    /* Shift epoch to March 1 of year 0 (Jan/Feb belong to previous year) */
+    int j = (m < 3) ? 1 : 0;
+    int y0 = y - j;
+    int m0 = j ? m + 12 : m;
+    int d0 = d - 1;
+
+    /* Calculate year contribution with leap year correction */
+    int q1 = DIV(y0, NS_YEARS_PER_CENTURY);
+    int yc = DIV(NS_DAYS_IN_4_YEARS * y0, 4) - q1 + DIV(q1, 4);
+
+    /* Calculate month contribution using integer arithmetic */
+    int mc = (NS_CIVIL_MONTH_COEFF * m0 - NS_CIVIL_MONTH_OFFSET) / NS_CIVIL_MONTH_DIVISOR;
+
+    /* Combine and add epoch offset to get JDN */
+    return yc + mc + d0 + NS_EPOCH;
+}
+
+/* Optimized: Julian Day Number -> Gregorian date */
+static void
+c_gregorian_jd_to_civil(int jd, int *ry, int *rm, int *rd)
+{
+    int r0, n1, q1, r1, n2, q2, r2, n3, q3, r3, y0, j;
+    uint64_t u2;
+
+    /* Convert JDN to rata die (March 1, Year 0 epoch) */
+    r0 = jd - NS_EPOCH;
+
+    /* Extract century and day within 400-year cycle */
+    /* Use Euclidean (floor) division for negative values */
+    n1 = 4 * r0 + 3;
+    q1 = DIV(n1, NS_DAYS_IN_400_YEARS);
+    r1 = MOD(n1, NS_DAYS_IN_400_YEARS) / 4;
+
+    /* Calculate year within century and day of year */
+    n2 = 4 * r1 + 3;
+    /* Use 64-bit arithmetic to avoid overflow */
+    u2 = (uint64_t)NS_YEAR_MULTIPLIER * (uint64_t)n2;
+    q2 = (int)(u2 >> 32);
+    r2 = (int)((uint32_t)u2 / NS_YEAR_MULTIPLIER / 4);
+
+    /* Calculate month and day using integer arithmetic */
+    n3 = NS_MONTH_COEFF * r2 + NS_MONTH_OFFSET;
+    q3 = n3 >> 16;
+    r3 = (n3 & 0xFFFF) / NS_MONTH_COEFF;
+
+    /* Combine century and year */
+    y0 = NS_YEARS_PER_CENTURY * q1 + q2;
+
+    /* Adjust for January/February (shift from fiscal year) */
+    j = (r2 >= NS_DAYS_BEFORE_NEW_YEAR) ? 1 : 0;
+
+    *ry = y0 + j;
+    *rm = j ? q3 - 12 : q3;
+    *rd = r3 + 1;
+}
+
+/* O(1) first day of year for Gregorian calendar */
+inline static int
+c_gregorian_fdoy(int y)
+{
+    return c_gregorian_civil_to_jd(y, 1, 1);
+}
+
+/* O(1) last day of year for Gregorian calendar */
+inline static int
+c_gregorian_ldoy(int y)
+{
+    return c_gregorian_civil_to_jd(y, 12, 31);
+}
+
+/* O(1) last day of month (JDN) for Gregorian calendar */
+inline static int
+c_gregorian_ldom_jd(int y, int m)
+{
+    return c_gregorian_civil_to_jd(y, m, c_gregorian_last_day_of_month(y, m));
+}
+
 static int
 c_valid_julian_p(int y, int m, int d, int *rm, int *rd)
 {
@@ -794,11 +992,15 @@ c_valid_commercial_p(int y, int w, int d, double sg,
     if (w < 0) {
 	int rjd2;
 
+	if (w < -53) return 0;
 	c_commercial_to_jd(y + 1, 1, 1, sg, &rjd2, &ns2);
 	c_jd_to_commercial(rjd2 + w * 7, sg, &ry2, &rw2, &rd2);
 	if (ry2 != y)
 	    return 0;
 	w = rw2;
+    }
+    else {
+	if (w < 1 || 53 < w) return 0;
     }
     c_commercial_to_jd(y, w, d, sg, rjd, ns);
     c_jd_to_commercial(*rjd, sg, &ry2, rw, rd);
@@ -1594,7 +1796,7 @@ m_ajd(union DateData *x)
 
     if (simple_dat_p(x)) {
 	r = m_real_jd(x);
-	if (FIXNUM_P(r) && FIX2LONG(r) <= (FIXNUM_MAX / 2)) {
+	if (FIXNUM_P(r) && FIX2LONG(r) <= (FIXNUM_MAX / 2) && FIX2LONG(r) >= (FIXNUM_MIN + 1) / 2) {
 	    long ir = FIX2LONG(r);
 	    ir = ir * 2 - 1;
 	    return rb_rational_new2(LONG2FIX(ir), INT2FIX(2));
@@ -2423,9 +2625,9 @@ offset_to_sec(VALUE vof, int *rof)
 		if (!FIXNUM_P(vn))
 		    return 0;
 		n = FIX2LONG(vn);
-		if (n < -DAY_IN_SECONDS || n > DAY_IN_SECONDS)
-		    return 0;
 	    }
+	    if (n < -DAY_IN_SECONDS || n > DAY_IN_SECONDS)
+		return 0;
 	    *rof = (int)n;
 	    return 1;
 	}
@@ -2493,7 +2695,7 @@ date_s__valid_jd_p(int argc, VALUE *argv, VALUE klass)
  *
  *   Date.valid_jd?(2451944) # => true
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd.
  */
@@ -2587,7 +2789,7 @@ date_s__valid_civil_p(int argc, VALUE *argv, VALUE klass)
  *   Date.valid_date?(2001, 2, 29) # => false
  *   Date.valid_date?(2001, 2, -1) # => true
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd, Date.new.
  */
@@ -2675,7 +2877,7 @@ date_s__valid_ordinal_p(int argc, VALUE *argv, VALUE klass)
  *   Date.valid_ordinal?(2001, 34)  # => true
  *   Date.valid_ordinal?(2001, 366) # => false
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd, Date.ordinal.
  */
@@ -2765,7 +2967,7 @@ date_s__valid_commercial_p(int argc, VALUE *argv, VALUE klass)
  *
  * See Date.commercial.
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd, Date.commercial.
  */
@@ -2997,34 +3199,66 @@ date_s_gregorian_leap_p(VALUE klass, VALUE y)
     return f_boolcast(c_gregorian_leap_p(ry));
 }
 
+#ifndef HAVE_RB_GC_MARK_MOVABLE
+#define rb_gc_mark_movable rb_gc_mark
+#else
+static void
+d_lite_gc_compact(void *ptr)
+{
+    union DateData *dat = ptr;
+    if (simple_dat_p(dat))
+        dat->s.nth = rb_gc_location(dat->s.nth);
+    else {
+        dat->c.nth = rb_gc_location(dat->c.nth);
+        dat->c.sf = rb_gc_location(dat->c.sf);
+    }
+}
+#endif
+
 static void
 d_lite_gc_mark(void *ptr)
 {
     union DateData *dat = ptr;
     if (simple_dat_p(dat))
-	rb_gc_mark(dat->s.nth);
+        rb_gc_mark_movable(dat->s.nth);
     else {
-	rb_gc_mark(dat->c.nth);
-	rb_gc_mark(dat->c.sf);
+        rb_gc_mark_movable(dat->c.nth);
+        rb_gc_mark_movable(dat->c.sf);
     }
-}
-
-static size_t
-d_lite_memsize(const void *ptr)
-{
-    const union DateData *dat = ptr;
-    return complex_dat_p(dat) ? sizeof(struct ComplexDateData) : sizeof(struct SimpleDateData);
 }
 
 #ifndef HAVE_RB_EXT_RACTOR_SAFE
 #   define RUBY_TYPED_FROZEN_SHAREABLE 0
 #endif
 
+#if defined(RUBY_TYPED_EMBEDDABLE) || defined(HAVE_CONST_RUBY_TYPED_EMBEDDABLE)
+# define HAVE_RUBY_TYPED_EMBEDDABLE 1
+#else
+# define RUBY_TYPED_EMBEDDABLE 0
+#endif
+
+static size_t
+d_lite_memsize(const void *ptr)
+{
+#ifdef HAVE_RUBY_TYPED_EMBEDDABLE
+    return 0;
+#else
+    return sizeof(union DateData);
+#endif
+}
+
 static const rb_data_type_t d_lite_type = {
     "Date",
-    {d_lite_gc_mark, RUBY_TYPED_DEFAULT_FREE, d_lite_memsize,},
+    {
+        d_lite_gc_mark,
+        RUBY_TYPED_DEFAULT_FREE,
+        d_lite_memsize,
+#ifdef HAVE_RB_GC_MARK_MOVABLE
+        d_lite_gc_compact,
+#endif
+    },
     0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY|RUBY_TYPED_WB_PROTECTED|RUBY_TYPED_FROZEN_SHAREABLE,
+    RUBY_TYPED_FREE_IMMEDIATELY|RUBY_TYPED_WB_PROTECTED|RUBY_TYPED_EMBEDDABLE|RUBY_TYPED_FROZEN_SHAREABLE,
 };
 
 inline static VALUE
@@ -3035,10 +3269,11 @@ d_simple_new_internal(VALUE klass,
 		      unsigned flags)
 {
     struct SimpleDateData *dat;
+    union DateData *u_dat;
     VALUE obj;
 
-    obj = TypedData_Make_Struct(klass, struct SimpleDateData,
-				&d_lite_type, dat);
+    obj = TypedData_Make_Struct(klass, union DateData, &d_lite_type, u_dat);
+    dat = &u_dat->s;
     set_to_simple(obj, dat, nth, jd, sg, y, m, d, flags);
 
     assert(have_jd_p(dat) || have_civil_p(dat));
@@ -3056,10 +3291,11 @@ d_complex_new_internal(VALUE klass,
 		       unsigned flags)
 {
     struct ComplexDateData *dat;
+    union DateData *u_dat;
     VALUE obj;
 
-    obj = TypedData_Make_Struct(klass, struct ComplexDateData,
-				&d_lite_type, dat);
+    obj = TypedData_Make_Struct(klass, union DateData, &d_lite_type, u_dat);
+    dat = &u_dat->c;
     set_to_complex(obj, dat, nth, jd, df, sf, of, sg,
 		   y, m, d, h, min, s, flags);
 
@@ -3345,7 +3581,7 @@ static VALUE d_lite_plus(VALUE, VALUE);
  *
  *     Date.jd(Date::ITALY - 1).julian?    # => true
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.new.
  */
@@ -3410,7 +3646,7 @@ date_s_jd(int argc, VALUE *argv, VALUE klass)
  *
  * Raises an exception if +yday+ is zero or out of range.
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd, Date.new.
  */
@@ -3487,7 +3723,7 @@ date_s_civil(int argc, VALUE *argv, VALUE klass)
  * where +n+ is the number of days in the month;
  * when the argument is negative, counts backward from the end of the month.
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd.
  */
@@ -3593,7 +3829,7 @@ date_initialize(int argc, VALUE *argv, VALUE self)
  *     Date.commercial(2020, 1, 1).to_s # => "2019-12-30"
        Date.commercial(2020, 1, 7).to_s # => "2020-01-05"
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * Related: Date.jd, Date.new, Date.ordinal.
  */
@@ -3778,7 +4014,7 @@ static void set_sg(union DateData *, double);
  *
  *   Date.today.to_s # => "2022-07-06"
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  */
 static VALUE
@@ -3873,7 +4109,6 @@ static VALUE
 rt_complete_frags(VALUE klass, VALUE hash)
 {
     static VALUE tab = Qnil;
-    int g;
     long e;
     VALUE k, a, d;
 
@@ -3970,9 +4205,13 @@ rt_complete_frags(VALUE klass, VALUE hash)
 	rb_gc_register_mark_object(tab);
     }
 
-    {
-	long i, eno = 0, idx = 0;
+    k = a = Qnil;
 
+    {
+	long i, eno = 0;
+	VALUE t = Qnil;
+
+	e = 0;
 	for (i = 0; i < RARRAY_LEN(tab); i++) {
 	    VALUE x, a;
 
@@ -3987,23 +4226,20 @@ rt_complete_frags(VALUE klass, VALUE hash)
 			n++;
 		if (n > eno) {
 		    eno = n;
-		    idx = i;
+		    t = x;
 		}
 	    }
 	}
-	if (eno == 0)
-	    g = 0;
-	else {
-	    g = 1;
-	    k = RARRAY_AREF(RARRAY_AREF(tab, idx), 0);
-	    a = RARRAY_AREF(RARRAY_AREF(tab, idx), 1);
-	    e =	eno;
+	if (eno > 0) {
+	    k = RARRAY_AREF(t, 0);
+	    a = RARRAY_AREF(t, 1);
 	}
+	e = eno;
     }
 
     d = Qnil;
 
-    if (g && !NIL_P(k) && (RARRAY_LEN(a) - e)) {
+    if (!NIL_P(k) && (RARRAY_LEN(a) > e)) {
 	if (k == sym("ordinal")) {
 	    if (NIL_P(ref_hash("year"))) {
 		if (NIL_P(d))
@@ -4090,7 +4326,7 @@ rt_complete_frags(VALUE klass, VALUE hash)
 	}
     }
 
-    if (g && k == sym("time")) {
+    if (k == sym("time")) {
 	if (f_le_p(klass, cDateTime)) {
 	    if (NIL_P(d))
 		d = date_s_today(0, (VALUE *)0, cDate);
@@ -4317,7 +4553,8 @@ d_new_by_frags(VALUE klass, VALUE hash, VALUE sg)
 }
 
 VALUE date__strptime(const char *str, size_t slen,
-		     const char *fmt, size_t flen, VALUE hash);
+		     const char *fmt, size_t flen,
+		     VALUE hash, rb_encoding *enc);
 
 static VALUE
 date_s__strptime_internal(int argc, VALUE *argv, VALUE klass,
@@ -4326,10 +4563,12 @@ date_s__strptime_internal(int argc, VALUE *argv, VALUE klass,
     VALUE vstr, vfmt, hash;
     const char *str, *fmt;
     size_t slen, flen;
+    rb_encoding *enc;
 
     rb_scan_args(argc, argv, "11", &vstr, &vfmt);
 
     StringValue(vstr);
+    if (argc > 1) StringValue(vfmt);
     if (!rb_enc_str_asciicompat_p(vstr))
 	rb_raise(rb_eArgError,
 		 "string should have ASCII compatible encoding");
@@ -4338,34 +4577,18 @@ date_s__strptime_internal(int argc, VALUE *argv, VALUE klass,
     if (argc < 2) {
 	fmt = default_fmt;
 	flen = strlen(default_fmt);
+	enc = rb_enc_get(vstr);
     }
     else {
-	StringValue(vfmt);
 	if (!rb_enc_str_asciicompat_p(vfmt))
 	    rb_raise(rb_eArgError,
 		     "format should have ASCII compatible encoding");
+	enc = rb_enc_check(vstr, vfmt);
 	fmt = RSTRING_PTR(vfmt);
 	flen = RSTRING_LEN(vfmt);
     }
     hash = rb_hash_new();
-    if (NIL_P(date__strptime(str, slen, fmt, flen, hash)))
-	return Qnil;
-
-    {
-	VALUE zone = ref_hash("zone");
-	VALUE left = ref_hash("leftover");
-
-	if (!NIL_P(zone)) {
-	    rb_enc_copy(zone, vstr);
-	    set_hash("zone", zone);
-	}
-	if (!NIL_P(left)) {
-	    rb_enc_copy(left, vstr);
-	    set_hash("leftover", left);
-	}
-    }
-
-    return hash;
+    return date__strptime(str, slen, fmt, flen, hash, enc);
 }
 
 /*
@@ -4378,7 +4601,7 @@ date_s__strptime_internal(int argc, VALUE *argv, VALUE klass,
  *   Date._strptime('2001-02-03', '%Y-%m-%d') # => {:year=>2001, :mon=>2, :mday=>3}
  *
  * For other formats, see
- * {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc].
+ * {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc].
  * (Unlike Date.strftime, does not support flags and width.)
  *
  * See also {strptime(3)}[https://man7.org/linux/man-pages/man3/strptime.3.html].
@@ -4407,10 +4630,10 @@ date_s__strptime(int argc, VALUE *argv, VALUE klass)
  *   Date.strptime('sat3feb01', '%a%d%b%y')   # => #<Date: 2001-02-03>
  *
  * For other formats, see
- * {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc].
+ * {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc].
  * (Unlike Date.strftime, does not support flags and width.)
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  * See also {strptime(3)}[https://man7.org/linux/man-pages/man3/strptime.3.html].
  *
@@ -4425,7 +4648,7 @@ date_s_strptime(int argc, VALUE *argv, VALUE klass)
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01");
+	str = rb_str_new2(JULIAN_EPOCH_DATE);
       case 1:
 	fmt = rb_str_new2("%F");
       case 2:
@@ -4459,11 +4682,10 @@ get_limit(VALUE opt)
 #define rb_category_warn(category, fmt) rb_warn(fmt)
 #endif
 
-static void
+static VALUE
 check_limit(VALUE str, VALUE opt)
 {
     size_t slen, limit;
-    if (NIL_P(str)) return;
     StringValue(str);
     slen = RSTRING_LEN(str);
     limit = get_limit(opt);
@@ -4471,6 +4693,7 @@ check_limit(VALUE str, VALUE opt)
 	rb_raise(rb_eArgError,
 		 "string length (%"PRI_SIZE_PREFIX"u) exceeds the limit %"PRI_SIZE_PREFIX"u", slen, limit);
     }
+    return str;
 }
 
 static VALUE
@@ -4478,10 +4701,8 @@ date_s__parse_internal(int argc, VALUE *argv, VALUE klass)
 {
     VALUE vstr, vcomp, hash, opt;
 
-    rb_scan_args(argc, argv, "11:", &vstr, &vcomp, &opt);
-    if (!NIL_P(opt)) argc--;
-    check_limit(vstr, opt);
-    StringValue(vstr);
+    argc = rb_scan_args(argc, argv, "11:", &vstr, &vcomp, &opt);
+    vstr = check_limit(vstr, opt);
     if (!rb_enc_str_asciicompat_p(vstr))
 	rb_raise(rb_eArgError,
 		 "string should have ASCII compatible encoding");
@@ -4501,7 +4722,7 @@ date_s__parse_internal(int argc, VALUE *argv, VALUE klass)
  * This method recognizes many forms in +string+,
  * but it is not a validator.
  * For formats, see
- * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc@Specialized+Format+Strings]
+ * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc@Specialized+Format+Strings]
  *
  * If +string+ does not specify a valid date,
  * the result is unpredictable;
@@ -4536,7 +4757,7 @@ date_s__parse(int argc, VALUE *argv, VALUE klass)
  * This method recognizes many forms in +string+,
  * but it is not a validator.
  * For formats, see
- * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc@Specialized+Format+Strings]
+ * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc@Specialized+Format+Strings]
  * If +string+ does not specify a valid date,
  * the result is unpredictable;
  * consider using Date._strptime instead.
@@ -4556,7 +4777,7 @@ date_s__parse(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._parse (returns a hash).
@@ -4566,12 +4787,11 @@ date_s_parse(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, comp, sg, opt;
 
-    rb_scan_args(argc, argv, "03:", &str, &comp, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "03:", &str, &comp, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01");
+	str = rb_str_new2(JULIAN_EPOCH_DATE);
       case 1:
 	comp = Qtrue;
       case 2:
@@ -4601,7 +4821,7 @@ VALUE date__jisx0301(VALUE);
  *   Date._iso8601(string, limit: 128) -> hash
  *
  * Returns a hash of values parsed from +string+, which should contain
- * an {ISO 8601 formatted date}[rdoc-ref:strftime_formatting.rdoc@ISO+8601+Format+Specifications]:
+ * an {ISO 8601 formatted date}[rdoc-ref:language/strftime_formatting.rdoc@ISO+8601+Format+Specifications]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.iso8601    # => "2001-02-03"
@@ -4617,7 +4837,7 @@ date_s__iso8601(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__iso8601(str);
 }
@@ -4628,7 +4848,7 @@ date_s__iso8601(int argc, VALUE *argv, VALUE klass)
  *
  * Returns a new \Date object with values parsed from +string+,
  * which should contain
- * an {ISO 8601 formatted date}[rdoc-ref:strftime_formatting.rdoc@ISO+8601+Format+Specifications]:
+ * an {ISO 8601 formatted date}[rdoc-ref:language/strftime_formatting.rdoc@ISO+8601+Format+Specifications]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.iso8601   # => "2001-02-03"
@@ -4636,7 +4856,7 @@ date_s__iso8601(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._iso8601 (returns a hash).
@@ -4646,12 +4866,11 @@ date_s_iso8601(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01");
+	str = rb_str_new2(JULIAN_EPOCH_DATE);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -4671,7 +4890,7 @@ date_s_iso8601(int argc, VALUE *argv, VALUE klass)
  *   Date._rfc3339(string, limit: 128) -> hash
  *
  * Returns a hash of values parsed from +string+, which should be a valid
- * {RFC 3339 format}[rdoc-ref:strftime_formatting.rdoc@RFC+3339+Format]:
+ * {RFC 3339 format}[rdoc-ref:language/strftime_formatting.rdoc@RFC+3339+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.rfc3339     # => "2001-02-03T00:00:00+00:00"
@@ -4688,7 +4907,7 @@ date_s__rfc3339(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__rfc3339(str);
 }
@@ -4699,7 +4918,7 @@ date_s__rfc3339(int argc, VALUE *argv, VALUE klass)
  *
  * Returns a new \Date object with values parsed from +string+,
  * which should be a valid
- * {RFC 3339 format}[rdoc-ref:strftime_formatting.rdoc@RFC+3339+Format]:
+ * {RFC 3339 format}[rdoc-ref:language/strftime_formatting.rdoc@RFC+3339+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.rfc3339   # => "2001-02-03T00:00:00+00:00"
@@ -4707,7 +4926,7 @@ date_s__rfc3339(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._rfc3339 (returns a hash).
@@ -4717,12 +4936,11 @@ date_s_rfc3339(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -4758,7 +4976,7 @@ date_s__xmlschema(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__xmlschema(str);
 }
@@ -4776,7 +4994,7 @@ date_s__xmlschema(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._xmlschema (returns a hash).
@@ -4786,12 +5004,11 @@ date_s_xmlschema(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01");
+	str = rb_str_new2(JULIAN_EPOCH_DATE);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -4811,7 +5028,7 @@ date_s_xmlschema(int argc, VALUE *argv, VALUE klass)
  *   Date._rfc2822(string, limit: 128) -> hash
  *
  * Returns a hash of values parsed from +string+, which should be a valid
- * {RFC 2822 date format}[rdoc-ref:strftime_formatting.rdoc@RFC+2822+Format]:
+ * {RFC 2822 date format}[rdoc-ref:language/strftime_formatting.rdoc@RFC+2822+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.rfc2822 # => "Sat, 3 Feb 2001 00:00:00 +0000"
@@ -4828,7 +5045,7 @@ date_s__rfc2822(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__rfc2822(str);
 }
@@ -4839,7 +5056,7 @@ date_s__rfc2822(int argc, VALUE *argv, VALUE klass)
  *
  * Returns a new \Date object with values parsed from +string+,
  * which should be a valid
- * {RFC 2822 date format}[rdoc-ref:strftime_formatting.rdoc@RFC+2822+Format]:
+ * {RFC 2822 date format}[rdoc-ref:language/strftime_formatting.rdoc@RFC+2822+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.rfc2822   # => "Sat, 3 Feb 2001 00:00:00 +0000"
@@ -4847,7 +5064,7 @@ date_s__rfc2822(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._rfc2822 (returns a hash).
@@ -4857,11 +5074,11 @@ date_s_rfc2822(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("Mon, 1 Jan -4712 00:00:00 +0000");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME_RFC3339);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -4881,7 +5098,7 @@ date_s_rfc2822(int argc, VALUE *argv, VALUE klass)
  *   Date._httpdate(string, limit: 128) -> hash
  *
  * Returns a hash of values parsed from +string+, which should be a valid
- * {HTTP date format}[rdoc-ref:strftime_formatting.rdoc@HTTP+Format]:
+ * {HTTP date format}[rdoc-ref:language/strftime_formatting.rdoc@HTTP+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.httpdate # => "Sat, 03 Feb 2001 00:00:00 GMT"
@@ -4896,7 +5113,7 @@ date_s__httpdate(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__httpdate(str);
 }
@@ -4907,7 +5124,7 @@ date_s__httpdate(int argc, VALUE *argv, VALUE klass)
  *
  * Returns a new \Date object with values parsed from +string+,
  * which should be a valid
- * {HTTP date format}[rdoc-ref:strftime_formatting.rdoc@HTTP+Format]:
+ * {HTTP date format}[rdoc-ref:language/strftime_formatting.rdoc@HTTP+Format]:
  *
  *   d = Date.new(2001, 2, 3)
      s = d.httpdate   # => "Sat, 03 Feb 2001 00:00:00 GMT"
@@ -4915,7 +5132,7 @@ date_s__httpdate(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._httpdate (returns a hash).
@@ -4925,11 +5142,11 @@ date_s_httpdate(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("Mon, 01 Jan -4712 00:00:00 GMT");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME_HTTPDATE);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -4949,7 +5166,7 @@ date_s_httpdate(int argc, VALUE *argv, VALUE klass)
  *   Date._jisx0301(string, limit: 128) -> hash
  *
  * Returns a hash of values parsed from +string+, which should be a valid
- * {JIS X 0301 date format}[rdoc-ref:strftime_formatting.rdoc@JIS+X+0301+Format]:
+ * {JIS X 0301 date format}[rdoc-ref:language/strftime_formatting.rdoc@JIS+X+0301+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.jisx0301    # => "H13.02.03"
@@ -4965,7 +5182,7 @@ date_s__jisx0301(int argc, VALUE *argv, VALUE klass)
     VALUE str, opt;
 
     rb_scan_args(argc, argv, "1:", &str, &opt);
-    check_limit(str, opt);
+    if (!NIL_P(str)) str = check_limit(str, opt);
 
     return date__jisx0301(str);
 }
@@ -4975,7 +5192,7 @@ date_s__jisx0301(int argc, VALUE *argv, VALUE klass)
  *   Date.jisx0301(string = '-4712-01-01', start = Date::ITALY, limit: 128) -> date
  *
  * Returns a new \Date object with values parsed from +string+,
- * which should be a valid {JIS X 0301 format}[rdoc-ref:strftime_formatting.rdoc@JIS+X+0301+Format]:
+ * which should be a valid {JIS X 0301 format}[rdoc-ref:language/strftime_formatting.rdoc@JIS+X+0301+Format]:
  *
  *   d = Date.new(2001, 2, 3)
  *   s = d.jisx0301   # => "H13.02.03"
@@ -4987,7 +5204,7 @@ date_s__jisx0301(int argc, VALUE *argv, VALUE klass)
  *
  * See:
  *
- * - Argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * - Argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  * - Argument {limit}[rdoc-ref:Date@Argument+limit].
  *
  * Related: Date._jisx0301 (returns a hash).
@@ -4997,12 +5214,11 @@ date_s_jisx0301(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01");
+	str = rb_str_new2(JULIAN_EPOCH_DATE);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -5746,7 +5962,7 @@ d_lite_leap_p(VALUE self)
  *   Date.new(2001, 2, 3, Date::GREGORIAN).start # => -Infinity
  *   Date.new(2001, 2, 3, Date::JULIAN).start    # => Infinity
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  */
 static VALUE
@@ -5812,7 +6028,7 @@ dup_obj_with_new_start(VALUE obj, double sg)
 
 /*
  * call-seq:
- *   new_start(start = Date::ITALY]) -> new_date
+ *   new_start(start = Date::ITALY) -> new_date
  *
  * Returns a copy of +self+ with the given +start+ value:
  *
@@ -5821,7 +6037,7 @@ dup_obj_with_new_start(VALUE obj, double sg)
  *   d1 = d0.new_start(Date::JULIAN)
  *   d1.julian? # => true
  *
- * See argument {start}[rdoc-ref:calendars.rdoc@Argument+start].
+ * See argument {start}[rdoc-ref:language/calendars.rdoc@Argument+start].
  *
  */
 static VALUE
@@ -6937,13 +7153,24 @@ d_lite_eql_p(VALUE self, VALUE other)
 static VALUE
 d_lite_hash(VALUE self)
 {
-    st_index_t v, h[4];
+    st_index_t v, h[5];
+    VALUE nth;
 
     get_d1(self);
-    h[0] = m_nth(dat);
-    h[1] = m_jd(dat);
-    h[2] = m_df(dat);
-    h[3] = m_sf(dat);
+    nth = m_nth(dat);
+
+    if (FIXNUM_P(nth)) {
+        h[0] = 0;
+        h[1] = (st_index_t)nth;
+    } else {
+        h[0] = 1;
+        h[1] = (st_index_t)FIX2LONG(rb_hash(nth));
+    }
+
+    h[2] = m_jd(dat);
+    h[3] = m_df(dat);
+    h[4] = m_sf(dat);
+
     v = rb_memhash(h, sizeof(h));
     return ST2FIX(v);
 }
@@ -6958,7 +7185,7 @@ static VALUE strftimev(const char *, VALUE,
  *   to_s -> string
  *
  * Returns a string representation of the date in +self+
- * in {ISO 8601 extended date format}[rdoc-ref:strftime_formatting.rdoc@ISO+8601+Format+Specifications]
+ * in {ISO 8601 extended date format}[rdoc-ref:language/strftime_formatting.rdoc@ISO+8601+Format+Specifications]
  * (<tt>'%Y-%m-%d'</tt>):
  *
  *   Date.new(2001, 2, 3).to_s # => "2001-02-03"
@@ -7239,7 +7466,7 @@ date_strftime_internal(int argc, VALUE *argv, VALUE self,
  *   Date.new(2001, 2, 3).strftime # => "2001-02-03"
  *
  * For other formats, see
- * {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc].
+ * {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc].
  *
  */
 static VALUE
@@ -7271,12 +7498,12 @@ strftimev(const char *fmt, VALUE self,
  *   asctime -> string
  *
  * Equivalent to #strftime with argument <tt>'%a %b %e %T %Y'</tt>
- * (or its {shorthand form}[rdoc-ref:strftime_formatting.rdoc@Shorthand+Conversion+Specifiers]
+ * (or its {shorthand form}[rdoc-ref:language/strftime_formatting.rdoc@Shorthand+Conversion+Specifiers]
  * <tt>'%c'</tt>):
  *
  *   Date.new(2001, 2, 3).asctime # => "Sat Feb  3 00:00:00 2001"
  *
- * See {asctime}[https://linux.die.net/man/3/asctime].
+ * See {asctime}[https://man7.org/linux/man-pages/man3/asctime.3p.html].
  *
  */
 static VALUE
@@ -7290,7 +7517,7 @@ d_lite_asctime(VALUE self)
  *   iso8601    ->  string
  *
  * Equivalent to #strftime with argument <tt>'%Y-%m-%d'</tt>
- * (or its {shorthand form}[rdoc-ref:strftime_formatting.rdoc@Shorthand+Conversion+Specifiers]
+ * (or its {shorthand form}[rdoc-ref:language/strftime_formatting.rdoc@Shorthand+Conversion+Specifiers]
  * <tt>'%F'</tt>);
  *
  *   Date.new(2001, 2, 3).iso8601 # => "2001-02-03"
@@ -7307,7 +7534,7 @@ d_lite_iso8601(VALUE self)
  *   rfc3339 -> string
  *
  * Equivalent to #strftime with argument <tt>'%FT%T%:z'</tt>;
- * see {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc]:
+ * see {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc]:
  *
  *   Date.new(2001, 2, 3).rfc3339 # => "2001-02-03T00:00:00+00:00"
  *
@@ -7323,7 +7550,7 @@ d_lite_rfc3339(VALUE self)
  *   rfc2822 -> string
  *
  * Equivalent to #strftime with argument <tt>'%a, %-d %b %Y %T %z'</tt>;
- * see {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc]:
+ * see {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc]:
  *
  *   Date.new(2001, 2, 3).rfc2822 # => "Sat, 3 Feb 2001 00:00:00 +0000"
  *
@@ -7339,7 +7566,7 @@ d_lite_rfc2822(VALUE self)
  *   httpdate -> string
  *
  * Equivalent to #strftime with argument <tt>'%a, %d %b %Y %T GMT'</tt>;
- * see {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc]:
+ * see {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc]:
  *
  *   Date.new(2001, 2, 3).httpdate # => "Sat, 03 Feb 2001 00:00:00 GMT"
  *
@@ -7518,10 +7745,7 @@ d_lite_marshal_dump_old(VALUE self)
 		    m_of_in_day(dat),
 		    DBL2NUM(m_sg(dat)));
 
-    if (FL_TEST(self, FL_EXIVAR)) {
-	rb_copy_generic_ivar(a, self);
-	FL_SET(a, FL_EXIVAR);
-    }
+    rb_copy_generic_ivar(a, self);
 
     return a;
 }
@@ -7543,10 +7767,8 @@ d_lite_marshal_dump(VALUE self)
 		    INT2FIX(m_of(dat)),
 		    DBL2NUM(m_sg(dat)));
 
-    if (FL_TEST(self, FL_EXIVAR)) {
-	rb_copy_generic_ivar(a, self);
-	FL_SET(a, FL_EXIVAR);
-    }
+
+    rb_copy_generic_ivar(a, self);
 
     return a;
 }
@@ -7607,8 +7829,6 @@ d_lite_marshal_load(VALUE self, VALUE a)
     if (simple_dat_p(dat)) {
 	if (df || !f_zero_p(sf) || of) {
 	    /* loading a fractional date; promote to complex */
-	    dat = ruby_xrealloc(dat, sizeof(struct ComplexDateData));
-	    RTYPEDDATA(self)->data = dat;
 	    goto complex_data;
 	}
 	set_to_simple(self, &dat->s, nth, jd, sg, 0, 0, 0, HAVE_JD);
@@ -7619,10 +7839,7 @@ d_lite_marshal_load(VALUE self, VALUE a)
 		       HAVE_JD | HAVE_DF);
     }
 
-    if (FL_TEST(a, FL_EXIVAR)) {
-	rb_copy_generic_ivar(self, a);
-	FL_SET(self, FL_EXIVAR);
-    }
+    rb_copy_generic_ivar(self, a);
 
     return self;
 }
@@ -8375,7 +8592,7 @@ datetime_s_strptime(int argc, VALUE *argv, VALUE klass)
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	fmt = rb_str_new2("%FT%T%z");
       case 2:
@@ -8423,12 +8640,11 @@ datetime_s_parse(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, comp, sg, opt;
 
-    rb_scan_args(argc, argv, "03:", &str, &comp, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "03:", &str, &comp, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	comp = Qtrue;
       case 2:
@@ -8470,12 +8686,11 @@ datetime_s_iso8601(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8485,7 +8700,7 @@ datetime_s_iso8601(int argc, VALUE *argv, VALUE klass)
         VALUE argv2[2], hash;
         argv2[0] = str;
         argv2[1] = opt;
-        if (!NIL_P(opt)) argc2--;
+        if (!NIL_P(opt)) argc2++;
 	hash = date_s__iso8601(argc2, argv2, klass);
 	return dt_new_by_frags(klass, hash, sg);
     }
@@ -8510,12 +8725,11 @@ datetime_s_rfc3339(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8550,12 +8764,11 @@ datetime_s_xmlschema(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8591,12 +8804,11 @@ datetime_s_rfc2822(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("Mon, 1 Jan -4712 00:00:00 +0000");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME_RFC3339);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8631,12 +8843,11 @@ datetime_s_httpdate(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("Mon, 01 Jan -4712 00:00:00 GMT");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME_HTTPDATE);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8676,12 +8887,11 @@ datetime_s_jisx0301(int argc, VALUE *argv, VALUE klass)
 {
     VALUE str, sg, opt;
 
-    rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
-    if (!NIL_P(opt)) argc--;
+    argc = rb_scan_args(argc, argv, "02:", &str, &sg, &opt);
 
     switch (argc) {
       case 0:
-	str = rb_str_new2("-4712-01-01T00:00:00+00:00");
+	str = rb_str_new2(JULIAN_EPOCH_DATETIME);
       case 1:
 	sg = INT2FIX(DEFAULT_SG);
     }
@@ -8723,7 +8933,7 @@ dt_lite_to_s(VALUE self)
  *   DateTime.now.strftime # => "2022-07-01T11:03:19-05:00"
  *
  * For other formats,
- * see {Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc]:
+ * see {Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc]:
  *
  */
 static VALUE
@@ -8962,9 +9172,10 @@ date_to_time(VALUE self)
     get_d1a(self);
 
     if (m_julian_p(adat)) {
-        self = d_lite_gregorian(self);
-        get_d1b(self);
+        VALUE g = d_lite_gregorian(self);
+        get_d1b(g);
         adat = bdat;
+        self = g;
     }
 
     t = f_local3(rb_cTime,
@@ -9042,9 +9253,10 @@ datetime_to_time(VALUE self)
     get_d1(self);
 
     if (m_julian_p(dat)) {
-	self = d_lite_gregorian(self);
-	get_d1a(self);
+	VALUE g = d_lite_gregorian(self);
+	get_d1a(g);
 	dat = adat;
+	self = g;
     }
 
     {
@@ -9500,6 +9712,7 @@ Init_date_core(void)
     sym_zone = ID2SYM(rb_intern_const("zone"));
 
     half_days_in_day = rb_rational_new2(INT2FIX(1), INT2FIX(2));
+    rb_gc_register_mark_object(half_days_in_day);
 
 #if (LONG_MAX / DAY_IN_SECONDS) > SECOND_IN_NANOSECONDS
     day_in_nanoseconds = LONG2NUM((long)DAY_IN_SECONDS *
@@ -9511,8 +9724,6 @@ Init_date_core(void)
     day_in_nanoseconds = f_mul(INT2FIX(DAY_IN_SECONDS),
 			       INT2FIX(SECOND_IN_NANOSECONDS));
 #endif
-
-    rb_gc_register_mark_object(half_days_in_day);
     rb_gc_register_mark_object(day_in_nanoseconds);
 
     positive_inf = +INFINITY;
@@ -9528,7 +9739,7 @@ Init_date_core(void)
      *
      * - You need both dates and times; \Date handles only dates.
      * - You need only Gregorian dates (and not Julian dates);
-     *   see {Julian and Gregorian Calendars}[rdoc-ref:calendars.rdoc].
+     *   see {Julian and Gregorian Calendars}[rdoc-ref:language/calendars.rdoc].
      *
      * A \Date object, once created, is immutable, and cannot be modified.
      *
@@ -9575,7 +9786,7 @@ Init_date_core(void)
      *     Date.strptime('fri31dec99', '%a%d%b%y')  # => #<Date: 1999-12-31>
      *
      * See also the specialized methods in
-     * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:strftime_formatting.rdoc@Specialized+Format+Strings]
+     * {"Specialized Format Strings" in Formats for Dates and Times}[rdoc-ref:language/strftime_formatting.rdoc@Specialized+Format+Strings]
      *
      * == Argument +limit+
      *

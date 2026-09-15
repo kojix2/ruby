@@ -91,18 +91,26 @@ prefix or only the files that are requireable.
   end
 
   def files_in_gem(spec)
-    gem_path  = spec.full_gem_path
-    extra     = "/{#{spec.require_paths.join ","}}" if options[:lib_only]
-    glob      = "#{gem_path}#{extra}/**/*"
-    prefix_re = %r{#{Regexp.escape(gem_path)}/}
+    gem_path = spec.full_gem_path
 
-    Dir[glob].map do |file|
-      [gem_path, file.sub(prefix_re, "")]
+    if options[:lib_only]
+      # raw_require_paths rather than require_paths, since the latter prepends
+      # the absolute extension_dir, which would escape the glob base
+      require_paths = spec.raw_require_paths
+      return [] if require_paths.empty?
+
+      glob = "{#{require_paths.join ","}}/**/*"
+    else
+      glob = "**/*"
+    end
+
+    Dir.glob(glob, base: gem_path).map do |file|
+      [gem_path, file]
     end
   end
 
   def files_in_default_gem(spec)
-    spec.files.map do |file|
+    spec.files.filter_map do |file|
       if file.start_with?("#{spec.bindir}/")
         [RbConfig::CONFIG["bindir"], file.delete_prefix("#{spec.bindir}/")]
       else
@@ -119,7 +127,7 @@ prefix or only the files that are requireable.
 
         [resolve.delete_suffix(requirable_part), requirable_part]
       end
-    end.compact
+    end
   end
 
   def gem_contents(name)
@@ -189,8 +197,8 @@ prefix or only the files that are requireable.
   end
 
   def specification_directories # :nodoc:
-    options[:specdirs].map do |i|
-      [i, File.join(i, "specifications")]
-    end.flatten
+    options[:specdirs].flat_map do |i|
+      Gem::SpecificationRecord.dirs_with_abi([i, File.join(i, "specifications")])
+    end
   end
 end

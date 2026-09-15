@@ -431,6 +431,22 @@ class TestGemRequire < Gem::TestCase
     assert_equal %w[default-2.0.0.0], loaded_spec_names
   end
 
+  def test_multiple_gems_with_the_same_path_the_non_activated_spec_is_chosen
+    a1 = util_spec "a", "1", nil, "lib/ib.rb"
+    a2 = util_spec "a", "2", nil, "lib/foo.rb"
+    b1 = util_spec "b", "1", nil, "lib/ib.rb"
+
+    install_specs a1, a2, b1
+
+    a2.activate
+
+    assert_equal %w[a-2], loaded_spec_names
+    assert_empty unresolved_names
+
+    assert_require "ib"
+    assert_equal %w[a-2 b-1], loaded_spec_names
+  end
+
   def test_default_gem_require_activates_just_once
     default_gem_spec = new_default_spec("default", "2.0.0.0",
                                         nil, "default/gem.rb")
@@ -460,6 +476,7 @@ class TestGemRequire < Gem::TestCase
 
   def test_realworld_default_gem
     omit "this test can't work under ruby-core setup" if ruby_repo?
+    omit "JRuby on Windows does not register json as a default gem the same way" if Gem.win_platform? && Gem.java_platform?
 
     cmd = <<-RUBY
       $stderr = $stdout
@@ -467,7 +484,7 @@ class TestGemRequire < Gem::TestCase
       puts Gem.loaded_specs["json"]
     RUBY
     output = Gem::Util.popen(*ruby_with_rubygems_in_load_path, "-e", cmd).strip
-    assert $?.success?
+    assert Process.last_status.success?
     refute_empty output
   end
 
@@ -491,7 +508,7 @@ class TestGemRequire < Gem::TestCase
     assert_equal "999.99.9", output.lines[0].chomp
     # Make sure only files from the newer json gem are loaded, and no files from the default json gem
     assert_equal ["#{@gemhome}/gems/json-999.99.9/lib/json.rb"], output.lines.grep(%r{/gems/json-}).map(&:chomp)
-    assert $?.success?
+    assert Process.last_status.success?
   end
 
   def test_default_gem_and_normal_gem
@@ -701,6 +718,7 @@ class TestGemRequire < Gem::TestCase
 
   ["", "Kernel."].each do |prefix|
     define_method "test_no_kernel_require_in_#{prefix.tr(".", "_")}warn_with_uplevel" do
+      pend_for_ruby_box_stdio_capture
       Dir.mktmpdir("warn_test") do |dir|
         File.write(dir + "/sub.rb", "#{prefix}warn 'uplevel', 'test', uplevel: 1\n")
         File.write(dir + "/main.rb", "require 'sub'\n")
@@ -716,6 +734,7 @@ class TestGemRequire < Gem::TestCase
     end
 
     define_method "test_no_other_behavioral_changes_with_#{prefix.tr(".", "_")}warn" do
+      pend_for_ruby_box_stdio_capture
       Dir.mktmpdir("warn_test") do |dir|
         File.write(dir + "/main.rb", "#{prefix}warn({x:1}, {y:2}, [])\n")
         _, err = capture_subprocess_io do
@@ -731,6 +750,7 @@ class TestGemRequire < Gem::TestCase
   end
 
   def test_no_crash_when_overriding_warn_with_warning_module
+    pend_for_ruby_box_stdio_capture
     Dir.mktmpdir("warn_test") do |dir|
       File.write(dir + "/main.rb", "module Warning; def warn(str); super; end; end; warn 'Foo Bar'")
       _, err = capture_subprocess_io do
@@ -745,6 +765,7 @@ class TestGemRequire < Gem::TestCase
   end
 
   def test_expected_backtrace_location_when_inheriting_from_basic_object_and_including_kernel
+    pend_for_ruby_box_stdio_capture
     Dir.mktmpdir("warn_test") do |dir|
       File.write(dir + "/main.rb", "\nrequire 'sub'\n")
       File.write(dir + "/sub.rb", <<-'RUBY')
@@ -770,6 +791,8 @@ class TestGemRequire < Gem::TestCase
   end
 
   def test_require_does_not_crash_when_utilizing_bundler_version_finder
+    omit "JRuby on Windows hits a different require path" if Gem.win_platform? && Gem.java_platform?
+
     a1 = util_spec "a", "1.1", { "bundler" => ">= 0" }
     a2 = util_spec "a", "1.2", { "bundler" => ">= 0" }
     b1 = util_spec "bundler", "2.3.7"

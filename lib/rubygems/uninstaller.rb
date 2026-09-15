@@ -10,7 +10,6 @@ require "fileutils"
 require_relative "../rubygems"
 require_relative "installer_uninstaller_utils"
 require_relative "dependency_list"
-require_relative "rdoc"
 require_relative "user_interaction"
 
 ##
@@ -43,14 +42,30 @@ class Gem::Uninstaller
   attr_reader :spec
 
   ##
-  # Constructs an uninstaller that will uninstall +gem+
+  # Constructs an uninstaller that will uninstall gem named +gem+.
+  # +options+ is a Hash with the following keys:
+  #
+  # :version:: Version requirement for the gem to uninstall. If not specified,
+  #            uses Gem::Requirement.default.
+  # :install_dir:: The directory where the gem is installed. If not specified,
+  #                uses Gem.dir.
+  # :executables:: Whether executables should be removed without confirmation or not. If nil, asks the user explicitly.
+  # :all:: If more than one version matches the requirement, whether to forcefully remove all matching versions or ask the user to select specific matching versions that should be removed.
+  # :ignore:: Ignore broken dependency checks when uninstalling.
+  # :bin_dir:: Directory containing executables to remove. If not specified,
+  #            uses Gem.bindir.
+  # :format_executable:: In order to find executables to be removed, format executable names using Gem::Installer.exec_format.
+  # :abort_on_dependent:: Directly abort uninstallation if dependencies would be broken, rather than asking the user for confirmation.
+  # :check_dev:: When checking if uninstalling gem would leave broken dependencies around, also consider development dependencies.
+  # :force:: Set both :all and :ignore to true for forced uninstallation.
+  # :user_install:: Uninstall from user gem directory instead of system directory.
 
   def initialize(gem, options = {})
-    # TODO: document the valid options
     @gem                = gem
     @version            = options[:version] || Gem::Requirement.default
     @install_dir        = options[:install_dir]
-    @gem_home           = File.realpath(@install_dir || Gem.dir)
+    gem_home            = @install_dir || Gem.dir
+    @gem_home           = File.exist?(gem_home) ? File.realpath(gem_home) : gem_home
     @user_dir           = File.exist?(Gem.user_dir) ? File.realpath(Gem.user_dir) : Gem.user_dir
     @force_executables  = options[:executables]
     @force_all          = options[:all]
@@ -58,10 +73,6 @@ class Gem::Uninstaller
     @bin_dir            = options[:bin_dir]
     @format_executable  = options[:format_executable]
     @abort_on_dependent = options[:abort_on_dependent]
-
-    # Indicate if development dependencies should be checked when
-    # uninstalling. (default: false)
-    #
     @check_dev = options[:check_dev]
 
     if options[:force]
@@ -261,6 +272,8 @@ class Gem::Uninstaller
 
     safe_delete { rm_r full_gem_path, exclusions: exclusions }
     safe_delete { FileUtils.rm_r spec.extension_dir }
+    safe_delete { FileUtils.rm_f File.join(spec.build_info_dir, "#{spec.full_name}.mkmf.log") }
+    safe_delete { FileUtils.rm_f File.join(spec.build_info_dir, "#{spec.full_name}.gem_make.out") }
 
     old_platform_name = spec.original_name
 

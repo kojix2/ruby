@@ -4,8 +4,6 @@ module Psych
   ###
   # Scan scalars for built in types
   class ScalarScanner
-    autoload :Date, "date"
-
     # Taken from http://yaml.org/type/timestamp.html
     TIME = /^-?\d{4}-\d{1,2}-\d{1,2}(?:[Tt]|\s+)\d{1,2}:\d\d:\d\d(?:\.\d*)?(?:\s*(?:Z|[-+]\d{1,2}:?(?:\d\d)?))?$/
 
@@ -26,13 +24,26 @@ module Psych
                          |[-+]?(?:0|[1-9](?:[0-9]|,[0-9]|_[0-9])*) (?# base 10)
                          |[-+]?0x[_,]*[0-9a-fA-F][0-9a-fA-F_,]*    (?# base 16))$/x
 
+    # YAML 1.1 treats yes/no/on/off as booleans in addition to true/false,
+    # while YAML 1.2's core schema only recognizes true/false.  The default
+    # libyaml backend keeps the 1.1 set for backward compatibility; the
+    # experimental libfyaml backend follows 1.2.
+    if defined?(Psych::BACKEND) && Psych::BACKEND == 'libfyaml'
+      BOOLEAN_TRUE  = /^true$/i
+      BOOLEAN_FALSE = /^false$/i
+    else
+      BOOLEAN_TRUE  = /^(yes|true|on)$/i
+      BOOLEAN_FALSE = /^(no|false|off)$/i
+    end
+
     attr_reader :class_loader
 
     # Create a new scanner
-    def initialize class_loader, strict_integer: false
+    def initialize class_loader, strict_integer: false, parse_symbols: true
       @symbol_cache = {}
       @class_loader = class_loader
       @strict_integer = strict_integer
+      @parse_symbols = parse_symbols
     end
 
     # Tokenize +string+ returning the Ruby object
@@ -49,9 +60,9 @@ module Psych
           string
         elsif string == '~' || string.match?(/^null$/i)
           nil
-        elsif string.match?(/^(yes|true|on)$/i)
+        elsif string.match?(BOOLEAN_TRUE)
           true
-        elsif string.match?(/^(no|false|off)$/i)
+        elsif string.match?(BOOLEAN_FALSE)
           false
         else
           string
@@ -74,7 +85,7 @@ module Psych
         -Float::INFINITY
       elsif string.match?(/^\.nan$/i)
         Float::NAN
-      elsif string.match?(/^:./)
+      elsif @parse_symbols && string.match?(/^:./)
         if string =~ /^:(["'])(.*)\1/
           @symbol_cache[string] = class_loader.symbolize($2.sub(/^:/, ''))
         else
@@ -116,7 +127,7 @@ module Psych
     def parse_time string
       klass = class_loader.load 'Time'
 
-      date, time = *(string.split(/[ tT]/, 2))
+      date, time = *(string.split(/[Tt]|\s+/, 2))
       (yy, m, dd) = date.match(/^(-?\d{4})-(\d{1,2})-(\d{1,2})/).captures.map { |x| x.to_i }
       md = time.match(/(\d+:\d+:\d+)(?:\.(\d*))?\s*(Z|[-+]\d+(:\d\d)?)?/)
 

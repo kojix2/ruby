@@ -6,7 +6,7 @@ describe "Time#zone" do
       with_timezone("America/New_York") do
         Time.new(2001, 1, 1, 0, 0, 0).zone.should == "EST"
         Time.new(2001, 7, 1, 0, 0, 0).zone.should == "EDT"
-        %w[EST EDT].should include Time.now.zone
+        %w[EST EDT].should.include? Time.now.zone
       end
     end
   end
@@ -29,7 +29,7 @@ describe "Time#zone" do
     t = Time.new(2005, 2, 27, 22, 50, 0, -3600)
 
     with_timezone("America/New_York") do
-      t.getlocal("+05:00").zone.should be_nil
+      t.getlocal("+05:00").zone.should == nil
     end
   end
 
@@ -69,22 +69,18 @@ describe "Time#zone" do
     Time.at(Time.now, in: 'UTC').zone.should == "UTC"
     Time.at(Time.now, in: 'Z').zone.should == "UTC"
 
-    ruby_version_is "3.1" do
-      Time.new(2022, 1, 1, 0, 0, 0, "-00:00").zone.should == "UTC"
-      Time.now.localtime("-00:00").zone.should == "UTC"
-      Time.at(Time.now, in: '-00:00').zone.should == "UTC"
-    end
+    Time.new(2022, 1, 1, 0, 0, 0, "-00:00").zone.should == "UTC"
+    Time.now.localtime("-00:00").zone.should == "UTC"
+    Time.at(Time.now, in: '-00:00').zone.should == "UTC"
 
-    ruby_version_is "3.1" do
-      Time.new(2022, 1, 1, 0, 0, 0, in: "UTC").zone.should == "UTC"
-      Time.new(2022, 1, 1, 0, 0, 0, in: "Z").zone.should == "UTC"
+    Time.new(2022, 1, 1, 0, 0, 0, in: "UTC").zone.should == "UTC"
+    Time.new(2022, 1, 1, 0, 0, 0, in: "Z").zone.should == "UTC"
 
-      Time.now(in: 'UTC').zone.should == "UTC"
-      Time.now(in: 'Z').zone.should == "UTC"
+    Time.now(in: 'UTC').zone.should == "UTC"
+    Time.now(in: 'Z').zone.should == "UTC"
 
-      Time.at(Time.now, in: 'UTC').zone.should == "UTC"
-      Time.at(Time.now, in: 'Z').zone.should == "UTC"
-    end
+    Time.at(Time.now, in: 'UTC').zone.should == "UTC"
+    Time.at(Time.now, in: 'Z').zone.should == "UTC"
   end
 
   platform_is_not :aix, :windows do

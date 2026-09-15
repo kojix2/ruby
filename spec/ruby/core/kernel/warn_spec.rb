@@ -14,7 +14,7 @@ describe "Kernel#warn" do
   end
 
   it "is a private method" do
-    Kernel.should have_private_instance_method(:warn)
+    Kernel.private_instance_methods(false).should.include?(:warn)
   end
 
   it "accepts multiple arguments" do
@@ -112,6 +112,12 @@ describe "Kernel#warn" do
       ruby_exe(file, options: "-rrubygems", args: "2>&1").should == "#{file}:2: warning: warn-require-warning\n"
     end
 
+    it "doesn't show the caller when the uplevel is `nil`" do
+      w = KernelSpecs::WarnInNestedCall.new
+
+      -> { w.f4("foo", nil) }.should output(nil, "foo\n")
+    end
+
     guard -> { Kernel.instance_method(:tap).source_location } do
       it "skips <internal: core library methods defined in Ruby" do
         file, line = Kernel.instance_method(:tap).source_location
@@ -155,7 +161,7 @@ describe "Kernel#warn" do
       -> {
         $VERBOSE = true
         warn("message", category: Object.new)
-      }.should raise_error(TypeError)
+      }.should.raise(TypeError)
     end
 
     it "converts first arg using to_s" do
@@ -188,19 +194,19 @@ describe "Kernel#warn" do
     end
 
     it "raises ArgumentError if passed negative value" do
-      -> { warn "", uplevel: -2 }.should raise_error(ArgumentError)
-      -> { warn "", uplevel: -100 }.should raise_error(ArgumentError)
+      -> { warn "", uplevel: -2 }.should.raise(ArgumentError)
+      -> { warn "", uplevel: -100 }.should.raise(ArgumentError)
     end
 
     it "raises ArgumentError if passed -1" do
-      -> { warn "", uplevel: -1 }.should raise_error(ArgumentError)
+      -> { warn "", uplevel: -1 }.should.raise(ArgumentError)
     end
 
     it "raises TypeError if passed not Integer" do
-      -> { warn "", uplevel: "" }.should raise_error(TypeError)
-      -> { warn "", uplevel: [] }.should raise_error(TypeError)
-      -> { warn "", uplevel: {} }.should raise_error(TypeError)
-      -> { warn "", uplevel: Object.new }.should raise_error(TypeError)
+      -> { warn "", uplevel: "" }.should.raise(TypeError)
+      -> { warn "", uplevel: [] }.should.raise(TypeError)
+      -> { warn "", uplevel: {} }.should.raise(TypeError)
+      -> { warn "", uplevel: Object.new }.should.raise(TypeError)
     end
   end
 
@@ -222,10 +228,10 @@ describe "Kernel#warn" do
 
     begin
       ScratchPad.clear
-      Kernel.warn("Chunky bacon!")
+      warn("Chunky bacon!")
       ScratchPad.recorded.should == "Chunky bacon!\n"
 
-      Kernel.warn("Deprecated bacon!", category: :deprecated)
+      warn("Deprecated bacon!", category: :deprecated)
       ScratchPad.recorded.should == "Deprecated bacon!\n"
     ensure
       class << Warning
@@ -242,7 +248,7 @@ describe "Kernel#warn" do
     verbose = $VERBOSE
     $VERBOSE = false
     begin
-      Kernel.warn("Chunky bacon!")
+      warn("Chunky bacon!")
     ensure
       $VERBOSE = verbose
     end
@@ -253,7 +259,7 @@ describe "Kernel#warn" do
     verbose = $VERBOSE
     $VERBOSE = false
     begin
-      Kernel.warn("Chunky bacon!", category: 'deprecated')
+      warn("Chunky bacon!", category: 'deprecated')
     ensure
       $VERBOSE = verbose
     end
@@ -288,5 +294,11 @@ describe "Kernel#warn" do
     out = ruby_exe(code, args: "2>&1", options: "--disable-gems")
     out.should == "avoid infinite recursion\n"
     $?.should.success?
+  end
+end
+
+describe "Kernel.warn" do
+  it "is a public method" do
+    Kernel.public_methods(false).should.include?(:warn)
   end
 end

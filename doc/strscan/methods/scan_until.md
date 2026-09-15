@@ -1,6 +1,3 @@
-call-seq:
-  scan_until(pattern) -> substring or nil
-
 Attempts to [match][17] the given `pattern`
 anywhere (at any [position][2]) in the [target substring][3].
 
@@ -12,7 +9,7 @@ If the match attempt succeeds:
 - Returns the matched substring.
 
 
-```
+```rb
 scanner = StringScanner.new(HIRAGANA_TEXT)
 scanner.string           # => "こんにちは"
 scanner.pos = 6
@@ -46,7 +43,7 @@ If the match attempt fails:
 - Returns `nil`.
 - Does not update positions.
 
-```
+```rb
 scanner.scan_until(/nope/)     # => nil
 match_values_cleared?(scanner) # => true
 ```

@@ -16,6 +16,8 @@ module Bundler
 
       check_for_conflicting_options
 
+      Bundler::CLI::Common.configure_cooldown(options)
+
       print = options[:print]
       previous_output_stream = Bundler.ui.output_stream
       Bundler.ui.output_stream = :stderr if print
@@ -23,6 +25,9 @@ module Bundler
       Bundler::Fetcher.disable_endpoint = options["full-index"]
 
       update = options[:update]
+      # --update is repeatable, so it parses as an array with one entry per
+      # occurrence, where a bare `--update` produces a `true` entry
+      update = update.include?(true) ? true : update.flatten if update.is_a?(Array)
       conservative = options[:conservative]
       bundler = options[:bundler]
 
@@ -35,19 +40,18 @@ module Bundler
         update = { bundler: bundler }
       end
 
-      file = options[:lockfile]
-      file = file ? Pathname.new(file).expand_path : Bundler.default_lockfile
-
       Bundler.settings.temporary(frozen: false) do
-        definition = Bundler.definition(update, file)
+        definition = Bundler.definition(update, Bundler.default_lockfile)
+        definition.add_checksums if options["add-checksums"]
 
         Bundler::CLI::Common.configure_gem_version_promoter(definition, options) if options[:update]
 
-        options["remove-platform"].each do |platform|
+        options["remove-platform"].flatten.each do |platform_string|
+          platform = Gem::Platform.new(platform_string)
           definition.remove_platform(platform)
         end
 
-        options["add-platform"].each do |platform_string|
+        options["add-platform"].flatten.each do |platform_string|
           platform = Gem::Platform.new(platform_string)
           if platform.to_s == "unknown"
             Bundler.ui.error "The platform `#{platform_string}` is unknown to RubyGems and can't be added to the lockfile."
@@ -60,7 +64,7 @@ module Bundler
           raise InvalidOption, "Removing all platforms from the bundle is not allowed"
         end
 
-        definition.resolve_remotely! unless options[:local]
+        definition.remotely! unless options[:local]
 
         if options["normalize-platforms"]
           definition.normalize_platforms
@@ -69,9 +73,14 @@ module Bundler
         if print
           puts definition.to_lock
         else
+          file = options[:lockfile]
+          file = file ? Pathname.new(file).expand_path : Bundler.default_lockfile
+
           puts "Writing lockfile to #{file}"
-          definition.lock
+          definition.write_lock(file, false)
         end
+
+        Bundler::CLI::Common.output_cooldown_skipped_summary(definition)
       end
 
       Bundler.ui.output_stream = previous_output_stream

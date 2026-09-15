@@ -118,7 +118,6 @@ static VALUE thread_spec_rb_thread_wait_for(VALUE self, VALUE s, VALUE ms) {
   return Qnil;
 }
 
-
 VALUE thread_spec_call_proc(void *arg_ptr) {
   VALUE arg_array = (VALUE)arg_ptr;
   VALUE arg = rb_ary_pop(arg_array);
@@ -167,6 +166,39 @@ static VALUE thread_spec_ruby_native_thread_p_new_thread(VALUE self) {
 #endif
 }
 
+#ifdef RUBY_VERSION_IS_4_0
+static VALUE thread_spec_ruby_thread_has_gvl_p(VALUE self) {
+  return ruby_thread_has_gvl_p() ? Qtrue : Qfalse;
+}
+#endif
+
+#ifdef RUBY_VERSION_IS_4_1
+struct nogvl_pending_intr_fail_data {
+  int called;
+};
+
+static void *nogvl_pending_intr_fail_func(void *ptr) {
+  struct nogvl_pending_intr_fail_data *data = ptr;
+
+  data->called = 1;
+
+  return (void *)Qtrue;
+}
+
+static VALUE thread_spec_rb_nogvl_pending_intr_fail(VALUE self) {
+  struct nogvl_pending_intr_fail_data data = {0};
+  void *ret;
+  int saved_errno;
+
+  errno = 0;
+  ret = rb_nogvl(nogvl_pending_intr_fail_func, &data, RUBY_UBF_IO, 0,
+      RB_NOGVL_PENDING_INTR_FAIL);
+  saved_errno = errno;
+
+  return rb_ary_new_from_args(3, data.called ? Qtrue : Qfalse, (VALUE)ret, INT2FIX(saved_errno));
+}
+#endif
+
 void Init_thread_spec(void) {
   VALUE cls = rb_define_class("CApiThreadSpecs", rb_cObject);
   rb_define_method(cls, "rb_thread_alone", thread_spec_rb_thread_alone, 0);
@@ -180,6 +212,12 @@ void Init_thread_spec(void) {
   rb_define_method(cls,  "rb_thread_create", thread_spec_rb_thread_create, 2);
   rb_define_method(cls,  "ruby_native_thread_p", thread_spec_ruby_native_thread_p, 0);
   rb_define_method(cls,  "ruby_native_thread_p_new_thread", thread_spec_ruby_native_thread_p_new_thread, 0);
+#ifdef RUBY_VERSION_IS_4_0
+  rb_define_method(cls,  "ruby_thread_has_gvl_p", thread_spec_ruby_thread_has_gvl_p, 0);
+#endif
+#ifdef RUBY_VERSION_IS_4_1
+  rb_define_method(cls,  "rb_nogvl_pending_intr_fail", thread_spec_rb_nogvl_pending_intr_fail, 0);
+#endif
 }
 
 #ifdef __cplusplus

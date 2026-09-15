@@ -21,6 +21,8 @@ struct rb_builtin_function {
 }
 
 void rb_load_with_builtin_functions(const char *feature_name, const struct rb_builtin_function *table);
+VALUE rb_define_gem_modules(VALUE, VALUE);
+void rb_load_gem_prelude(VALUE box);
 
 #ifndef rb_execution_context_t
 typedef struct rb_execution_context_struct rb_execution_context_t;
@@ -104,6 +106,12 @@ rb_vm_lvar(rb_execution_context_t *ec, int index)
 #else
     return rb_vm_lvar_exposed(ec, index);
 #endif
+}
+
+static inline VALUE
+rb_builtin_basic_definition_p(rb_execution_context_t *ec, VALUE klass, VALUE id_sym)
+{
+    return rb_method_basic_definition_p(klass, rb_sym2id(id_sym)) ? Qtrue : Qfalse;
 }
 
 #define LOCAL_PTR(local) local ## __ptr

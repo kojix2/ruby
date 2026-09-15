@@ -285,6 +285,12 @@ module DefinedSpecs
     end
   end
 
+  module ModuleWithConstMissing
+    def self.const_missing(const)
+      const
+    end
+  end
+
   class SuperWithIntermediateModules
     include IntermediateModule1
     include IntermediateModule2
@@ -292,6 +298,33 @@ module DefinedSpecs
     def method_no_args
       super
     end
+  end
+
+  class ProtectedBase
+    def m; end
+    protected :m
+    def defined_on(o)
+      defined?(o.m)
+    end
+  end
+
+  class ProtectedSubclass < ProtectedBase
+  end
+
+  module ProtectedInModule
+    def m; end
+    protected :m
+    def defined_on(o)
+      defined?(o.m)
+    end
+  end
+
+  class ProtectedIncluderA
+    include ProtectedInModule
+  end
+
+  class ProtectedIncluderB
+    include ProtectedInModule
   end
 end
 

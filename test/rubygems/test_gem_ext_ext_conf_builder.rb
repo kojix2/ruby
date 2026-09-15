@@ -15,40 +15,44 @@ class TestGemExtExtConfBuilder < Gem::TestCase
   end
 
   def test_class_build
-    if Gem.java_platform?
-      pend("failing on jruby")
-    end
-
     if vc_windows? && !nmake_found?
       pend("test_class_build skipped - nmake not found")
     end
 
     File.open File.join(@ext, "extconf.rb"), "w" do |extconf|
+      extconf.puts "return if Gem.java_platform?"
       extconf.puts "require 'mkmf'\ncreate_makefile 'foo'"
     end
 
     output = []
 
-    result = Gem::Ext::ExtConfBuilder.build "extconf.rb", @dest_path, output, [], nil, @ext
+    if Gem.java_platform?
+      # extconf returns before creating a Makefile, so the extension is skipped.
+      # Deciding what that means is Gem::Ext::Builder#build_extension's job now,
+      # so the error reaches it instead of being swallowed here.
+      assert_raise Gem::Ext::Builder::NoMakefileError do
+        Gem::Ext::ExtConfBuilder.build "extconf.rb", @dest_path, output, [], nil, @ext
+      end
+    else
+      result = Gem::Ext::ExtConfBuilder.build "extconf.rb", @dest_path, output, [], nil, @ext
 
-    assert_same result, output
+      assert_same result, output
+
+      assert_equal "creating Makefile\n", output[2]
+      assert_match(/^current directory:/, output[3])
+      assert_contains_make_command "clean", output[4]
+      assert_contains_make_command "", output[7]
+      assert_contains_make_command "install", output[10]
+    end
 
     assert_match(/^current directory:/, output[0])
     assert_match(/^#{Regexp.quote(Gem.ruby)}.* extconf.rb/, output[1])
-    assert_equal "creating Makefile\n", output[2]
-    assert_match(/^current directory:/, output[3])
-    assert_contains_make_command "clean", output[4]
-    assert_contains_make_command "", output[7]
-    assert_contains_make_command "install", output[10]
+
     assert_empty Dir.glob(File.join(@ext, "siteconf*.rb"))
     assert_empty Dir.glob(File.join(@ext, ".gem.*"))
   end
 
   def test_class_build_rbconfig_make_prog
-    if Gem.java_platform?
-      pend("failing on jruby")
-    end
-
     configure_args do
       File.open File.join(@ext, "extconf.rb"), "w" do |extconf|
         extconf.puts "require 'mkmf'\ncreate_makefile 'foo'"
@@ -71,10 +75,6 @@ class TestGemExtExtConfBuilder < Gem::TestCase
 
     env_large_make = ENV.delete "MAKE"
     ENV["MAKE"] = "anothermake"
-
-    if Gem.java_platform?
-      pend("failing on jruby")
-    end
 
     configure_args "" do
       File.open File.join(@ext, "extconf.rb"), "w" do |extconf|
@@ -115,10 +115,12 @@ class TestGemExtExtConfBuilder < Gem::TestCase
     assert_equal "extconf failed, exit code 1", error.message
 
     assert_match(/^#{Regexp.quote(Gem.ruby)}.* extconf.rb/, output[1])
-    assert_match(File.join(@dest_path, "mkmf.log"), output[4])
-    assert_includes(output, "To see why this extension failed to compile, please check the mkmf.log which can be found here:\n")
+    refute_includes(output, "To see why this extension failed to compile, please check the mkmf.log which can be found here:\n")
 
-    assert_path_exist File.join @dest_path, "mkmf.log"
+    # mkmf.log is left in the extension directory; deciding where it ends up is
+    # left to Gem::Ext::Builder#build_extension.
+    assert_path_exist File.join @ext, "mkmf.log"
+    assert_path_not_exist File.join @dest_path, "mkmf.log"
   end
 
   def test_class_build_extconf_success_without_warning
@@ -138,6 +140,9 @@ class TestGemExtExtConfBuilder < Gem::TestCase
 
     refute_includes(output, "To see why this extension failed to compile, please check the mkmf.log which can be found here:\n")
 
+    # mkmf.log is parked in dest_path so that "make clean" cannot delete it.
+    # Dropping it is Gem::Ext::Builder#build_extension's job, not this one's.
+    assert_path_not_exist File.join @ext, "mkmf.log"
     assert_path_exist File.join @dest_path, "mkmf.log"
   end
 
@@ -206,11 +211,11 @@ end
   end
 
   def test_class_make_no_Makefile
-    error = assert_raise Gem::InstallError do
+    error = assert_raise Gem::Ext::Builder::NoMakefileError do
       Gem::Ext::ExtConfBuilder.make @ext, ["output"], @ext
     end
 
-    assert_equal "Makefile not found", error.message
+    assert_match(/No Makefile found/, error.message)
   end
 
   def configure_args(args = nil)

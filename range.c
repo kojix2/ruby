@@ -21,12 +21,16 @@
 #include "id.h"
 #include "internal.h"
 #include "internal/array.h"
+#include "internal/class.h"
 #include "internal/compar.h"
 #include "internal/enum.h"
 #include "internal/enumerator.h"
 #include "internal/error.h"
 #include "internal/numeric.h"
+#include "internal/object.h"
 #include "internal/range.h"
+#include "shape.h"
+#include "zjit.h"
 
 VALUE rb_cRange;
 static ID id_beg, id_end, id_excl;
@@ -40,13 +44,13 @@ static VALUE r_cover_p(VALUE, VALUE, VALUE, VALUE);
 
 #define RANGE_SET_BEG(r, v) (RSTRUCT_SET(r, 0, v))
 #define RANGE_SET_END(r, v) (RSTRUCT_SET(r, 1, v))
-#define RANGE_SET_EXCL(r, v) (RSTRUCT_SET(r, 2, v))
 
-#define EXCL(r) RTEST(RANGE_EXCL(r))
+#define EXCL(r) RTEST(FL_TEST(r, RANGE_FL_EXCL))
 
 static void
 range_init(VALUE range, VALUE beg, VALUE end, VALUE exclude_end)
 {
+    // Changing this condition has implications for JITs. If you do, please let maintainers know.
     if ((!FIXNUM_P(beg) || !FIXNUM_P(end)) && !NIL_P(beg) && !NIL_P(end)) {
         VALUE v;
 
@@ -55,7 +59,12 @@ range_init(VALUE range, VALUE beg, VALUE end, VALUE exclude_end)
             rb_raise(rb_eArgError, "bad value for range");
     }
 
-    RANGE_SET_EXCL(range, exclude_end);
+    if (RTEST(exclude_end)) {
+        FL_SET_RAW(range, RANGE_FL_EXCL);
+    }
+
+    FL_SET_RAW(range, RANGE_FL_INIT);
+
     RANGE_SET_BEG(range, beg);
     RANGE_SET_END(range, end);
 
@@ -73,12 +82,27 @@ rb_range_new(VALUE beg, VALUE end, int exclude_end)
     return range;
 }
 
+#if USE_ZJIT
+void
+rb_zjit_range_new_fastpath(bool exclude_end, size_t *alloc_size_out, VALUE *flags_out)
+{
+    const long len = 2;
+    *alloc_size_out = offsetof(struct RStruct, as.ary) + (sizeof(VALUE) * len);
+    if (RCLASS_MAX_IV_COUNT(rb_cRange) > 0) {
+        *alloc_size_out += sizeof(VALUE);
+    }
+
+    *flags_out = T_STRUCT | (len << RSTRUCT_EMBED_LEN_SHIFT) | RANGE_FL_INIT | FL_FREEZE;
+    if (exclude_end) *flags_out |= RANGE_FL_EXCL;
+}
+#endif
+
 static void
 range_modify(VALUE range)
 {
     rb_check_frozen(range);
     /* Ranges are immutable, so that they should be initialized only once. */
-    if (RANGE_EXCL(range) != Qnil) {
+    if (FL_TEST(range, RANGE_FL_INIT)) {
         rb_name_err_raise("'initialize' called twice", range, ID2SYM(idInitialize));
     }
 }
@@ -114,6 +138,7 @@ static VALUE
 range_initialize_copy(VALUE range, VALUE orig)
 {
     range_modify(range);
+    FL_SET_RAW(range, FL_TEST_RAW(orig, RANGE_FL_EXCL|RANGE_FL_INIT));
     rb_struct_init_copy(range, orig);
     return range;
 }
@@ -153,14 +178,14 @@ recursive_equal(VALUE range, VALUE obj, int recur)
  *  call-seq:
  *    self == other -> true or false
  *
- *  Returns +true+ if and only if:
+ *  Returns whether all of the following are true:
  *
  *  - +other+ is a range.
  *  - <tt>other.begin == self.begin</tt>.
  *  - <tt>other.end == self.end</tt>.
  *  - <tt>other.exclude_end? == self.exclude_end?</tt>.
  *
- *  Otherwise returns +false+.
+ *  Examples:
  *
  *    r = (1..5)
  *    r == (1..5)                # => true
@@ -194,16 +219,27 @@ range_eq(VALUE range, VALUE obj)
 /* compares _a_ and _b_ and returns:
  * < 0: a < b
  * = 0: a = b
+ * > 0: a > b
+ * raises an ArgumentError if non-comparable
+ */
+static int
+r_cmp(VALUE a, VALUE b)
+{
+    return OPTIMIZED_CMP(a, b);
+}
+
+/* compares _a_ and _b_ and returns:
+ * < 0: a < b
+ * = 0: a = b
  * > 0: a > b or non-comparable
  */
 static int
 r_less(VALUE a, VALUE b)
 {
-    VALUE r = rb_funcall(a, id_cmp, 1, b);
-
-    if (NIL_P(r))
-        return INT_MAX;
-    return rb_cmpint(r, a, b);
+    VALUE r;
+#define rb_cmpint(cmp, a, b) (NIL_P(r = (cmp)) ? INT_MAX : rb_cmpint(r, (a), (b)))
+    return OPTIMIZED_CMP(a, b);
+#undef rb_cmpint
 }
 
 static VALUE
@@ -410,7 +446,7 @@ range_step_size(VALUE range, VALUE args, VALUE eobj)
  *  Iterates over the elements of range in steps of +s+. The iteration is performed
  *  by <tt>+</tt> operator:
  *
- *    (0..6).step(2) { puts _1 } #=> 1..5
+ *    (0..6).step(2) { puts _1 }
  *    # Prints: 0, 2, 4, 6
  *
  *    # Iterate between two dates in step of 1 day (24 hours)
@@ -488,6 +524,7 @@ range_step(int argc, VALUE *argv, VALUE range)
 
     b = RANGE_BEG(range);
     e = RANGE_END(range);
+    v = b;
 
     const VALUE b_num_p = rb_obj_is_kind_of(b, rb_cNumeric);
     const VALUE e_num_p = rb_obj_is_kind_of(e, rb_cNumeric);
@@ -559,7 +596,8 @@ range_step(int argc, VALUE *argv, VALUE range)
                 rb_yield(LONG2NUM(i));
                 i += unit;
             }
-        } else {
+        }
+        else {
             if (!EXCL(range))
                 end += 1;
             i = FIX2LONG(b);
@@ -571,7 +609,8 @@ range_step(int argc, VALUE *argv, VALUE range)
     }
     else if (b_num_p && step_num_p && ruby_float_step(b, e, step, EXCL(range), TRUE)) {
         /* done */
-    } else if (!NIL_P(str_b) && FIXNUM_P(step)) {
+    }
+    else if (!NIL_P(str_b) && FIXNUM_P(step)) {
         // backwards compatibility behavior for String only, when no step/Integer step is passed
         // See discussion in https://bugs.ruby-lang.org/issues/18368
 
@@ -583,7 +622,8 @@ range_step(int argc, VALUE *argv, VALUE range)
         else {
             rb_str_upto_each(str_b, e, EXCL(range), step_i, (VALUE)iter);
         }
-    } else if (!NIL_P(sym_b) && FIXNUM_P(step)) {
+    }
+    else if (!NIL_P(sym_b) && FIXNUM_P(step)) {
         // same as above: backward compatibility for symbols
 
         VALUE iter[2] = {INT2FIX(1), step};
@@ -594,47 +634,48 @@ range_step(int argc, VALUE *argv, VALUE range)
         else {
             rb_str_upto_each(sym_b, rb_sym2str(e), EXCL(range), sym_step_i, (VALUE)iter);
         }
-    } else {
-        v = b;
-        if (!NIL_P(e)) {
-            if (b_num_p && step_num_p && r_less(step, INT2FIX(0)) < 0) {
-                // iterate backwards, for consistency with ArithmeticSequence
-                if (EXCL(range)) {
-                    for (; r_less(e, v) < 0; v = rb_funcall(v, id_plus, 1, step))
-                        rb_yield(v);
-                }
-                else {
-                    for (; (c = r_less(e, v)) <= 0; v = rb_funcall(v, id_plus, 1, step)) {
-                        rb_yield(v);
-                        if (!c) break;
-                    }
-                }
-
-            } else {
-                // Direction of the comparison. We use it as a comparison operator in cycle:
-                // if begin < end, the cycle performs while value < end (iterating forward)
-                // if begin > end, the cycle performs while value > end (iterating backward with
-                // a negative step)
-                dir = r_less(b, e);
-                // One preliminary addition to check the step moves iteration in the same direction as
-                // from begin to end; otherwise, the iteration should be empty.
-                if (r_less(b, rb_funcall(b, id_plus, 1, step)) == dir) {
-                    if (EXCL(range)) {
-                        for (; r_less(v, e) == dir; v = rb_funcall(v, id_plus, 1, step))
-                            rb_yield(v);
-                    }
-                    else {
-                        for (; (c = r_less(v, e)) == dir || c == 0; v = rb_funcall(v, id_plus, 1, step)) {
-                            rb_yield(v);
-                            if (!c) break;
-                        }
-                    }
-                }
+    }
+    else if (NIL_P(e)) {
+        // endless range
+        for (;; v = rb_funcall(v, id_plus, 1, step))
+            rb_yield(v);
+    }
+    else if (b_num_p && step_num_p && r_less(step, INT2FIX(0)) < 0) {
+        // iterate backwards, for consistency with ArithmeticSequence
+        if (EXCL(range)) {
+            for (; r_less(e, v) < 0; v = rb_funcall(v, id_plus, 1, step))
+                rb_yield(v);
+        }
+        else {
+            for (; (c = r_less(e, v)) <= 0; v = rb_funcall(v, id_plus, 1, step)) {
+                rb_yield(v);
+                if (!c) break;
             }
         }
-        else
-            for (;; v = rb_funcall(v, id_plus, 1, step))
+
+    }
+    else if ((dir = r_less(b, e)) == 0) {
+        if (!EXCL(range)) {
+            rb_yield(v);
+        }
+    }
+    else if (dir == r_less(b, rb_funcall(b, id_plus, 1, step))) {
+        // Direction of the comparison. We use it as a comparison operator in cycle:
+        // if begin < end, the cycle performs while value < end (iterating forward)
+        // if begin > end, the cycle performs while value > end (iterating backward with
+        // a negative step)
+        // One preliminary addition to check the step moves iteration in the same direction as
+        // from begin to end; otherwise, the iteration should be empty.
+        if (EXCL(range)) {
+            for (; r_less(v, e) == dir; v = rb_funcall(v, id_plus, 1, step))
                 rb_yield(v);
+        }
+        else {
+            for (; (c = r_less(v, e)) == dir || c == 0; v = rb_funcall(v, id_plus, 1, step)) {
+                rb_yield(v);
+                if (!c) break;
+            }
+        }
     }
     return range;
 }
@@ -778,7 +819,7 @@ bsearch_integer_range(VALUE beg, VALUE end, int excl)
  *
  *  Returns an element from +self+ selected by a binary search.
  *
- *  See {Binary Searching}[rdoc-ref:bsearch.rdoc].
+ *  See {Binary Searching}[rdoc-ref:language/bsearch.rdoc].
  *
  */
 
@@ -908,6 +949,10 @@ sym_each_i(VALUE v, VALUE arg)
     return each_i(rb_str_intern(v), arg);
 }
 
+#define CANT_ITERATE_FROM(x) \
+    rb_raise(rb_eTypeError, "can't iterate from %s", \
+             rb_obj_classname(x))
+
 /*
  *  call-seq:
  *    size -> non_negative_integer or Infinity or nil
@@ -944,12 +989,47 @@ range_size(VALUE range)
     }
 
     if (!discrete_object_p(b)) {
-        rb_raise(rb_eTypeError, "can't iterate from %s",
-                 rb_obj_classname(b));
+        CANT_ITERATE_FROM(b);
     }
 
     return Qnil;
 }
+
+static VALUE
+range_reverse_size(VALUE range)
+{
+    VALUE b = RANGE_BEG(range), e = RANGE_END(range);
+
+    if (NIL_P(e)) {
+        CANT_ITERATE_FROM(e);
+    }
+
+    if (RB_INTEGER_TYPE_P(b)) {
+        if (rb_obj_is_kind_of(e, rb_cNumeric)) {
+            return ruby_num_interval_step_size(b, e, INT2FIX(1), EXCL(range));
+        }
+        else {
+            CANT_ITERATE_FROM(e);
+        }
+    }
+
+    if (NIL_P(b)) {
+        if (RB_INTEGER_TYPE_P(e)) {
+            return DBL2NUM(HUGE_VAL);
+        }
+        else {
+            CANT_ITERATE_FROM(e);
+        }
+    }
+
+    if (!discrete_object_p(b)) {
+        CANT_ITERATE_FROM(e);
+    }
+
+    return Qnil;
+}
+
+#undef CANT_ITERATE_FROM
 
 /*
  *  call-seq:
@@ -973,10 +1053,39 @@ range_to_a(VALUE range)
     return rb_call_super(0, 0);
 }
 
+/*
+ *  call-seq:
+ *    to_set -> set
+ *
+ *  Returns a set containing the elements in +self+, if a finite collection;
+ *  raises an exception otherwise.
+ *
+ *    (1..4).to_set   # => Set[1, 2, 3, 4]
+ *    (1...4).to_set   # => Set[1, 2, 3]
+ *
+ *    (1..).to_set
+ *    # in 'Range#to_set': cannot convert endless range to a set (RangeError)
+ *
+ */
+static VALUE
+range_to_set(VALUE range)
+{
+    if (NIL_P(RANGE_END(range))) {
+        rb_raise(rb_eRangeError, "cannot convert endless range to a set");
+    }
+    return rb_call_super(0, NULL);
+}
+
 static VALUE
 range_enum_size(VALUE range, VALUE args, VALUE eobj)
 {
     return range_size(range);
+}
+
+static VALUE
+range_enum_reverse_size(VALUE range, VALUE args, VALUE eobj)
+{
+    return range_reverse_size(range);
 }
 
 RBIMPL_ATTR_NORETURN()
@@ -1225,7 +1334,7 @@ range_reverse_each_negative_bignum_section(VALUE beg, VALUE end)
 static VALUE
 range_reverse_each(VALUE range)
 {
-    RETURN_SIZED_ENUMERATOR(range, 0, 0, range_enum_size);
+    RETURN_SIZED_ENUMERATOR(range, 0, 0, range_enum_reverse_size);
 
     VALUE beg = RANGE_BEG(range);
     VALUE end = RANGE_END(range);
@@ -1272,13 +1381,6 @@ range_reverse_each(VALUE range)
  *  Related: Range#first, Range#end.
  */
 
-static VALUE
-range_begin(VALUE range)
-{
-    return RANGE_BEG(range);
-}
-
-
 /*
  *  call-seq:
  *    self.end -> object
@@ -1291,14 +1393,6 @@ range_begin(VALUE range)
  *
  *  Related: Range#begin, Range#last.
  */
-
-
-static VALUE
-range_end(VALUE range)
-{
-    return RANGE_END(range);
-}
-
 
 static VALUE
 first_i(RB_BLOCK_CALL_FUNC_ARGLIST(i, cbarg))
@@ -1355,12 +1449,29 @@ range_first(int argc, VALUE *argv, VALUE range)
     return ary[1];
 }
 
+static bool
+range_basic_each_p(VALUE range)
+{
+    return rb_method_basic_definition_p(CLASS_OF(range), idEach);
+}
+
+static bool
+integer_end_optimizable(VALUE range)
+{
+    VALUE b = RANGE_BEG(range);
+    if (!NIL_P(b) && !RB_INTEGER_TYPE_P(b)) return false;
+    VALUE e = RANGE_END(range);
+    if (!RB_INTEGER_TYPE_P(e)) return false;
+    if (RB_LIKELY(range_basic_each_p(range))) return true;
+    return false;
+}
+
 static VALUE
 rb_int_range_last(int argc, VALUE *argv, VALUE range)
 {
     static const VALUE ONE = INT2FIX(1);
 
-    VALUE b, e, len_1, len, nv, ary;
+    VALUE b, e, len_1 = Qnil, len = Qnil, nv, ary;
     int x;
     long n;
 
@@ -1368,20 +1479,28 @@ rb_int_range_last(int argc, VALUE *argv, VALUE range)
 
     b = RANGE_BEG(range);
     e = RANGE_END(range);
-    RUBY_ASSERT(RB_INTEGER_TYPE_P(b) && RB_INTEGER_TYPE_P(e));
+    RUBY_ASSERT(NIL_P(b) || RB_INTEGER_TYPE_P(b), "b=%"PRIsVALUE, rb_obj_class(b));
+    RUBY_ASSERT(RB_INTEGER_TYPE_P(e), "e=%"PRIsVALUE, rb_obj_class(e));
 
     x = EXCL(range);
 
-    len_1 = rb_int_minus(e, b);
-    if (x) {
-        e = rb_int_minus(e, ONE);
-        len = len_1;
+    if (!NIL_P(b)) {
+        len_1 = rb_int_minus(e, b);
+        if (x) {
+            e = rb_int_minus(e, ONE);
+            len = len_1;
+        }
+        else {
+            len = rb_int_plus(len_1, ONE);
+        }
     }
     else {
-        len = rb_int_plus(len_1, ONE);
+        if (x) {
+            e = rb_int_minus(e, ONE);
+        }
     }
 
-    if (FIXNUM_ZERO_P(len) || rb_num_negative_p(len)) {
+    if (!NIL_P(len) && (FIXNUM_ZERO_P(len) || rb_num_negative_p(len))) {
         return rb_ary_new_capa(0);
     }
 
@@ -1392,7 +1511,7 @@ rb_int_range_last(int argc, VALUE *argv, VALUE range)
     }
 
     nv = LONG2NUM(n);
-    if (RTEST(rb_int_gt(nv, len))) {
+    if (!NIL_P(b) && RTEST(rb_int_gt(nv, len))) {
         nv = len;
         n = NUM2LONG(nv);
     }
@@ -1446,17 +1565,11 @@ rb_int_range_last(int argc, VALUE *argv, VALUE range)
 static VALUE
 range_last(int argc, VALUE *argv, VALUE range)
 {
-    VALUE b, e;
-
     if (NIL_P(RANGE_END(range))) {
         rb_raise(rb_eRangeError, "cannot get the last element of endless range");
     }
     if (argc == 0) return RANGE_END(range);
-
-    b = RANGE_BEG(range);
-    e = RANGE_END(range);
-    if (RB_INTEGER_TYPE_P(b) && RB_INTEGER_TYPE_P(e) &&
-        RB_LIKELY(rb_method_basic_definition_p(rb_cRange, idEach))) {
+    if (integer_end_optimizable(range)) {
         return rb_int_range_last(argc, argv, range);
     }
     return rb_ary_last(argc, argv, rb_Array(range));
@@ -1664,11 +1777,26 @@ range_max(int argc, VALUE *argv, VALUE range)
 
     VALUE b = RANGE_BEG(range);
 
-    if (rb_block_given_p() || (EXCL(range) && !nm) || argc) {
+    if (rb_block_given_p() || (EXCL(range) && !nm)) {
         if (NIL_P(b)) {
             rb_raise(rb_eRangeError, "cannot get the maximum of beginless range with custom comparison method");
         }
         return rb_call_super(argc, argv);
+    }
+    else if (argc) {
+        VALUE ary[2];
+        ID reverse_each;
+        CONST_ID(reverse_each, "reverse_each");
+        rb_scan_args(argc, argv, "1", &ary[0]);
+        ary[1] = rb_ary_new2(NUM2LONG(ary[0]));
+        rb_block_call(range, reverse_each, 0, 0, first_i, (VALUE)ary);
+        return ary[1];
+#if 0
+        if (integer_end_optimizable(range)) {
+            return rb_int_range_last(argc, argv, range, true);
+        }
+        return rb_ary_reverse(rb_ary_last(argc, argv, rb_Array(range)));
+#endif
     }
     else {
         int c = NIL_P(b) ? -1 : OPTIMIZED_CMP(b, e);
@@ -1680,13 +1808,13 @@ range_max(int argc, VALUE *argv, VALUE range)
                 rb_raise(rb_eTypeError, "cannot exclude non Integer end value");
             }
             if (c == 0) return Qnil;
-            if (!RB_INTEGER_TYPE_P(b)) {
+            if (!NIL_P(b) && !RB_INTEGER_TYPE_P(b)) {
                 rb_raise(rb_eTypeError, "cannot exclude end value with non Integer begin value");
             }
             if (FIXNUM_P(e)) {
                 return LONG2NUM(FIX2LONG(e) - 1);
             }
-            return rb_funcall(e, '-', 1, INT2FIX(1));
+            return rb_int_minus(e,INT2FIX(1));
         }
         return e;
     }
@@ -1946,10 +2074,9 @@ VALUE rb_str_include_range_p(VALUE beg, VALUE end, VALUE val, VALUE exclusive);
 
 /*
  *  call-seq:
- *     self === object ->  true or false
+ *     self === other ->  true or false
  *
- *  Returns +true+ if +object+ is between <tt>self.begin</tt> and <tt>self.end</tt>.
- *  +false+ otherwise:
+ *  Returns whether +other+ is between <tt>self.begin</tt> and <tt>self.end</tt>:
  *
  *    (1..4) === 2       # => true
  *    (1..4) === 5       # => false
@@ -2276,7 +2403,7 @@ r_cover_p(VALUE range, VALUE beg, VALUE end, VALUE val)
 static VALUE
 range_dumper(VALUE range)
 {
-    VALUE v = rb_obj_alloc(rb_cObject);
+    VALUE v = rb_class_allocate_instance_capa(rb_cObject, 3);
 
     rb_ivar_set(v, id_excl, RANGE_EXCL(range));
     rb_ivar_set(v, id_beg, RANGE_BEG(range));
@@ -2477,7 +2604,7 @@ range_overlap(VALUE range, VALUE other)
         /* if both begin values are equal, no more comparisons needed */
         if (rb_cmpint(cmp, self_beg, other_beg) == 0) return Qtrue;
     }
-    else if (NIL_P(self_beg) && !NIL_P(self_end) && NIL_P(other_beg)) {
+    else if (NIL_P(self_beg) && !NIL_P(self_end) && NIL_P(other_beg) && !NIL_P(other_end)) {
         VALUE cmp = rb_funcall(self_end, id_cmp, 1, other_end);
         return RBOOL(!NIL_P(cmp));
     }
@@ -2486,6 +2613,111 @@ range_overlap(VALUE range, VALUE other)
     if (empty_region_p(other_beg, other_end, other_excl)) return Qfalse;
 
     return Qtrue;
+}
+
+/*
+ * call-seq:
+ *    clamp(min, max) ->  range
+ *    clamp(range)    ->  range
+ *
+ * Returns a new +Range+ instance whose begin and end values are
+ * clamped to _min_ and _max_, or to _range.begin_ and _range.end_.
+ *
+ * The returned range excludes its end if any of the following is true:
+ *
+ * - The returned end value is an excluded end value of +self+ or _range_.
+ * - Both begin and end values are clamped to the lower bound, or both
+ *   are clamped to the upper bound.  Since +self+ is entirely outside
+ *   the clamping bounds, the returned range is made empty by
+ *   excluding its end.
+ *
+ * Otherwise, the returned range includes its end.
+ *
+ * Examples:
+ *
+ *   (1..10).clamp(3, 7)       # => 3..7
+ *   (1...10).clamp(3, 7)      # => 3..7
+ *   (1...10).clamp(3, 10)     # => 3...10
+ *   (0...).clamp(0, 10)       # => 0..10
+ *
+ *   (1..10).clamp(3..7)       # => 3..7
+ *   (1..10).clamp(3...7)      # => 3...7
+ *   (1..5).clamp(3...7)       # => 3..5
+ *
+ *   (..10).clamp(3, 7)        # => 3..7
+ *   (...10).clamp(3, 7)       # => 3..7
+ *   (..10).clamp(3...7)       # => 3...7
+ *   (..5).clamp(3...7)        # => 3..5
+ *
+ *   (1..10).clamp(20..30)     # => 20...20
+ *   (1..10).clamp(-10..0)     # => 0...0
+ *   (..10).clamp(20..30)      # => 20...20
+ *
+ *   (1..10).clamp(..7)        # => 1..7
+ *   (1..10).clamp(...7)       # => 1...7
+ *   (1..5).clamp(...7)        # => 1..5
+ *
+ *   (1..10).clamp(3..)        # => 3..10
+ *   (1..10).clamp(3...)       # => 3..10
+ *   (1..).clamp(3..)          # => 3..
+ *   (1...).clamp(3...)        # => 3...
+ */
+
+static VALUE
+range_clamp(int argc, VALUE *argv, VALUE self)
+{
+    VALUE self_beg = RANGE_BEG(self);
+    VALUE self_end = RANGE_END(self);
+    int self_excl = EXCL(self);
+    VALUE min, max;
+    int clamp_beg = 0, clamp_end = 0, excl = 0;
+
+    argc = rb_scan_args(argc, argv, "11", &min, &max);
+    if (argc == 1) {
+        VALUE range = min;
+        if (!rb_range_values(range, &min, &max, &excl)) {
+            rb_raise(rb_eTypeError, "wrong argument type %s (expected Range)",
+                     rb_builtin_class_name(range));
+        }
+    }
+    if (!NIL_P(min) && !NIL_P(max) && r_cmp(min, max) > 0) {
+        rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
+    }
+
+    if (!NIL_P(min)) {
+        if (NIL_P(self_beg) || r_cmp(self_beg, min) < 0) {
+            clamp_beg = -1;
+            self_beg = min;
+        }
+        if (!NIL_P(self_end) && r_cmp(self_end, min) < 0) {
+            clamp_end = -1;
+            self_end = min;
+        }
+    }
+    if (!NIL_P(max)) {
+        if (clamp_beg == 0) {
+            if (!NIL_P(self_beg) && r_cmp(self_beg, max) > 0) {
+                clamp_beg = +1;
+                self_beg = max;
+            }
+        }
+        if (clamp_end == 0) {
+            int cmp = NIL_P(self_end) ? +1 : r_cmp(self_end, max);
+            if (cmp > 0) {
+                clamp_end = +1;
+                self_end = max;
+                self_excl = excl;
+            }
+            else if (cmp == 0) {
+                self_excl |= excl;
+            }
+        }
+    }
+    if (clamp_beg && clamp_beg == clamp_end) {
+        /* self is entirely outside the clamping bounds. */
+        self_excl = TRUE;
+    }
+    return rb_range_new(self_beg, self_end, self_excl);
 }
 
 /* A \Range object represents a collection of values
@@ -2504,12 +2736,12 @@ range_overlap(VALUE range, VALUE other)
  *
  * - Method Range.new:
  *
- *   # Ranges that by default include the given end value.
- *   Range.new(1, 4).to_a     # => [1, 2, 3, 4]
- *   Range.new('a', 'd').to_a # => ["a", "b", "c", "d"]
- *   # Ranges that use third argument +exclude_end+ to exclude the given end value.
- *   Range.new(1, 4, true).to_a     # => [1, 2, 3]
- *   Range.new('a', 'd', true).to_a # => ["a", "b", "c"]
+ *     # Ranges that by default include the given end value.
+ *     Range.new(1, 4).to_a     # => [1, 2, 3, 4]
+ *     Range.new('a', 'd').to_a # => ["a", "b", "c", "d"]
+ *     # Ranges that use third argument +exclude_end+ to exclude the given end value.
+ *     Range.new(1, 4, true).to_a     # => [1, 2, 3]
+ *     Range.new('a', 'd', true).to_a # => ["a", "b", "c"]
  *
  * == Beginless Ranges
  *
@@ -2537,7 +2769,7 @@ range_overlap(VALUE range, VALUE other)
  *  r = (...2) # => nil...2
  *  a[r]       # => [1, 2]
  *
- * \Method +each+ for a beginless range raises an exception.
+ * Method +each+ for a beginless range raises an exception.
  *
  * == Endless Ranges
  *
@@ -2567,7 +2799,7 @@ range_overlap(VALUE range, VALUE other)
  *   r = (2..) # => 2..
  *   a[r]      # => [3, 4]
  *
- * \Method +each+ for an endless range calls the given block indefinitely:
+ * Method +each+ for an endless range calls the given block indefinitely:
  *
  *   a = []
  *   r = (1..)
@@ -2577,14 +2809,14 @@ range_overlap(VALUE range, VALUE other)
  *   end
  *   a # => [2, 4, 6, 8, 10]
  *
- * A range can be both beginless and endless.  For literal beginless, endless
+ * A range can be both beginless and endless. For literal beginless, endless
  * ranges, at least the beginning or end of the range must be given as an
  * explicit nil value. It is recommended to use an explicit nil beginning and
- * implicit nil end, since that is what Ruby uses for Range#inspect:
+ * end, since that is what Ruby uses for Range#inspect:
  *
- *   (nil..)    # => (nil..)
- *   (..nil)    # => (nil..)
- *   (nil..nil) # => (nil..)
+ *   (nil..)    # => (nil..nil)
+ *   (..nil)    # => (nil..nil)
+ *   (nil..nil) # => (nil..nil)
  *
  * == Ranges and Other Classes
  *
@@ -2659,10 +2891,10 @@ range_overlap(VALUE range, VALUE other)
  *
  * == What's Here
  *
- * First, what's elsewhere. \Class \Range:
+ * First, what's elsewhere. Class \Range:
  *
- * - Inherits from {class Object}[rdoc-ref:Object@What-27s+Here].
- * - Includes {module Enumerable}[rdoc-ref:Enumerable@What-27s+Here],
+ * - Inherits from {class Object}[rdoc-ref:Object@Whats+Here].
+ * - Includes {module Enumerable}[rdoc-ref:Enumerable@Whats+Here],
  *   which provides dozens of additional methods.
  *
  * Here, class \Range provides methods that are useful for:
@@ -2677,6 +2909,7 @@ range_overlap(VALUE range, VALUE other)
  * === Methods for Creating a \Range
  *
  * - ::new: Returns a new range.
+ * - #clamp: Returns a new range with clamped begin and end values.
  *
  * === Methods for Querying
  *
@@ -2736,7 +2969,7 @@ Init_Range(void)
 
     rb_cRange = rb_struct_define_without_accessor(
         "Range", rb_cObject, range_alloc,
-        "begin", "end", "excl", NULL);
+        "begin", "end", NULL);
 
     rb_include_module(rb_cRange, rb_mEnumerable);
     rb_marshal_define_compat(rb_cRange, rb_cObject, range_dumper, range_loader);
@@ -2751,8 +2984,8 @@ Init_Range(void)
     rb_define_method(rb_cRange, "%", range_percent_step, 1);
     rb_define_method(rb_cRange, "reverse_each", range_reverse_each, 0);
     rb_define_method(rb_cRange, "bsearch", range_bsearch, 0);
-    rb_define_method(rb_cRange, "begin", range_begin, 0);
-    rb_define_method(rb_cRange, "end", range_end, 0);
+    rb_struct_define_aref_method(rb_cRange, id_beg, 0);
+    rb_struct_define_aref_method(rb_cRange, id_end, 1);
     rb_define_method(rb_cRange, "first", range_first, -1);
     rb_define_method(rb_cRange, "last", range_last, -1);
     rb_define_method(rb_cRange, "min", range_min, -1);
@@ -2760,6 +2993,7 @@ Init_Range(void)
     rb_define_method(rb_cRange, "minmax", range_minmax, 0);
     rb_define_method(rb_cRange, "size", range_size, 0);
     rb_define_method(rb_cRange, "to_a", range_to_a, 0);
+    rb_define_method(rb_cRange, "to_set", range_to_set, 0);
     rb_define_method(rb_cRange, "entries", range_to_a, 0);
     rb_define_method(rb_cRange, "to_s", range_to_s, 0);
     rb_define_method(rb_cRange, "inspect", range_inspect, 0);
@@ -2771,4 +3005,5 @@ Init_Range(void)
     rb_define_method(rb_cRange, "cover?", range_cover, 1);
     rb_define_method(rb_cRange, "count", range_count, -1);
     rb_define_method(rb_cRange, "overlap?", range_overlap, 1);
+    rb_define_method(rb_cRange, "clamp", range_clamp, -1);
 }

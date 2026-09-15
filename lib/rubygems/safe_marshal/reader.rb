@@ -20,14 +20,25 @@ module Gem
       class EOFError < Error
       end
 
+      class DataTooShortError < Error
+      end
+
+      class NegativeLengthError < Error
+      end
+
+      class LengthTooLongError < Error
+      end
+
       def initialize(io)
         @io = io
+        @object_links = {}
+        @symbol_links = {}
       end
 
       def read!
         read_header
         root = read_element
-        raise UnconsumedBytesError unless @io.eof?
+        raise UnconsumedBytesError, "expected EOF, got #{@io.read(10).inspect}... after top-level element #{root.class}" unless @io.eof?
         root
       end
 
@@ -41,8 +52,16 @@ module Gem
         raise UnsupportedVersionError, "Unsupported marshal version #{v.bytes.map(&:ord).join(".")}, expected #{Marshal::MAJOR_VERSION}.#{Marshal::MINOR_VERSION}" unless v == MARSHAL_VERSION
       end
 
+      def read_bytes(n)
+        raise NegativeLengthError if n < 0
+        str = @io.read(n)
+        raise EOFError, "expected #{n} bytes, got EOF" if str.nil?
+        raise DataTooShortError, "expected #{n} bytes, got #{str.inspect}" unless str.bytesize == n
+        str
+      end
+
       def read_byte
-        @io.getbyte
+        @io.getbyte || raise(EOFError, "Unexpected EOF")
       end
 
       def read_integer
@@ -67,8 +86,6 @@ module Gem
           read_byte | (read_byte << 8) | -0x10000
         when 0xFF
           read_byte | -0x100
-        when nil
-          raise EOFError, "Unexpected EOF"
         else
           signed = (b ^ 128) - 128
           if b >= 128
@@ -77,6 +94,18 @@ module Gem
             signed - 5
           end
         end
+      end
+
+      # Reads an element count and validates it against the number of bytes
+      # remaining in the input, since each element to be read consumes at
+      # least one byte. This prevents allocating huge backing stores for
+      # maliciously crafted lengths that could never be satisfied.
+      def read_count
+        count = read_integer
+        raise NegativeLengthError if count < 0
+        remaining = @io.size - @io.pos
+        raise LengthTooLongError, "expected #{count} elements, but only #{remaining} bytes remain" if count > remaining
+        count
       end
 
       def read_element
@@ -107,8 +136,6 @@ module Gem
         when 47 then read_regexp # ?/
         when 83 then read_struct # ?S
         when 67 then read_user_class # ?C
-        when nil
-          raise EOFError, "Unexpected EOF"
         else
           raise Error, "Unknown marshal type discriminator #{type.chr.inspect} (#{type})"
         end
@@ -127,7 +154,7 @@ module Gem
             Elements::Symbol.new(byte.chr)
           end
         else
-          name = -@io.read(len)
+          name = read_bytes(len)
           Elements::Symbol.new(name)
         end
       end
@@ -138,7 +165,7 @@ module Gem
       def read_string
         length = read_integer
         return EMPTY_STRING if length == 0
-        str = @io.read(length)
+        str = read_bytes(length)
         Elements::String.new(str)
       end
 
@@ -152,7 +179,7 @@ module Gem
 
       def read_user_defined
         name = read_element
-        binary_string = @io.read(read_integer)
+        binary_string = read_bytes(read_integer)
         Elements::UserDefined.new(name, binary_string)
       end
 
@@ -160,7 +187,7 @@ module Gem
       private_constant :EMPTY_ARRAY
 
       def read_array
-        length = read_integer
+        length = read_count
         return EMPTY_ARRAY if length == 0
         elements = Array.new(length) do
           read_element
@@ -170,7 +197,8 @@ module Gem
 
       def read_object_with_ivars
         object = read_element
-        ivars = Array.new(read_integer) do
+        length = read_count
+        ivars = Array.new(length) do
           [read_element, read_element]
         end
         Elements::WithIvars.new(object, ivars)
@@ -178,7 +206,7 @@ module Gem
 
       def read_symbol_link
         offset = read_integer
-        Elements::SymbolLink.new(offset)
+        @symbol_links[offset] ||= Elements::SymbolLink.new(offset)
       end
 
       def read_user_marshal
@@ -187,50 +215,16 @@ module Gem
         Elements::UserMarshal.new(name, data)
       end
 
-      # profiling bundle install --full-index shows that
-      # offset 6 is by far the most common object link,
-      # so we special case it to avoid allocating a new
-      # object a third of the time.
-      # the following are all the object links that
-      # appear more than 10000 times in my profiling
-
-      OBJECT_LINKS = {
-        6 => Elements::ObjectLink.new(6).freeze,
-        30 => Elements::ObjectLink.new(30).freeze,
-        81 => Elements::ObjectLink.new(81).freeze,
-        34 => Elements::ObjectLink.new(34).freeze,
-        38 => Elements::ObjectLink.new(38).freeze,
-        50 => Elements::ObjectLink.new(50).freeze,
-        91 => Elements::ObjectLink.new(91).freeze,
-        42 => Elements::ObjectLink.new(42).freeze,
-        46 => Elements::ObjectLink.new(46).freeze,
-        150 => Elements::ObjectLink.new(150).freeze,
-        100 => Elements::ObjectLink.new(100).freeze,
-        104 => Elements::ObjectLink.new(104).freeze,
-        108 => Elements::ObjectLink.new(108).freeze,
-        242 => Elements::ObjectLink.new(242).freeze,
-        246 => Elements::ObjectLink.new(246).freeze,
-        139 => Elements::ObjectLink.new(139).freeze,
-        143 => Elements::ObjectLink.new(143).freeze,
-        114 => Elements::ObjectLink.new(114).freeze,
-        308 => Elements::ObjectLink.new(308).freeze,
-        200 => Elements::ObjectLink.new(200).freeze,
-        54 => Elements::ObjectLink.new(54).freeze,
-        62 => Elements::ObjectLink.new(62).freeze,
-        1_286_245 => Elements::ObjectLink.new(1_286_245).freeze,
-      }.freeze
-      private_constant :OBJECT_LINKS
-
       def read_object_link
         offset = read_integer
-        OBJECT_LINKS[offset] || Elements::ObjectLink.new(offset)
+        @object_links[offset] ||= Elements::ObjectLink.new(offset)
       end
 
       EMPTY_HASH = Elements::Hash.new([].freeze).freeze
       private_constant :EMPTY_HASH
 
       def read_hash
-        length = read_integer
+        length = read_count
         return EMPTY_HASH if length == 0
         pairs = Array.new(length) do
           [read_element, read_element]
@@ -239,7 +233,8 @@ module Gem
       end
 
       def read_hash_with_default_value
-        pairs = Array.new(read_integer) do
+        length = read_count
+        pairs = Array.new(length) do
           [read_element, read_element]
         end
         default = read_element
@@ -249,7 +244,8 @@ module Gem
       def read_object
         name = read_element
         object = Elements::Object.new(name)
-        ivars = Array.new(read_integer) do
+        length = read_count
+        ivars = Array.new(length) do
           [read_element, read_element]
         end
         Elements::WithIvars.new(object, ivars)
@@ -260,13 +256,13 @@ module Gem
       end
 
       def read_float
-        string = @io.read(read_integer)
+        string = read_bytes(read_integer)
         Elements::Float.new(string)
       end
 
       def read_bignum
         sign = read_byte
-        data = @io.read(read_integer * 2)
+        data = read_bytes(read_integer * 2)
         Elements::Bignum.new(sign, data)
       end
 

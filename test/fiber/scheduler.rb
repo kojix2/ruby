@@ -65,63 +65,79 @@ class Scheduler
     end
   end
 
-  def run
-    # $stderr.puts [__method__, Fiber.current].inspect
+  def run_once
+    readable = writable = nil
 
-    while @readable.any? or @writable.any? or @waiting.any? or @blocking.any?
-      # May only handle file descriptors up to 1024...
+    begin
       readable, writable = IO.select(@readable.keys + [@urgent.first], @writable.keys, [], next_timeout)
+    rescue IOError
+      # Ignore - this can happen if the IO is closed while we are waiting.
+    end
 
-      # puts "readable: #{readable}" if readable&.any?
-      # puts "writable: #{writable}" if writable&.any?
+    # puts "readable: #{readable}" if readable&.any?
+    # puts "writable: #{writable}" if writable&.any?
 
-      selected = {}
+    selected = {}
 
-      readable&.each do |io|
-        if fiber = @readable.delete(io)
-          @writable.delete(io) if @writable[io] == fiber
-          selected[fiber] = IO::READABLE
-        elsif io == @urgent.first
-          @urgent.first.read_nonblock(1024)
-        end
+    readable&.each do |io|
+      if fiber = @readable.delete(io)
+        @writable.delete(io) if @writable[io] == fiber
+        selected[fiber] = IO::READABLE
+      elsif io == @urgent.first
+        @urgent.first.read_nonblock(1024)
       end
+    end
 
-      writable&.each do |io|
-        if fiber = @writable.delete(io)
-          @readable.delete(io) if @readable[io] == fiber
-          selected[fiber] = selected.fetch(fiber, 0) | IO::WRITABLE
-        end
+    writable&.each do |io|
+      if fiber = @writable.delete(io)
+        @readable.delete(io) if @readable[io] == fiber
+        selected[fiber] = selected.fetch(fiber, 0) | IO::WRITABLE
       end
+    end
 
-      selected.each do |fiber, events|
-        fiber.transfer(events)
-      end
+    selected.each do |fiber, events|
+      fiber.transfer(events)
+    end
 
-      if @waiting.any?
-        time = current_time
-        waiting, @waiting = @waiting, {}
+    if @waiting.any?
+      time = current_time
+      waiting, @waiting = @waiting, {}
 
-        waiting.each do |fiber, timeout|
-          if fiber.alive?
-            if timeout <= time
-              fiber.transfer
-            else
-              @waiting[fiber] = timeout
-            end
+      waiting.each do |fiber, timeout|
+        if fiber.alive?
+          if timeout <= time
+            fiber.transfer
+          else
+            @waiting[fiber] = timeout
           end
         end
       end
+    end
 
-      if @ready.any?
-        ready = nil
+    if @ready.any?
+      ready = nil
 
-        @lock.synchronize do
-          ready, @ready = @ready, []
-        end
+      @lock.synchronize do
+        ready, @ready = @ready, []
+      end
 
-        ready.each do |fiber|
-          fiber.transfer
-        end
+      ready.each do |fiber|
+        fiber.transfer if fiber.alive?
+      end
+    end
+  end
+
+  def run
+    # $stderr.puts [__method__, Fiber.current].inspect
+
+    # Use Thread.handle_interrupt like Async::Scheduler does
+    # This defers signal processing, which is the root cause of the gRPC bug
+    # See: https://github.com/socketry/async/blob/main/lib/async/scheduler.rb
+    Thread.handle_interrupt(::SignalException => :never) do
+      while @readable.any? or @writable.any? or @waiting.any? or @blocking.any?
+        run_once
+
+        break if Thread.pending_interrupt?
       end
     end
   end
@@ -239,6 +255,13 @@ class Scheduler
     end.value
   end
 
+  # This hook is invoked by `IO#close`. Using a separate IO object
+  # demonstrates that the close operation is asynchronous.
+  def io_close(descriptor)
+    Fiber.blocking{IO.for_fd(descriptor.to_i).close}
+    return true
+  end
+
   # This hook is invoked by `Kernel#sleep` and `Thread::Mutex#sleep`.
   def kernel_sleep(duration = nil)
     # $stderr.puts [__method__, duration, Fiber.current].inspect
@@ -290,6 +313,15 @@ class Scheduler
     io.write_nonblock('.')
   end
 
+  def fiber_interrupt(target, _exception)
+    @lock.synchronize do
+      @ready << target
+    end
+
+    io = @urgent.last
+    io.write_nonblock('.')
+  end
+
   # This hook is invoked by `Fiber.schedule`. Strictly speaking, you should use
   # it to create scheduled fibers, but it is not required in practice;
   # `Fiber.new` is usually sufficient.
@@ -309,129 +341,99 @@ class Scheduler
       Addrinfo.getaddrinfo(hostname, nil).map(&:ip_address).uniq
     end.value
   end
+
+  def blocking_operation_wait(work)
+    thread = Thread.new{work.call}
+
+    thread.join
+
+    thread = nil
+  ensure
+    thread&.kill
+  end
 end
 
 # This scheduler class implements `io_read` and `io_write` hooks which require
 # `IO::Buffer`.
 class IOBufferScheduler < Scheduler
-  EAGAIN = -Errno::EAGAIN::Errno
-
-  def io_read(io, buffer, length, offset)
-    total = 0
+  def io_read(io, buffer, offset, length)
     io.nonblock = true
 
-    while true
-      maximum_size = buffer.size - offset
-      result = blocking{buffer.read(io, maximum_size, offset)}
-
-      if result > 0
-        total += result
-        offset += result
-        break if total >= length
-      elsif result == 0
-        break
-      elsif result == EAGAIN
-        if length > 0
-          self.io_wait(io, IO::READABLE, nil)
-        else
-          return result
-        end
-      elsif result < 0
-        return result
-      end
-    end
-
-    return total
+    blocking{buffer.read(io, offset, length)}
   end
 
-  def io_write(io, buffer, length, offset)
-    total = 0
+  def io_write(io, buffer, offset, length)
     io.nonblock = true
 
-    while true
-      maximum_size = buffer.size - offset
-      result = blocking{buffer.write(io, maximum_size, offset)}
-
-      if result > 0
-        total += result
-        offset += result
-        break if total >= length
-      elsif result == 0
-        break
-      elsif result == EAGAIN
-        if length > 0
-          self.io_wait(io, IO::WRITABLE, nil)
-        else
-          return result
-        end
-      elsif result < 0
-        return result
-      end
-    end
-
-    return total
+    blocking{buffer.write(io, offset, length)}
   end
 
-  def io_pread(io, buffer, from, length, offset)
-    total = 0
+  def io_pread(io, buffer, from, offset, length)
     io.nonblock = true
 
-    while true
-      maximum_size = buffer.size - offset
-      result = blocking{buffer.pread(io, from, maximum_size, offset)}
-
-      if result > 0
-        total += result
-        offset += result
-        from += result
-        break if total >= length
-      elsif result == 0
-        break
-      elsif result == EAGAIN
-        if length > 0
-          self.io_wait(io, IO::READABLE, nil)
-        else
-          return result
-        end
-      elsif result < 0
-        return result
-      end
-    end
-
-    return total
+    blocking{buffer.pread(io, from, offset, length)}
   end
 
-  def io_pwrite(io, buffer, from, length, offset)
-    total = 0
+  def io_pwrite(io, buffer, from, offset, length)
     io.nonblock = true
 
-    while true
-      maximum_size = buffer.size - offset
-      result = blocking{buffer.pwrite(io, from, maximum_size, offset)}
-
-      if result > 0
-        total += result
-        offset += result
-        from += result
-        break if total >= length
-      elsif result == 0
-        break
-      elsif result == EAGAIN
-        if length > 0
-          self.io_wait(io, IO::WRITABLE, nil)
-        else
-          return result
-        end
-      elsif result < 0
-        return result
-      end
-    end
-
-    return total
+    blocking{buffer.pwrite(io, from, offset, length)}
   end
 
   def blocking(&block)
     Fiber.blocking(&block)
+  end
+end
+
+class IOScheduler < Scheduler
+  def operations
+    @operations ||= []
+  end
+
+  def io_write(io, buffer, offset, length)
+    descriptor = io.fileno
+    string = buffer.get_string(offset, length)
+
+    self.operations << [:io_write, descriptor, string]
+
+    Fiber.blocking do
+      buffer.write(io, offset, length)
+    end
+  end
+end
+
+class IOErrorScheduler < Scheduler
+  def io_read(io, buffer, offset, length)
+    return -Errno::EBADF::Errno
+  end
+
+  def io_write(io, buffer, offset, length)
+    return -Errno::EINVAL::Errno
+  end
+end
+
+class FailingIOScheduler < Scheduler
+  # Expose the last temporary IO::Buffer to test escaping scenarios.
+  attr_reader :buffer
+
+  def io_read(io, buffer, offset, length)
+    @buffer = buffer
+    raise "scheduler read error"
+  end
+
+  def io_write(io, buffer, offset, length)
+    @buffer = buffer
+    raise "scheduler write error"
+  end
+
+  def io_pread(io, buffer, from, offset, length)
+    @buffer = buffer
+    raise "scheduler pread error"
+  end
+
+  def io_pwrite(io, buffer, from, offset, length)
+    @buffer = buffer
+    raise "scheduler pwrite error"
   end
 end
 

@@ -15,6 +15,7 @@ class Gem::Commands::EnvironmentCommand < Gem::Command
           version         display the gem format version
           remotesources   display the remote gem servers
           platform        display the supported gem platforms
+          credentials     display the path where credentials are stored
           <omitted>       display everything
     EOF
     args.gsub(/^\s+/, "")
@@ -37,6 +38,7 @@ keys:
   :verbose: Verbosity of the gem command. false, true, and :really are the
             levels
   :update_sources: Enable/disable automatic updating of repository metadata
+  :concurrent_downloads: The number of gem downloads to perform concurrently
   :backtrace: Print backtrace when RubyGems encounters an error
   :gempath: The paths in which to look for gems
   :disable_default_gem_server: Force specification of gem server host on push
@@ -88,6 +90,8 @@ lib/rubygems/defaults/operating_system.rb
         Gem.sources.to_a.join("\n")
       when /^platform/ then
         Gem.platforms.join(File::PATH_SEPARATOR)
+      when /^credentials/, /^creds/ then
+        Gem.configuration.credentials_path
       when nil then
         show_environment
       else
@@ -113,6 +117,8 @@ lib/rubygems/defaults/operating_system.rb
     out << "  - INSTALLATION DIRECTORY: #{Gem.dir}\n"
 
     out << "  - USER INSTALLATION DIRECTORY: #{Gem.user_dir}\n"
+
+    out << "  - CREDENTIALS FILE: #{Gem.configuration.credentials_path}\n"
 
     out << "  - RUBYGEMS PREFIX: #{Gem.prefix}\n" unless Gem.prefix.nil?
 

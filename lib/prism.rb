@@ -1,4 +1,7 @@
 # frozen_string_literal: true
+# :markup: markdown
+#--
+# rbs_inline: enabled
 
 # The Prism Ruby parser.
 #
@@ -19,9 +22,8 @@ module Prism
   autoload :DSL, "prism/dsl"
   autoload :InspectVisitor, "prism/inspect_visitor"
   autoload :LexCompat, "prism/lex_compat"
-  autoload :LexRipper, "prism/lex_compat"
   autoload :MutationCompiler, "prism/mutation_compiler"
-  autoload :Pack, "prism/pack"
+  autoload :NodeFind, "prism/node_find"
   autoload :Pattern, "prism/pattern"
   autoload :Reflection, "prism/reflection"
   autoload :Relocation, "prism/relocation"
@@ -33,41 +35,95 @@ module Prism
   # Some of these constants are not meant to be exposed, so marking them as
   # private here.
 
-  private_constant :LexCompat
-  private_constant :LexRipper
+  if RUBY_ENGINE != "jruby"
+    private_constant :LexCompat
+    private_constant :NodeFind
+  end
+
+  # Raised when requested to parse as the currently running Ruby version but Prism has no support for it.
+  class CurrentVersionError < ArgumentError
+    # Initialize a new exception for the given ruby version string.
+    #
+    #: (String version) -> void
+    def initialize(version)
+      message = +"invalid version: Requested to parse as `version: 'current'`; "
+      major, minor, =
+        if version.match?(/\A\d+\.\d+.\d+\z/)
+          version.split(".").map(&:to_i)
+        end
+
+      if major && minor && ((major < 3) || (major == 3 && minor < 3))
+        message << " #{version} is below the minimum supported syntax."
+      else
+        message << " #{version} is unknown. Please update the `prism` gem."
+      end
+
+      super(message)
+    end
+  end
 
   # :call-seq:
-  #   Prism::lex_compat(source, **options) -> LexCompat::Result
+  #   lex_compat(source, **options) -> LexCompat::Result
   #
   # Returns a parse result whose value is an array of tokens that closely
-  # resembles the return value of Ripper::lex. The main difference is that the
-  # `:on_sp` token is not emitted.
+  # resembles the return value of Ripper.lex.
   #
-  # For supported options, see Prism::parse.
+  # For supported options, see Prism.parse.
+  #
+  #: (String source, **untyped options) -> LexCompat::Result
   def self.lex_compat(source, **options)
     LexCompat.new(source, **options).result # steep:ignore
   end
 
   # :call-seq:
-  #   Prism::lex_ripper(source) -> Array
-  #
-  # This lexes with the Ripper lex. It drops any space events but otherwise
-  # returns the same tokens. Raises SyntaxError if the syntax in source is
-  # invalid.
-  def self.lex_ripper(source)
-    LexRipper.new(source).result # steep:ignore
-  end
-
-  # :call-seq:
-  #   Prism::load(source, serialized) -> ParseResult
+  #   load(source, serialized, freeze) -> ParseResult
   #
   # Load the serialized AST using the source as a reference into a tree.
-  def self.load(source, serialized)
-    Serialize.load(source, serialized)
+  #
+  #: (String source, String serialized, ?bool freeze) -> ParseResult
+  def self.load(source, serialized, freeze = false)
+    Serialize.load_parse(source, serialized, freeze)
   end
+
+  # Given a Method, UnboundMethod, Proc, or Thread::Backtrace::Location,
+  # returns the Prism node representing it. On CRuby, this uses node_id for
+  # an exact match. On other implementations, it falls back to best-effort
+  # matching by source location line number.
+  #
+  #: (Method | UnboundMethod | Proc | Thread::Backtrace::Location callable) -> Node?
+  def self.find(callable)
+    NodeFind.find(callable)
+  end
+
+  # @rbs!
+  #    VERSION: String
+  #    BACKEND: :CEXT | :FFI
+  #
+  #    interface _Stream
+  #      def gets: (?Integer integer) -> (String | nil)
+  #    end
+  #
+  #    def self.parse:               (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> ParseResult
+  #    def self.profile:             (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> void
+  #    def self.lex:                 (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> LexResult
+  #    def self.parse_lex:           (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> ParseLexResult
+  #    def self.dump:                (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> String
+  #    def self.parse_comments:      (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> Array[Comment]
+  #    def self.parse_success?:      (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> bool
+  #    def self.parse_failure?:      (String source,  ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> bool
+  #    def self.parse_stream:        (_Stream stream, ?filepath: String, ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> ParseResult
+  #    def self.parse_file:          (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> ParseResult
+  #    def self.profile_file:        (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> void
+  #    def self.lex_file:            (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> LexResult
+  #    def self.parse_lex_file:      (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> ParseLexResult
+  #    def self.dump_file:           (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> String
+  #    def self.parse_file_comments: (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> Array[Comment]
+  #    def self.parse_file_success?: (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> bool
+  #    def self.parse_file_failure?: (path filepath,                     ?command_line: String, ?encoding: Encoding | false, ?freeze: bool, ?frozen_string_literal: bool, ?line: Integer, ?main_script: bool, ?partial_script: bool, ?raise_error: Symbol | true, ?scopes: Array[Array[Symbol]], ?version: String) -> bool
 end
 
 require_relative "prism/polyfill/byteindex"
+require_relative "prism/polyfill/warn"
 require_relative "prism/node"
 require_relative "prism/node_ext"
 require_relative "prism/parse_result"
@@ -80,7 +136,30 @@ if RUBY_ENGINE == "ruby" and !ENV["PRISM_FFI_BACKEND"]
   # The C extension is the default backend on CRuby.
   Prism::BACKEND = :CEXT
 
-  require "prism/prism"
+  begin
+    # The precompiled native libraries are in <gem_dir>/lib/prism/<ruby_version>
+    require_relative "prism/#{RUBY_VERSION[/\d+\.\d+/]}/prism"
+  rescue LoadError => e
+    if e.message.include?("GLIBC")
+      warn(<<~EOM)
+
+        ERROR: It looks like you're trying to use Prism as a precompiled native gem on a system
+               with an unsupported version of glibc.
+
+          #{e.message}
+
+          If that's the case, then please install Prism via the `ruby` platform gem:
+              gem install prism --platform=ruby
+          or, in your Gemfile:
+              gem "prism", force_ruby_platform: true
+
+      EOM
+      raise e
+    end
+
+    # Precompiled library isn't available, fall back to the library compiled at installation time.
+    require "prism/prism"
+  end
 else
   # The FFI backend is used on other Ruby implementations.
   Prism::BACKEND = :FFI

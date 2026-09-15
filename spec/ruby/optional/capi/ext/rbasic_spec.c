@@ -13,13 +13,8 @@ extern "C" {
 #define RBASIC_SET_FLAGS(obj, flags_to_set) (RBASIC(obj)->flags = flags_to_set)
 #endif
 
-#ifndef FL_SHAREABLE
-static const VALUE VISIBLE_BITS = FL_TAINT | FL_FREEZE;
-static const VALUE DATA_VISIBLE_BITS = FL_TAINT | FL_FREEZE | ~(FL_USER0 - 1);
-#else
 static const VALUE VISIBLE_BITS = FL_FREEZE;
 static const VALUE DATA_VISIBLE_BITS = FL_FREEZE | ~(FL_USER0 - 1);
-#endif
 
 #if SIZEOF_VALUE == SIZEOF_LONG
 #define VALUE2NUM(v) ULONG2NUM(v)
@@ -29,13 +24,6 @@ static const VALUE DATA_VISIBLE_BITS = FL_FREEZE | ~(FL_USER0 - 1);
 #define NUM2VALUE(n) NUM2ULL(n)
 #else
 #error "unsupported"
-#endif
-
-
-#ifndef RUBY_VERSION_IS_3_1
-VALUE rbasic_spec_taint_flag(VALUE self) {
-  return VALUE2NUM(RUBY_FL_TAINT);
-}
 #endif
 
 VALUE rbasic_spec_freeze_flag(VALUE self) {
@@ -93,9 +81,6 @@ static VALUE rbasic_rdata_spec_get_klass(VALUE self, VALUE structure) {
 
 void Init_rbasic_spec(void) {
   VALUE cls = rb_define_class("CApiRBasicSpecs", rb_cObject);
-#ifndef RUBY_VERSION_IS_3_1
-  rb_define_method(cls, "taint_flag", rbasic_spec_taint_flag, 0);
-#endif
   rb_define_method(cls, "freeze_flag", rbasic_spec_freeze_flag, 0);
   rb_define_method(cls, "get_flags", rbasic_spec_get_flags, 1);
   rb_define_method(cls, "set_flags", rbasic_spec_set_flags, 2);

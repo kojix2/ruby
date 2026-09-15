@@ -1,4 +1,5 @@
 #include "ruby.h"
+#include "ruby/vm.h"
 #include "rubyspec.h"
 
 #include <errno.h>
@@ -7,14 +8,10 @@
 extern "C" {
 #endif
 
-VALUE kernel_spec_call_proc(VALUE arg_array) {
+static VALUE kernel_spec_call_proc(VALUE arg_array) {
   VALUE arg = rb_ary_pop(arg_array);
   VALUE proc = rb_ary_pop(arg_array);
   return rb_funcall(proc, rb_intern("call"), 1, arg);
-}
-
-VALUE kernel_spec_call_proc_raise(VALUE arg_array, VALUE raised_exc) {
-  return kernel_spec_call_proc(arg_array);
 }
 
 static VALUE kernel_spec_rb_block_given_p(VALUE self) {
@@ -71,9 +68,18 @@ VALUE kernel_spec_rb_block_call_no_func(VALUE self, VALUE ary) {
   return rb_block_call(ary, rb_intern("map"), 0, NULL, (rb_block_call_func_t)NULL, Qnil);
 }
 
-
 VALUE kernel_spec_rb_frame_this_func(VALUE self) {
   return ID2SYM(rb_frame_this_func());
+}
+
+VALUE kernel_spec_rb_category_warn_deprecated(VALUE self) {
+  rb_category_warn(RB_WARN_CATEGORY_DEPRECATED, "foo");
+  return Qnil;
+}
+
+VALUE kernel_spec_rb_category_warn_deprecated_with_integer_extra_value(VALUE self, VALUE value) {
+  rb_category_warn(RB_WARN_CATEGORY_DEPRECATED, "foo %d", FIX2INT(value));
+  return Qnil;
 }
 
 VALUE kernel_spec_rb_ensure(VALUE self, VALUE main_proc, VALUE arg,
@@ -108,13 +114,33 @@ VALUE kernel_spec_rb_catch_obj(VALUE self, VALUE obj, VALUE main_proc) {
   return rb_catch_obj(obj, kernel_spec_call_proc_with_catch_obj, main_proc);
 }
 
+struct rb_catch_obj_pointer_data {
+  int magic;
+};
+
+VALUE kernel_spec_catch_obj_pointer(RB_BLOCK_CALL_FUNC_ARGLIST(arg, data)) {
+  struct rb_catch_obj_pointer_data *pointer_data = (struct rb_catch_obj_pointer_data *)data;
+  if (pointer_data->magic != 0x1234) {
+    rb_raise(rb_eRuntimeError, "invalid catch pointer");
+  }
+
+  return Qtrue;
+}
+
+VALUE kernel_spec_rb_catch_obj_with_pointer(VALUE self, VALUE obj) {
+  struct rb_catch_obj_pointer_data data = { 0x1234 };
+  return rb_catch_obj(obj, kernel_spec_catch_obj_pointer, (VALUE)&data);
+}
+
 VALUE kernel_spec_rb_eval_string(VALUE self, VALUE str) {
   return rb_eval_string(RSTRING_PTR(str));
 }
 
+#ifndef RUBY_VERSION_IS_4_0
 VALUE kernel_spec_rb_eval_cmd_kw(VALUE self, VALUE cmd, VALUE args, VALUE kw_splat) {
   return rb_eval_cmd_kw(cmd, args, NUM2INT(kw_splat));
 }
+#endif
 
 VALUE kernel_spec_rb_raise(VALUE self, VALUE hash) {
   rb_hash_aset(hash, ID2SYM(rb_intern("stage")), ID2SYM(rb_intern("before")));
@@ -134,7 +160,16 @@ VALUE kernel_spec_rb_throw_obj(VALUE self, VALUE obj, VALUE result) {
   return ID2SYM(rb_intern("rb_throw_failed"));
 }
 
-VALUE kernel_spec_call_proc_with_raised_exc(VALUE arg_array, VALUE raised_exc) {
+VALUE kernel_spec_rb_errinfo(VALUE self) {
+  return rb_errinfo();
+}
+
+VALUE kernel_spec_rb_set_errinfo(VALUE self, VALUE exc) {
+  rb_set_errinfo(exc);
+  return Qnil;
+}
+
+static VALUE kernel_spec_call_proc_with_raised_exc(VALUE arg_array, VALUE raised_exc) {
   VALUE argv[2];
   int argc;
 
@@ -181,7 +216,7 @@ VALUE kernel_spec_rb_rescue2(int argc, VALUE *args, VALUE self) {
   rb_ary_push(raise_array, args[3]);
 
   return rb_rescue2(kernel_spec_call_proc, main_array,
-      kernel_spec_call_proc_raise, raise_array, args[4], args[5], (VALUE)0);
+      kernel_spec_call_proc_with_raised_exc, raise_array, args[4], args[5], (VALUE)0);
 }
 
 static VALUE kernel_spec_rb_protect_yield(VALUE self, VALUE obj, VALUE ary) {
@@ -195,7 +230,7 @@ static VALUE kernel_spec_rb_protect_yield(VALUE self, VALUE obj, VALUE ary) {
   return res;
 }
 
-static VALUE kernel_spec_rb_protect_errinfo(VALUE self, VALUE obj, VALUE ary) {
+static VALUE kernel_spec_rb_protect_ignore_status(VALUE self, VALUE obj, VALUE ary) {
   int status = 0;
   VALUE res = rb_protect(rb_yield, obj, &status);
   rb_ary_store(ary, 0, INT2NUM(23));
@@ -233,6 +268,13 @@ VALUE kernel_spec_rb_syserr_fail(VALUE self, VALUE err, VALUE msg) {
     rb_syserr_fail(NUM2INT(err), NULL);
   } else if (self != Qundef) {
     rb_syserr_fail(NUM2INT(err), StringValuePtr(msg));
+  }
+  return Qnil;
+}
+
+VALUE kernel_spec_rb_syserr_fail_str(VALUE self, VALUE err, VALUE msg) {
+  if (self != Qundef) {
+    rb_syserr_fail_str(NUM2INT(err), msg);
   }
   return Qnil;
 }
@@ -305,6 +347,28 @@ static VALUE kernel_spec_rb_exec_recursive(VALUE self, VALUE obj) {
   return rb_exec_recursive(do_rec, obj, Qtrue);
 }
 
+struct rb_exec_recursive_pointer_data {
+  int magic;
+};
+
+static VALUE do_rec_pointer(VALUE obj, VALUE arg, int is_rec) {
+  struct rb_exec_recursive_pointer_data *arg_data = (struct rb_exec_recursive_pointer_data *)arg;
+  if (arg_data->magic != 0x1234) {
+    rb_raise(rb_eRuntimeError, "invalid recursive pointer");
+  }
+
+  if (is_rec) {
+    return Qtrue;
+  } else {
+    return rb_exec_recursive(do_rec_pointer, obj, arg);
+  }
+}
+
+static VALUE kernel_spec_rb_exec_recursive_with_pointer(VALUE self) {
+  struct rb_exec_recursive_pointer_data data = { 0x1234 };
+  return rb_exec_recursive(do_rec_pointer, self, (VALUE)&data);
+}
+
 static void write_io(VALUE io) {
   rb_funcall(io, rb_intern("write"), 1, rb_str_new2("in write_io"));
 }
@@ -314,8 +378,21 @@ static VALUE kernel_spec_rb_set_end_proc(VALUE self, VALUE io) {
   return Qnil;
 }
 
+static void at_exit_hook(ruby_vm_t *vm) {
+  puts("ruby_vm_at_exit hook ran");
+}
+
+static VALUE kernel_spec_ruby_vm_at_exit(VALUE self) {
+  ruby_vm_at_exit(at_exit_hook);
+  return self;
+}
+
 static VALUE kernel_spec_rb_f_sprintf(VALUE self, VALUE ary) {
   return rb_f_sprintf((int)RARRAY_LEN(ary), RARRAY_PTR(ary));
+}
+
+static VALUE kernel_spec_rb_str_format(VALUE self, VALUE count, VALUE ary, VALUE format) {
+  return rb_str_format(FIX2INT(count), RARRAY_PTR(ary), format);
 }
 
 static VALUE kernel_spec_rb_make_backtrace(VALUE self) {
@@ -326,7 +403,6 @@ static VALUE kernel_spec_rb_funcallv(VALUE self, VALUE obj, VALUE method, VALUE 
   return rb_funcallv(obj, SYM2ID(method), RARRAY_LENINT(args), RARRAY_PTR(args));
 }
 
-#ifdef RUBY_VERSION_IS_3_0
 static VALUE kernel_spec_rb_funcallv_kw(VALUE self, VALUE obj, VALUE method, VALUE args) {
   return rb_funcallv_kw(obj, SYM2ID(method), RARRAY_LENINT(args), RARRAY_PTR(args), RB_PASS_KEYWORDS);
 }
@@ -334,7 +410,6 @@ static VALUE kernel_spec_rb_funcallv_kw(VALUE self, VALUE obj, VALUE method, VAL
 static VALUE kernel_spec_rb_keyword_given_p(int argc, VALUE *args, VALUE self) {
   return rb_keyword_given_p() ? Qtrue : Qfalse;
 }
-#endif
 
 static VALUE kernel_spec_rb_funcallv_public(VALUE self, VALUE obj, VALUE method) {
   return rb_funcallv_public(obj, SYM2ID(method), 0, NULL);
@@ -376,22 +451,31 @@ void Init_kernel_spec(void) {
   rb_define_method(cls, "rb_block_lambda", kernel_spec_rb_block_lambda, 0);
   rb_define_method(cls, "rb_frame_this_func_test", kernel_spec_rb_frame_this_func, 0);
   rb_define_method(cls, "rb_frame_this_func_test_again", kernel_spec_rb_frame_this_func, 0);
+  rb_define_method(cls, "rb_category_warn_deprecated", kernel_spec_rb_category_warn_deprecated, 0);
+  rb_define_method(cls, "rb_category_warn_deprecated_with_integer_extra_value", kernel_spec_rb_category_warn_deprecated_with_integer_extra_value, 1);
   rb_define_method(cls, "rb_ensure", kernel_spec_rb_ensure, 4);
   rb_define_method(cls, "rb_eval_string", kernel_spec_rb_eval_string, 1);
+#ifndef RUBY_VERSION_IS_4_0
   rb_define_method(cls, "rb_eval_cmd_kw", kernel_spec_rb_eval_cmd_kw, 3);
+#endif
   rb_define_method(cls, "rb_raise", kernel_spec_rb_raise, 1);
   rb_define_method(cls, "rb_throw", kernel_spec_rb_throw, 1);
   rb_define_method(cls, "rb_throw_obj", kernel_spec_rb_throw_obj, 2);
+  rb_define_method(cls, "rb_errinfo", kernel_spec_rb_errinfo, 0);
+  rb_define_method(cls, "rb_set_errinfo", kernel_spec_rb_set_errinfo, 1);
+  rb_define_method(cls, "rb_rescue", kernel_spec_rb_rescue, 4);
   rb_define_method(cls, "rb_rescue", kernel_spec_rb_rescue, 4);
   rb_define_method(cls, "rb_rescue2", kernel_spec_rb_rescue2, -1);
   rb_define_method(cls, "rb_protect_yield", kernel_spec_rb_protect_yield, 2);
-  rb_define_method(cls, "rb_protect_errinfo", kernel_spec_rb_protect_errinfo, 2);
+  rb_define_method(cls, "rb_protect_ignore_status", kernel_spec_rb_protect_ignore_status, 2);
   rb_define_method(cls, "rb_protect_null_status", kernel_spec_rb_protect_null_status, 1);
   rb_define_method(cls, "rb_eval_string_protect", kernel_spec_rb_eval_string_protect, 2);
   rb_define_method(cls, "rb_catch", kernel_spec_rb_catch, 2);
   rb_define_method(cls, "rb_catch_obj", kernel_spec_rb_catch_obj, 2);
+  rb_define_method(cls, "rb_catch_obj_with_pointer", kernel_spec_rb_catch_obj_with_pointer, 1);
   rb_define_method(cls, "rb_sys_fail", kernel_spec_rb_sys_fail, 1);
   rb_define_method(cls, "rb_syserr_fail", kernel_spec_rb_syserr_fail, 2);
+  rb_define_method(cls, "rb_syserr_fail_str", kernel_spec_rb_syserr_fail_str, 2);
   rb_define_method(cls, "rb_warn", kernel_spec_rb_warn, 1);
   rb_define_method(cls, "rb_yield", kernel_spec_rb_yield, 1);
   rb_define_method(cls, "rb_yield_indirected", kernel_spec_rb_yield_indirected, 1);
@@ -400,14 +484,15 @@ void Init_kernel_spec(void) {
   rb_define_method(cls, "rb_yield_values2", kernel_spec_rb_yield_values2, 1);
   rb_define_method(cls, "rb_yield_splat", kernel_spec_rb_yield_splat, 1);
   rb_define_method(cls, "rb_exec_recursive", kernel_spec_rb_exec_recursive, 1);
+  rb_define_method(cls, "rb_exec_recursive_with_pointer", kernel_spec_rb_exec_recursive_with_pointer, 0);
   rb_define_method(cls, "rb_set_end_proc", kernel_spec_rb_set_end_proc, 1);
+  rb_define_method(cls, "ruby_vm_at_exit", kernel_spec_ruby_vm_at_exit, 0);
   rb_define_method(cls, "rb_f_sprintf", kernel_spec_rb_f_sprintf, 1);
+  rb_define_method(cls, "rb_str_format", kernel_spec_rb_str_format, 3);
   rb_define_method(cls, "rb_make_backtrace", kernel_spec_rb_make_backtrace, 0);
   rb_define_method(cls, "rb_funcallv", kernel_spec_rb_funcallv, 3);
-#ifdef RUBY_VERSION_IS_3_0
   rb_define_method(cls, "rb_funcallv_kw", kernel_spec_rb_funcallv_kw, 3);
   rb_define_method(cls, "rb_keyword_given_p", kernel_spec_rb_keyword_given_p, -1);
-#endif
   rb_define_method(cls, "rb_funcallv_public", kernel_spec_rb_funcallv_public, 2);
   rb_define_method(cls, "rb_funcall_many_args", kernel_spec_rb_funcall_many_args, 2);
   rb_define_method(cls, "rb_funcall_with_block", kernel_spec_rb_funcall_with_block, 4);

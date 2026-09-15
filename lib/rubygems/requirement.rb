@@ -22,7 +22,7 @@ class Gem::Requirement
 
   SOURCE_SET_REQUIREMENT = Struct.new(:for_lockfile).new "!" # :nodoc:
 
-  quoted = OPS.keys.map {|k| Regexp.quote k }.join "|"
+  quoted = Regexp.union(OPS.keys)
   PATTERN_RAW = "\\s*(#{quoted})?\\s*(#{Gem::Version::VERSION_PATTERN})\\s*".freeze # :nodoc:
 
   ##
@@ -106,13 +106,15 @@ class Gem::Requirement
     unless PATTERN =~ obj.to_s
       raise BadRequirementError, "Illformed requirement [#{obj.inspect}]"
     end
+    op = -($1 || "=")
+    version = -$2
 
-    if $1 == ">=" && $2 == "0"
+    if op == ">=" && version == "0"
       DefaultRequirement
-    elsif $1 == ">=" && $2 == "0.a"
+    elsif op == ">=" && version == "0.a"
       DefaultPrereleaseRequirement
     else
-      [-($1 || "="), Gem::Version.new($2)]
+      [op, Gem::Version.new(version)]
     end
   end
 
@@ -201,7 +203,15 @@ class Gem::Requirement
   def marshal_load(array) # :nodoc:
     @requirements = array[0]
 
-    raise TypeError, "wrong @requirements" unless Array === @requirements
+    if Array === @requirements
+      return if @requirements.all? do |r|
+        next false unless r.size == 2
+        r[0] = "=" unless r.first.is_a?(String)
+        r.last.is_a?(Gem::Version)
+      end
+    end
+
+    raise TypeError, "wrong @requirements"
   end
 
   def yaml_initialize(tag, vals) # :nodoc:
@@ -238,7 +248,7 @@ class Gem::Requirement
   def satisfied_by?(version)
     raise ArgumentError, "Need a Gem::Version: #{version.inspect}" unless
       Gem::Version === version
-    requirements.all? {|op, rv| OPS[op].call version, rv }
+    requirements.all? {|op, rv| OPS.fetch(op).call version, rv }
   end
 
   alias_method :===, :satisfied_by?

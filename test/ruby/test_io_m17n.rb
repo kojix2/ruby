@@ -404,8 +404,17 @@ EOT
   end
 
   def test_stdin
-    assert_equal(Encoding.default_external, STDIN.external_encoding)
-    assert_equal(nil, STDIN.internal_encoding)
+    encoding = Encoding.default_external
+    internal = nil
+    if /mswin|mingw/ =~ RUBY_PLATFORM and STDIN.tty?
+      # Interactive console input on Windows is read in the locale (console
+      # code page) encoding and transcoded to the default external encoding.
+      encoding = Encoding.find("locale")
+      internal = Encoding.default_internal || Encoding.default_external
+      internal = nil if internal == encoding
+    end
+    assert_equal(encoding, STDIN.external_encoding)
+    assert_equal(internal, STDIN.internal_encoding)
   end
 
   def test_stdout
@@ -1393,30 +1402,6 @@ EOT
       assert_equal(Encoding::EUC_JP, s.encoding)
       assert_equal("\x8e\xa1".force_encoding("euc-jp"), s)
     }
-  end
-
-  def test_open_pipe_r_enc
-    EnvUtil.suppress_warning do # https://bugs.ruby-lang.org/issues/19630
-      open("|#{EnvUtil.rubybin} -e 'putc 255'", "r:ascii-8bit") {|f|
-        assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
-        assert_equal(nil, f.internal_encoding)
-        s = f.read
-        assert_equal(Encoding::ASCII_8BIT, s.encoding)
-        assert_equal("\xff".force_encoding("ascii-8bit"), s)
-      }
-    end
-  end
-
-  def test_open_pipe_r_enc2
-    EnvUtil.suppress_warning do # https://bugs.ruby-lang.org/issues/19630
-      open("|#{EnvUtil.rubybin} -e 'putc \"\\u3042\"'", "r:UTF-8") {|f|
-        assert_equal(Encoding::UTF_8, f.external_encoding)
-        assert_equal(nil, f.internal_encoding)
-        s = f.read
-        assert_equal(Encoding::UTF_8, s.encoding)
-        assert_equal("\u3042", s)
-      }
-    end
   end
 
   def test_s_foreach_enc
@@ -2748,8 +2733,8 @@ EOT
   def test_pos_with_buffer_end_cr
     bug6401 = '[ruby-core:44874]'
     with_tmpdir {
-      # Read buffer size is 8191. This generates '\r' at 8191.
-      lines = ["X" * 8187, "X"]
+      # Read buffer size is 8192. This generates '\r' at 8192.
+      lines = ["X" * 8188, "X"]
       generate_file("tmp", lines.join("\r\n") + "\r\n")
 
       open("tmp", "r") do |f|
@@ -2828,6 +2813,19 @@ EOT
     end
     unless failure.empty?
       flunk failure.join("\n---\n")
+    end
+  end
+
+  def test_each_codepoint_encoding_with_ungetc
+    File.open(File::NULL, "rt:utf-8") do |f|
+      f.ungetc(%Q[\u{3042}\u{3044}\u{3046}])
+      assert_equal [0x3042, 0x3044, 0x3046], f.each_codepoint.to_a
+    end
+    File.open(File::NULL, "rt:us-ascii") do |f|
+      f.ungetc(%Q[\u{3042}\u{3044}\u{3046}])
+      assert_raise(ArgumentError) do
+        f.each_codepoint.to_a
+      end
     end
   end
 end

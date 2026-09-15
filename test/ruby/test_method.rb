@@ -32,6 +32,7 @@ class TestMethod < Test::Unit::TestCase
   def mk7(a, b = nil, *c, d, **o) nil && o end
   def mk8(a, b = nil, *c, d, e:, f: nil, **o) nil && o end
   def mnk(**nil) end
+  def mnb(&nil) end
   def mf(...) end
 
   class Base
@@ -109,6 +110,20 @@ class TestMethod < Test::Unit::TestCase
       remove_method :foo
       def foo() :derived; end
     end
+  end
+
+  def test_unbound_method_equality_with_extended_module
+    m = Module.new { def hello; "hello"; end }
+    base = Class.new { extend m }
+    sub = Class.new(base)
+
+    from_module = m.instance_method(:hello)
+    from_base   = base.method(:hello).unbind
+    from_sub    = sub.method(:hello).unbind
+
+    assert_equal(from_module, from_base)
+    assert_equal(from_module, from_sub)
+    assert_equal(from_base, from_sub)
   end
 
   def test_callee
@@ -209,6 +224,27 @@ class TestMethod < Test::Unit::TestCase
     assert_kind_of(String, o.method(:foo).hash.to_s)
   end
 
+  def test_hash_does_not_change_after_compaction
+    omit "compaction is not supported on this platform" unless GC.respond_to?(:compact)
+
+    # iseq backed method
+    assert_separately([], <<~RUBY)
+      def a; end
+
+      # Need this method here because otherwise the iseq may be on the C stack
+      # which would get pinned and not move during compaction
+      def get_hash
+        method(:a).hash
+      end
+
+      hash = get_hash
+
+      GC.verify_compaction_references(expand_heap: true, toward: :empty)
+
+      assert_equal(hash, get_hash)
+    RUBY
+  end
+
   def test_owner
     c = Class.new do
       def foo; end
@@ -263,8 +299,10 @@ class TestMethod < Test::Unit::TestCase
     assert_raise(TypeError) { m.bind(Object.new) }
 
     cx = EnvUtil.labeled_class("X\u{1f431}")
-    assert_raise_with_message(TypeError, /X\u{1f431}/) do
-      o.method(cx)
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(TypeError, /X\u{1f431}/) do
+        o.method(cx)
+      end
     end
   end
 
@@ -294,9 +332,12 @@ class TestMethod < Test::Unit::TestCase
     assert_raise(TypeError) do
       Class.new.class_eval { define_method(:bar, o.method(:bar)) }
     end
+
     cx = EnvUtil.labeled_class("X\u{1f431}")
-    assert_raise_with_message(TypeError, /X\u{1F431}/) do
-      Class.new {define_method(cx) {}}
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(TypeError, /X\u{1F431}/) do
+        Class.new {define_method(cx) {}}
+      end
     end
   end
 
@@ -451,7 +492,6 @@ class TestMethod < Test::Unit::TestCase
   end
 
   def test_clone_under_gc_compact_stress
-    omit "compaction doesn't work well on s390x" if RUBY_PLATFORM =~ /s390x/ # https://github.com/ruby/ruby/pull/5077
     EnvUtil.under_gc_compact_stress do
       o = Object.new
       def o.foo; :foo; end
@@ -460,6 +500,20 @@ class TestMethod < Test::Unit::TestCase
       assert_equal(:foo, m.clone.call)
       assert_equal(:bar, m.clone.bar)
     end
+  end
+
+  def test_clone_preserves_singleton_methods
+    m = method(:itself)
+    m.define_singleton_method(:foo) { :bar }
+    assert_equal(:bar, m.foo)
+    assert_equal(:bar, m.clone.foo)
+  end
+
+  def test_dup_does_not_preserve_singleton_methods
+    m = method(:itself)
+    m.define_singleton_method(:foo) { :bar }
+    assert_equal(:bar, m.foo)
+    assert_raise(NoMethodError) { m.dup.foo }
   end
 
   def test_inspect
@@ -577,6 +631,7 @@ class TestMethod < Test::Unit::TestCase
   define_method(:pmk7) {|a, b = nil, *c, d, **o|}
   define_method(:pmk8) {|a, b = nil, *c, d, e:, f: nil, **o|}
   define_method(:pmnk) {|**nil|}
+  define_method(:pmnb) {|&nil|}
 
   def test_bound_parameters
     assert_equal([], method(:m0).parameters)
@@ -600,6 +655,7 @@ class TestMethod < Test::Unit::TestCase
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyrest, :o]], method(:mk7).parameters)
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyreq, :e], [:key, :f], [:keyrest, :o]], method(:mk8).parameters)
     assert_equal([[:nokey]], method(:mnk).parameters)
+    assert_equal([[:noblock]], method(:mnb).parameters)
     # pending
     assert_equal([[:rest, :*], [:keyrest, :**], [:block, :&]], method(:mf).parameters)
   end
@@ -626,6 +682,7 @@ class TestMethod < Test::Unit::TestCase
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyrest, :o]], self.class.instance_method(:mk7).parameters)
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyreq, :e], [:key, :f], [:keyrest, :o]], self.class.instance_method(:mk8).parameters)
     assert_equal([[:nokey]], self.class.instance_method(:mnk).parameters)
+    assert_equal([[:noblock]], self.class.instance_method(:mnb).parameters)
     # pending
     assert_equal([[:rest, :*], [:keyrest, :**], [:block, :&]], self.class.instance_method(:mf).parameters)
   end
@@ -651,6 +708,7 @@ class TestMethod < Test::Unit::TestCase
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyrest, :o]], method(:pmk7).parameters)
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyreq, :e], [:key, :f], [:keyrest, :o]], method(:pmk8).parameters)
     assert_equal([[:nokey]], method(:pmnk).parameters)
+    assert_equal([[:noblock]], method(:pmnb).parameters)
   end
 
   def test_bmethod_unbound_parameters
@@ -675,6 +733,7 @@ class TestMethod < Test::Unit::TestCase
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyrest, :o]], self.class.instance_method(:pmk7).parameters)
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:keyreq, :e], [:key, :f], [:keyrest, :o]], self.class.instance_method(:pmk8).parameters)
     assert_equal([[:nokey]], self.class.instance_method(:pmnk).parameters)
+    assert_equal([[:noblock]], self.class.instance_method(:pmnb).parameters)
   end
 
   def test_hidden_parameters
@@ -1405,10 +1464,6 @@ class TestMethod < Test::Unit::TestCase
   end
 
   def test_splat_long_array
-    if File.exist?('/etc/os-release') && File.read('/etc/os-release').include?('openSUSE Leap')
-      # For RubyCI's openSUSE machine http://rubyci.s3.amazonaws.com/opensuseleap/ruby-trunk/recent.html, which tends to die with NoMemoryError here.
-      omit 'do not exhaust memory on RubyCI openSUSE Leap machine'
-    end
     n = 10_000_000
     assert_equal n  , rest_parameter(*(1..n)).size, '[Feature #10440]'
   end
@@ -1417,6 +1472,46 @@ class TestMethod < Test::Unit::TestCase
     D = "Const_D"
     def foo
       a = b = c = a = b = c = 12345
+    end
+
+    def binding_noarg
+      a = a = 12345
+      binding
+    end
+
+    def binding_one_arg(x)
+      a = a = 12345
+      binding
+    end
+
+    def binding_optargs(x, y=42)
+      a = a = 12345
+      binding
+    end
+
+    def binding_anyargs(*x)
+      a = a = 12345
+      binding
+    end
+
+    def binding_keywords(x: 42)
+      a = a = 12345
+      binding
+    end
+
+    def binding_anykeywords(**x)
+      a = a = 12345
+      binding
+    end
+
+    def binding_forwarding(...)
+      a = a = 12345
+      binding
+    end
+
+    def binding_forwarding1(x, ...)
+      a = a = 12345
+      binding
     end
   end
 
@@ -1434,6 +1529,66 @@ class TestMethod < Test::Unit::TestCase
     assert_equal(123, b.local_variable_get(:foo), bug11012)
     assert_equal(456, b.local_variable_get(:bar), bug11012)
     assert_equal([:bar, :foo], b.local_variables.sort, bug11012)
+  end
+
+  def test_method_binding
+    c = C.new
+
+    b = c.binding_noarg
+    assert_equal(12345, b.local_variable_get(:a))
+
+    b = c.binding_one_arg(0)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(0, b.local_variable_get(:x))
+
+    b = c.binding_anyargs()
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal([], b.local_variable_get(:x))
+    b = c.binding_anyargs(0)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal([0], b.local_variable_get(:x))
+    b = c.binding_anyargs(0, 1)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal([0, 1], b.local_variable_get(:x))
+
+    b = c.binding_optargs(0)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(0, b.local_variable_get(:x))
+    assert_equal(42, b.local_variable_get(:y))
+    b = c.binding_optargs(0, 1)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(0, b.local_variable_get(:x))
+    assert_equal(1, b.local_variable_get(:y))
+
+    b = c.binding_keywords()
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(42, b.local_variable_get(:x))
+    b = c.binding_keywords(x: 102)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(102, b.local_variable_get(:x))
+
+    b = c.binding_anykeywords()
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal({}, b.local_variable_get(:x))
+    b = c.binding_anykeywords(foo: 999)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal({foo: 999}, b.local_variable_get(:x))
+
+    b = c.binding_forwarding()
+    assert_equal(12345, b.local_variable_get(:a))
+    b = c.binding_forwarding(0)
+    assert_equal(12345, b.local_variable_get(:a))
+    b = c.binding_forwarding(0, 1)
+    assert_equal(12345, b.local_variable_get(:a))
+    b = c.binding_forwarding(foo: 42)
+    assert_equal(12345, b.local_variable_get(:a))
+
+    b = c.binding_forwarding1(987)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(987, b.local_variable_get(:x))
+    b = c.binding_forwarding1(987, 654)
+    assert_equal(12345, b.local_variable_get(:a))
+    assert_equal(987, b.local_variable_get(:x))
   end
 
   MethodInMethodClass_Setup = -> do
@@ -1491,7 +1646,7 @@ class TestMethod < Test::Unit::TestCase
         begin
           foo(1)
         rescue ArgumentError => e
-          assert_equal "main.rb:#{$line_method}:in 'foo'", e.backtrace.first
+          assert_equal "main.rb:#{$line_method}:in 'Object#foo'", e.backtrace.first
         end
       EOS
     END_OF_BODY
@@ -1755,5 +1910,17 @@ class TestMethod < Test::Unit::TestCase
     RUBY
       assert_equal 0, err.size, err.join("\n")
     end
+
+    assert_in_out_err '-w', <<-'RUBY' do |_out, err, _status|
+      def foo(*, &block) = block
+      def bar(buz, ...) = foo(buz, ...)
+      bar(:test) {} # do not warn because of forwarding
+    RUBY
+      assert_equal 0, err.size, err.join("\n")
+    end
+  end
+
+  def test_unbound_method_ractor_shareable
+    assert Ractor.shareable?(BasicObject.instance_method(:equal?).freeze)
   end
 end

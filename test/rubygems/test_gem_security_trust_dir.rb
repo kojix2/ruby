@@ -7,8 +7,6 @@ unless Gem::HAVE_OPENSSL
 end
 
 class TestGemSecurityTrustDir < Gem::TestCase
-  CHILD_CERT = load_cert "child"
-
   def setup
     super
 
@@ -56,7 +54,7 @@ class TestGemSecurityTrustDir < Gem::TestCase
 
     assert_path_exist trusted
 
-    mask = 0o100600 & (~File.umask)
+    mask = 0o100600 & ~File.umask
 
     assert_equal mask, File.stat(trusted).mode unless Gem.win_platform?
 
@@ -70,7 +68,7 @@ class TestGemSecurityTrustDir < Gem::TestCase
 
     assert_path_exist @dest_dir
 
-    mask = 0o040700 & (~File.umask)
+    mask = 0o040700 & ~File.umask
     mask |= 0o200000 if RUBY_PLATFORM.include?("aix")
 
     assert_equal mask, File.stat(@dest_dir).mode unless Gem.win_platform?
@@ -91,7 +89,7 @@ class TestGemSecurityTrustDir < Gem::TestCase
 
     @trust_dir.verify
 
-    mask = 0o40700 & (~File.umask)
+    mask = 0o40700 & ~File.umask
     mask |= 0o200000 if RUBY_PLATFORM.include?("aix")
 
     assert_equal mask, File.stat(@dest_dir).mode unless Gem.win_platform?

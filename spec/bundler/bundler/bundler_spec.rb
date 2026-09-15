@@ -52,10 +52,10 @@ RSpec.describe Bundler do
         s.description = "Bundler manages an application's dependencies through its entire life, across many machines, systematically and repeatably"
         s.email = ["team@bundler.io"]
         s.homepage = "https://bundler.io"
-        s.metadata = { "bug_tracker_uri" => "https://github.com/rubygems/rubygems/issues?q=is%3Aopen+is%3Aissue+label%3ABundler",
-                       "changelog_uri" => "https://github.com/rubygems/rubygems/blob/master/bundler/CHANGELOG.md",
+        s.metadata = { "bug_tracker_uri" => "https://github.com/ruby/rubygems/issues?q=is%3Aopen+is%3Aissue+label%3ABundler",
+                       "changelog_uri" => "https://github.com/ruby/rubygems/blob/master/bundler/CHANGELOG.md",
                        "homepage_uri" => "https://bundler.io/",
-                       "source_code_uri" => "https://github.com/rubygems/rubygems/tree/master/bundler" }
+                       "source_code_uri" => "https://github.com/ruby/rubygems/tree/master/bundler" }
         s.require_paths = ["lib"]
         s.required_ruby_version = Gem::Requirement.new([">= 2.6.0"])
         s.required_rubygems_version = Gem::Requirement.new([">= 3.0.1"])
@@ -128,6 +128,49 @@ RSpec.describe Bundler do
       expect(subject.loaded_from).to eq(app_gemspec_path.expand_path.to_s)
     end
 
+    context "with a relative path" do
+      before do
+        create_file(tmp("nested/test.gemspec"), <<~GEMSPEC)
+          Gem::Specification.new do |gem|
+            gem.name = "nested"
+            gem.summary = __FILE__
+          end
+        GEMSPEC
+      end
+
+      it "resolves a relative gemspec path against the original working directory" do
+        spec, expanded = Dir.chdir(tmp) do
+          [Bundler.load_gemspec_uncached("nested/test.gemspec"), File.expand_path("nested/test.gemspec")]
+        end
+
+        expect(spec.summary).to eq(expanded)
+        expect(spec.loaded_from).to eq(expanded)
+      end
+    end
+
+    context "with a relative path whose \"..\" crosses a symlink", if: !Gem.win_platform? do
+      before do
+        create_file(tmp("lexical/target.gemspec"), <<~GEMSPEC)
+          Gem::Specification.new do |gem|
+            gem.name = "lexical"
+            gem.summary = __FILE__
+          end
+        GEMSPEC
+        create_file(tmp("lexical/physical/target.gemspec"), "raise \"read the physical path\"")
+        tmp("lexical/physical/elsewhere").mkpath
+        File.symlink(tmp("lexical/physical/elsewhere"), tmp("lexical/link"))
+      end
+
+      it "resolves the path lexically" do
+        spec, expanded = Dir.chdir(tmp("lexical")) do
+          [Bundler.load_gemspec_uncached("link/../target.gemspec"), File.expand_path("link/../target.gemspec")]
+        end
+
+        expect(spec.summary).to eq(expanded)
+        expect(spec.loaded_from).to eq(expanded)
+      end
+    end
+
     context "validate is true" do
       subject { Bundler.load_gemspec_uncached(app_gemspec_path, true) }
 
@@ -164,53 +207,36 @@ RSpec.describe Bundler do
   end
 
   describe "#which" do
-    let(:executable) { "executable" }
+    it "can detect relative path" do
+      script_path = bundled_app("tmp/test_command")
+      create_file(script_path, "#!/usr/bin/env ruby\n")
 
-    let(:path) do
-      if Gem.win_platform?
-        %w[C:/a C:/b C:/c C:/../d C:/e]
-      else
-        %w[/a /b c ../d /e]
+      result = Dir.chdir script_path.dirname.dirname do
+        Bundler.which("test_command")
       end
+      expect(result).to eq(nil)
+
+      result = Dir.chdir script_path.dirname do
+        Bundler.which("test_command")
+      end
+
+      expect(result).to eq("test_command") unless Gem.win_platform?
+      expect(result).to eq("test_command.bat") if Gem.win_platform?
     end
 
-    let(:expected) { "executable" }
+    it "can detect absolute path" do
+      create_file("test_command", "#!/usr/bin/env ruby\n")
 
-    before do
-      ENV["PATH"] = path.join(File::PATH_SEPARATOR)
+      ENV["PATH"] = bundled_app("test_command").parent.to_s
 
-      allow(File).to receive(:file?).and_return(false)
-      allow(File).to receive(:executable?).and_return(false)
-      if expected
-        expect(File).to receive(:file?).with(expected).and_return(true)
-        expect(File).to receive(:executable?).with(expected).and_return(true)
-      end
+      result = Bundler.which("test_command")
+      expect(result).to eq(bundled_app("test_command").to_s) unless Gem.win_platform?
+      expect(result).to eq(bundled_app("test_command.bat").to_s) if Gem.win_platform?
     end
 
-    subject { described_class.which(executable) }
-
-    shared_examples_for "it returns the correct executable" do
-      it "returns the expected file" do
-        expect(subject).to eq(expected)
-      end
-    end
-
-    it_behaves_like "it returns the correct executable"
-
-    context "when the executable in inside a quoted path" do
-      let(:expected) do
-        if Gem.win_platform?
-          "C:/e/executable"
-        else
-          "/e/executable"
-        end
-      end
-      it_behaves_like "it returns the correct executable"
-    end
-
-    context "when the executable is not found" do
-      let(:expected) { nil }
-      it_behaves_like "it returns the correct executable"
+    it "returns nil when not found" do
+      result = Bundler.which("test_command")
+      expect(result).to eq(nil)
     end
   end
 

@@ -22,10 +22,6 @@
 #include <unistd.h>
 #endif
 
-#ifndef O_CLOEXEC
-#  define O_CLOEXEC 0
-#endif
-
 #ifndef USE_OPENDIR_AT
 # if defined(HAVE_FDOPENDIR) && defined(HAVE_DIRFD) && \
     defined(HAVE_OPENAT) && defined(HAVE_FSTATAT)
@@ -35,8 +31,12 @@
 # endif
 #endif
 
-#if USE_OPENDIR_AT
-# include <fcntl.h>
+#ifdef HAVE_FCNTL_H
+#  include <fcntl.h>
+#endif
+
+#ifndef O_CLOEXEC
+#  define O_CLOEXEC 0
 #endif
 
 #undef HAVE_DIRENT_NAMLEN
@@ -504,6 +504,20 @@ fnmatch(
 }
 
 VALUE rb_cDir;
+static VALUE sym_directory, sym_link, sym_file, sym_unknown;
+
+#if defined(DT_BLK) || defined(S_IFBLK)
+static VALUE sym_block_device;
+#endif
+#if defined(DT_CHR) || defined(S_IFCHR)
+static VALUE sym_character_device;
+#endif
+#if defined(DT_FIFO) || defined(S_IFIFO)
+static VALUE sym_fifo;
+#endif
+#if defined(DT_SOCK) || defined(S_IFSOCK)
+static VALUE sym_socket;
+#endif
 
 struct dir_data {
     DIR *dir;
@@ -531,7 +545,7 @@ static const rb_data_type_t dir_data_type = {
         dir_free,
         NULL, // Nothing allocated externally, so don't need a memsize function
     },
-    0, NULL, RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_DECL_MARKING | RUBY_TYPED_EMBEDDABLE
+    0, NULL, RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_DECL_MARKING | RUBY_TYPED_EMBEDDABLE
 };
 
 static VALUE dir_close(VALUE);
@@ -905,12 +919,107 @@ dir_read(VALUE dir)
     }
 }
 
-static VALUE dir_each_entry(VALUE, VALUE (*)(VALUE, VALUE), VALUE, int);
+struct dir_entry_args {
+    struct dir_data *dirp;
+    struct dirent *dp;
+};
+
+static VALUE dir_each_entry(VALUE, VALUE (*)(VALUE, VALUE, struct dir_entry_args *), VALUE, int);
 
 static VALUE
-dir_yield(VALUE arg, VALUE path)
+dir_yield(VALUE arg, VALUE path, struct dir_entry_args *_unused)
 {
     return rb_yield(path);
+}
+
+static int do_lstat(int fd, const char *path, struct stat *pst, int flags, rb_encoding *enc);
+
+static VALUE
+dir_yield_with_type(VALUE arg, VALUE path, struct dir_entry_args *dir_entry)
+{
+    VALUE type;
+    switch (dir_entry->dp->d_type) {
+#ifdef DT_BLK
+      case DT_BLK:
+        type = sym_block_device;
+        break;
+#endif
+#ifdef DT_CHR
+      case DT_CHR:
+        type = sym_character_device;
+        break;
+#endif
+      case DT_DIR:
+        type = sym_directory;
+        break;
+#ifdef DT_FIFO
+      case DT_FIFO:
+        type = sym_fifo;
+        break;
+#endif
+      case DT_LNK:
+        type = sym_link;
+        break;
+      case DT_REG:
+        type = sym_file;
+        break;
+#ifdef DT_SOCK
+      case DT_SOCK:
+        type = sym_socket;
+        break;
+#endif
+      default:
+        type = sym_unknown;
+        break;
+    }
+
+#ifdef HAVE_DIRFD
+    if (RUBY_DEBUG || RB_UNLIKELY(type == sym_unknown)) {
+        struct stat st;
+        if (do_lstat(dirfd(dir_entry->dirp->dir), dir_entry->dp->d_name, &st, 0, rb_filesystem_encoding()) == 0) {
+            switch (st.st_mode & S_IFMT) {
+              case S_IFDIR:
+                type = sym_directory;
+                break;
+              case S_IFLNK:
+                type = sym_link;
+                break;
+              case S_IFREG:
+                type = sym_file;
+                break;
+#ifdef S_IFSOCK
+              case S_IFSOCK:
+                type = sym_socket;
+                break;
+#endif
+#ifdef S_IFIFO
+              case S_IFIFO:
+                type = sym_fifo;
+                break;
+#endif
+#ifdef S_IFBLK
+              case S_IFBLK:
+                type = sym_block_device;
+                break;
+#endif
+#ifdef S_IFCHR
+              case S_IFCHR:
+                type = sym_character_device;
+                break;
+#endif
+              default:
+                break;
+            }
+        }
+    }
+#endif // HAVE_DIRFD
+
+    if (NIL_P(arg)) {
+        return rb_yield_values(2, path, type);
+    }
+    else {
+        return rb_ary_push(arg, rb_assoc_new(path, type));
+    }
 }
 
 /*
@@ -940,7 +1049,7 @@ dir_each(VALUE dir)
 }
 
 static VALUE
-dir_each_entry(VALUE dir, VALUE (*each)(VALUE, VALUE), VALUE arg, int children_only)
+dir_each_entry(VALUE dir, VALUE (*each)(VALUE, VALUE, struct dir_entry_args *), VALUE arg, int children_only)
 {
     struct dir_data *dirp;
     struct dirent *dp;
@@ -966,7 +1075,11 @@ dir_each_entry(VALUE dir, VALUE (*each)(VALUE, VALUE), VALUE arg, int children_o
         else
 #endif
         path = rb_external_str_new_with_enc(name, namlen, dirp->enc);
-        (*each)(arg, path);
+        struct dir_entry_args each_args = {
+            .dirp = dirp,
+            .dp = dp,
+        };
+        (*each)(arg, path, &each_args);
     }
     return dir;
 }
@@ -1472,24 +1585,58 @@ dir_chdir(VALUE dir)
 #endif
 }
 
+static VALUE last_cwd;
+
 #ifndef _WIN32
+static VALUE
+getcwd_to_str(VALUE arg)
+{
+    const char *path = (const char *)arg;
+#ifdef __APPLE__
+    return rb_str_normalize_ospath(path, strlen(path));
+#else
+    return rb_str_new2(path);
+#endif
+}
+
+static VALUE
+getcwd_xfree(VALUE arg)
+{
+    xfree((void *)arg);
+    return Qnil;
+}
+
+static VALUE
+rb_dir_getwd_ospath_slowpath(void)
+{
+    char *path = ruby_getcwd();
+    return rb_ensure(getcwd_to_str, (VALUE)path, getcwd_xfree, (VALUE)path);
+}
+
 VALUE
 rb_dir_getwd_ospath(void)
 {
-    char *path;
-    VALUE cwd;
-    VALUE path_guard;
+    char buf[PATH_MAX < LONG_MAX ? PATH_MAX : -1];
+    char *path = getcwd(buf, PATH_MAX);
+    if (!path) {
+        return rb_dir_getwd_ospath_slowpath();
+    }
+    size_t len = strlen(path);
+    RBIMPL_ASSERT_OR_ASSUME(len < PATH_MAX);
 
-    path_guard = rb_imemo_tmpbuf_auto_free_pointer();
-    path = ruby_getcwd();
-    rb_imemo_tmpbuf_set_ptr(path_guard, path);
+    VALUE cached_cwd = RUBY_ATOMIC_VALUE_LOAD(last_cwd);
+
+    if (!cached_cwd || (size_t)RSTRING_LEN(cached_cwd) != len ||
+        memcmp(RSTRING_PTR(cached_cwd), path, len) != 0) {
 #ifdef __APPLE__
-    cwd = rb_str_normalize_ospath(path, strlen(path));
+        cached_cwd = rb_str_normalize_ospath(path, (long)len);
 #else
-    cwd = rb_str_new2(path);
+        cached_cwd = rb_str_new(path, (long)len);
 #endif
-    rb_free_tmp_buffer(&path_guard);
-    return cwd;
+        rb_str_freeze(cached_cwd);
+        RUBY_ATOMIC_VALUE_SET(last_cwd, cached_cwd);
+    }
+    return cached_cwd;
 }
 #endif
 
@@ -1498,7 +1645,7 @@ rb_dir_getwd(void)
 {
     rb_encoding *fs = rb_filesystem_encoding();
     int fsenc = rb_enc_to_index(fs);
-    VALUE cwd = rb_dir_getwd_ospath();
+    VALUE cwd = rb_str_new_shared(rb_dir_getwd_ospath());
 
     switch (fsenc) {
       case ENCINDEX_US_ASCII:
@@ -1600,15 +1747,16 @@ nogvl_mkdir(void *ptr)
  *
  * Creates a directory in the underlying file system
  * at +dirpath+ with the given +permissions+;
- * returns zero:
+ * see {File Permissions}[rdoc-ref:File@File+Permissions]:
  *
  *   Dir.mkdir('foo')
- *   File.stat(Dir.new('foo')).mode.to_s(8)[1..4] # => "0755"
+ *   File.stat(Dir.new('foo')).mode.to_s(8) # => "40775"
  *   Dir.mkdir('bar', 0644)
- *   File.stat(Dir.new('bar')).mode.to_s(8)[1..4] # => "0644"
+ *   File.stat(Dir.new('bar')).mode.to_s(8) # => "40644"
+ *   Dir.rmdir('foo')
+ *   Dir.rmdir('bar')
  *
- * See {File Permissions}[rdoc-ref:File@File+Permissions].
- * Note that argument +permissions+ is ignored on Windows.
+ * Argument +permissions+ is ignored on Windows.
  */
 static VALUE
 dir_s_mkdir(int argc, VALUE *argv, VALUE obj)
@@ -1804,7 +1952,7 @@ nogvl_stat(void *args)
 
 /* System call with warning */
 static int
-do_stat(int fd, size_t baselen, const char *path, struct stat *pst, int flags, rb_encoding *enc)
+do_stat(int fd, const char *path, struct stat *pst, int flags, rb_encoding *enc)
 {
 #if USE_OPENDIR_AT
     struct fstatat_args args;
@@ -1836,7 +1984,7 @@ nogvl_lstat(void *args)
 #endif
 
 static int
-do_lstat(int fd, size_t baselen, const char *path, struct stat *pst, int flags, rb_encoding *enc)
+do_lstat(int fd, const char *path, struct stat *pst, int flags, rb_encoding *enc)
 {
 #if USE_OPENDIR_AT
     struct fstatat_args args;
@@ -2659,8 +2807,10 @@ glob_opendir(ruby_glob_entries_t *ent, DIR *dirp, int flags, rb_encoding *enc)
             }
             if (count >= capacity) {
                 capacity += 256;
-                if (!(newp = GLOB_REALLOC_N(ent->sort.entries, capacity)))
+                if (!(newp = GLOB_REALLOC_N(ent->sort.entries, capacity))) {
+                    GLOB_FREE(rdp);
                     goto nomem;
+                }
                 ent->sort.entries = newp;
             }
             ent->sort.entries[count++] = rdp;
@@ -2779,7 +2929,7 @@ glob_helper(
 
     if (*path) {
         if (match_all && pathtype == path_unknown) {
-            if (do_lstat(fd, baselen, path, &st, flags, enc) == 0) {
+            if (do_lstat(fd, path, &st, flags, enc) == 0) {
                 pathtype = IFTODT(st.st_mode);
             }
             else {
@@ -2787,7 +2937,7 @@ glob_helper(
             }
         }
         if (match_dir && (pathtype == path_unknown || pathtype == path_symlink)) {
-            if (do_stat(fd, baselen, path, &st, flags, enc) == 0) {
+            if (do_stat(fd, path, &st, flags, enc) == 0) {
                 pathtype = IFTODT(st.st_mode);
             }
             else {
@@ -2915,7 +3065,7 @@ glob_helper(
             if (recursive && dotfile < ((flags & FNM_DOTMATCH) ? 2 : 1) &&
                 new_pathtype == path_unknown) {
                 /* RECURSIVE never match dot files unless FNM_DOTMATCH is set */
-                if (do_lstat(fd, baselen, buf, &st, flags, enc) == 0)
+                if (do_lstat(fd, buf, &st, flags, enc) == 0)
                     new_pathtype = IFTODT(st.st_mode);
                 else
                     new_pathtype = path_noent;
@@ -3471,10 +3621,16 @@ dir_foreach(int argc, VALUE *argv, VALUE io)
 }
 
 static VALUE
+dir_entry_ary_push(VALUE ary, VALUE entry, struct dir_entry_args *_unused)
+{
+    return rb_ary_push(ary, entry);
+}
+
+static VALUE
 dir_collect(VALUE dir)
 {
     VALUE ary = rb_ary_new();
-    dir_each_entry(dir, rb_ary_push, ary, FALSE);
+    dir_each_entry(dir, dir_entry_ary_push, ary, FALSE);
     return ary;
 }
 
@@ -3569,8 +3725,45 @@ static VALUE
 dir_collect_children(VALUE dir)
 {
     VALUE ary = rb_ary_new();
-    dir_each_entry(dir, rb_ary_push, ary, TRUE);
+    dir_each_entry(dir, dir_entry_ary_push, ary, TRUE);
     return ary;
+}
+
+/*
+ * call-seq:
+ *   scan -> entries
+ *   scan {|entry_name, entry_type| ... } -> nil
+ *
+ * Scans the entries in +self+, except for <tt>'.'</tt> and <tt>'..'</tt>.
+ *
+ * With no block given, returns +entries+, an array of 2-element arrays.
+ * Each nested array contains an entry name and its type:
+ *
+ *   dir = Dir.new('/example')
+ *   dir.scan # => [["config.h", :file], ["lib", :directory], ["main.rb", :file]]
+ *
+ * With a block given, calls the block with each entry name and its type;
+ * returns +nil+:
+ *
+ *   entries = []
+ *   dir.scan do |entry_name, entry_type|
+ *     entries << [entry_name, entry_type]
+ *   end # => nil
+ *   entries # => [["config.h", :file], ["lib", :directory], ["main.rb", :file]]
+ *
+ */
+static VALUE
+dir_scan_children(VALUE dir)
+{
+    if (rb_block_given_p()) {
+        dir_each_entry(dir, dir_yield_with_type, Qnil, TRUE);
+        return Qnil;
+    }
+    else {
+        VALUE ary = rb_ary_new();
+        dir_each_entry(dir, dir_yield_with_type, ary, TRUE);
+        return ary;
+    }
 }
 
 /*
@@ -3599,6 +3792,51 @@ dir_s_children(int argc, VALUE *argv, VALUE io)
 
     dir = dir_open_dir(argc, argv);
     return rb_ensure(dir_collect_children, dir, dir_close, dir);
+}
+
+/*
+ * call-seq:
+ *   Dir.scan(dirpath) -> entries
+ *   Dir.scan(dirpath, encoding: 'UTF-8') -> entries
+ *   Dir.scan(dirpath) {|entry_name, entry_type| ... } -> nil
+ *   Dir.scan(dirpath, encoding: 'UTF-8') {|entry_name, entry_type| ... } -> nil
+ *
+ * Scans the entries in the directory at +dirpath+, except for <tt>'.'</tt>
+ * and <tt>'..'</tt>.
+ *
+ * With no block given, returns +entries+, an array of 2-element arrays.
+ * Each nested array contains an entry name and its type:
+ *
+ *   Dir.scan('/example') # => [["config.h", :file], ["lib", :directory], ["main.rb", :file]]
+ *
+ * With a block given, calls the block with each entry name and its type;
+ * returns +nil+:
+ *
+ *   entries = []
+ *   Dir.scan('/example') do |entry_name, entry_type|
+ *     entries << [entry_name, entry_type]
+ *   end # => nil
+ *   entries # => [["config.h", :file], ["lib", :directory], ["main.rb", :file]]
+ *
+ * The type symbol is one of +:file+, +:directory+, +:characterSpecial+,
+ * +:blockSpecial+, +:fifo+, +:link+, +:socket+, or +:unknown+.
+ *
+ * The given +encoding+ is used as the external encoding for each entry name:
+ *
+ *   Dir.scan('/example').first.first.encoding
+ *   # => #<Encoding:UTF-8>
+ *   Dir.scan('/example', encoding: 'US-ASCII').first.first.encoding
+ *   # => #<Encoding:US-ASCII>
+ *
+ * See {String Encoding}[rdoc-ref:encodings.rdoc@String+Encoding].
+ *
+ * Raises an exception if the directory does not exist.
+ */
+static VALUE
+dir_s_scan(int argc, VALUE *argv, VALUE klass)
+{
+    VALUE dir = dir_open_dir(argc, argv);
+    return rb_ensure(dir_scan_children, dir, dir_close, dir);
 }
 
 static int
@@ -3804,8 +4042,27 @@ rb_dir_s_empty_p(VALUE obj, VALUE dirname)
 void
 Init_Dir(void)
 {
+    sym_directory = ID2SYM(rb_intern("directory"));
+    sym_link = ID2SYM(rb_intern("link"));
+    sym_file = ID2SYM(rb_intern("file"));
+    sym_unknown = ID2SYM(rb_intern("unknown"));
+
+#if defined(DT_BLK) || defined(S_IFBLK)
+    sym_block_device = ID2SYM(rb_intern("blockSpecial"));
+#endif
+#if defined(DT_CHR) || defined(S_IFCHR)
+    sym_character_device = ID2SYM(rb_intern("characterSpecial"));
+#endif
+#if defined(DT_FIFO) || defined(S_IFIFO)
+    sym_fifo = ID2SYM(rb_intern("fifo"));
+#endif
+#if defined(DT_SOCK) || defined(S_IFSOCK)
+    sym_socket = ID2SYM(rb_intern("socket"));
+#endif
+
     rb_gc_register_address(&chdir_lock.path);
     rb_gc_register_address(&chdir_lock.thread);
+    rb_gc_register_address(&last_cwd);
 
     rb_cDir = rb_define_class("Dir", rb_cObject);
 
@@ -3817,6 +4074,7 @@ Init_Dir(void)
     rb_define_singleton_method(rb_cDir, "entries", dir_entries, -1);
     rb_define_singleton_method(rb_cDir, "each_child", dir_s_each_child, -1);
     rb_define_singleton_method(rb_cDir, "children", dir_s_children, -1);
+    rb_define_singleton_method(rb_cDir, "scan", dir_s_scan, -1);
 
     rb_define_method(rb_cDir,"fileno", dir_fileno, 0);
     rb_define_method(rb_cDir,"path", dir_path, 0);
@@ -3826,6 +4084,7 @@ Init_Dir(void)
     rb_define_method(rb_cDir,"each", dir_each, 0);
     rb_define_method(rb_cDir,"each_child", dir_each_child_m, 0);
     rb_define_method(rb_cDir,"children", dir_collect_children, 0);
+    rb_define_method(rb_cDir,"scan", dir_scan_children, 0);
     rb_define_method(rb_cDir,"rewind", dir_rewind, 0);
     rb_define_method(rb_cDir,"tell", dir_tell, 0);
     rb_define_method(rb_cDir,"seek", dir_seek, 1);
@@ -3851,26 +4110,19 @@ Init_Dir(void)
     rb_define_singleton_method(rb_cFile,"fnmatch", file_s_fnmatch, -1);
     rb_define_singleton_method(rb_cFile,"fnmatch?", file_s_fnmatch, -1);
 
-    /* Document-const: FNM_NOESCAPE
-     * {File::FNM_NOESCAPE}[rdoc-ref:File::Constants@File-3A-3AFNM_NOESCAPE] */
+    /* {File::FNM_NOESCAPE}[rdoc-ref:File::Constants@File-3A-3AFNM_NOESCAPE] */
     rb_file_const("FNM_NOESCAPE", INT2FIX(FNM_NOESCAPE));
-    /* Document-const: FNM_PATHNAME
-     * {File::FNM_PATHNAME}[rdoc-ref:File::Constants@File-3A-3AFNM_PATHNAME] */
+    /* {File::FNM_PATHNAME}[rdoc-ref:File::Constants@File-3A-3AFNM_PATHNAME] */
     rb_file_const("FNM_PATHNAME", INT2FIX(FNM_PATHNAME));
-    /* Document-const: FNM_DOTMATCH
-     * {File::FNM_DOTMATCH}[rdoc-ref:File::Constants@File-3A-3AFNM_DOTMATCH] */
+    /* {File::FNM_DOTMATCH}[rdoc-ref:File::Constants@File-3A-3AFNM_DOTMATCH] */
     rb_file_const("FNM_DOTMATCH", INT2FIX(FNM_DOTMATCH));
-    /* Document-const: FNM_CASEFOLD
-     * {File::FNM_CASEFOLD}[rdoc-ref:File::Constants@File-3A-3AFNM_CASEFOLD] */
+    /* {File::FNM_CASEFOLD}[rdoc-ref:File::Constants@File-3A-3AFNM_CASEFOLD] */
     rb_file_const("FNM_CASEFOLD", INT2FIX(FNM_CASEFOLD));
-    /* Document-const: FNM_EXTGLOB
-     * {File::FNM_EXTGLOB}[rdoc-ref:File::Constants@File-3A-3AFNM_EXTGLOB] */
+    /* {File::FNM_EXTGLOB}[rdoc-ref:File::Constants@File-3A-3AFNM_EXTGLOB] */
     rb_file_const("FNM_EXTGLOB", INT2FIX(FNM_EXTGLOB));
-    /* Document-const: FNM_SYSCASE
-     * {File::FNM_SYSCASE}[rdoc-ref:File::Constants@File-3A-3AFNM_SYSCASE] */
+    /* {File::FNM_SYSCASE}[rdoc-ref:File::Constants@File-3A-3AFNM_SYSCASE] */
     rb_file_const("FNM_SYSCASE", INT2FIX(FNM_SYSCASE));
-    /* Document-const: FNM_SHORTNAME
-     * {File::FNM_SHORTNAME}[rdoc-ref:File::Constants@File-3A-3AFNM_SHORTNAME] */
+    /* {File::FNM_SHORTNAME}[rdoc-ref:File::Constants@File-3A-3AFNM_SHORTNAME] */
     rb_file_const("FNM_SHORTNAME", INT2FIX(FNM_SHORTNAME));
 }
 

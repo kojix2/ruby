@@ -542,15 +542,20 @@ EOS
       [:drop_while, selector],
       [:uniq, nil],
       [:uniq, proc{|x| x.odd?}],
-    ].each do |args|
-      block = args.pop
+    ].each do |*args, block|
       assert_equal [1, 2, 3].to_enum.to_enum(*args).first(2).to_a, [1, 2, 3].to_enum.lazy.to_enum(*args).first(2).to_a
       assert_equal (0..50).to_enum.to_enum(*args).first(2).to_a, (0..50000).to_enum.lazy.to_enum(*args).first(2).to_a
       if block
         assert_equal [1, 2, 3, 4].to_enum.to_enum(*args).map(&block).first(2).to_a, [1, 2, 3, 4].to_enum.lazy.to_enum(*args).map(&block).first(2).to_a
-        unless args.first == :take_while || args.first == :drop_while
+        case args.first
+        when :take_while, :drop_while, "take_while", "drop_while"
+        else
           assert_equal (0..50).to_enum.to_enum(*args).map(&block).first(2).to_a, (0..50000).to_enum.lazy.to_enum(*args).map(&block).first(2).to_a
         end
+      end
+      if Symbol === args.first
+        args.unshift(args.shift.name)
+        redo
       end
     end
   end
@@ -608,7 +613,7 @@ EOS
   end
 
   def test_require_block
-    %i[select reject drop_while take_while map flat_map].each do |method|
+    %i[select reject drop_while take_while map flat_map tap_each].each do |method|
       assert_raise(ArgumentError){ [].lazy.send(method) }
     end
   end
@@ -714,5 +719,24 @@ EOS
 
   def test_with_index_size
     assert_equal(3, Enumerator::Lazy.new([1, 2, 3], 3){|y, v| y << v}.with_index.size)
+  end
+
+  def test_tap_each
+    out = []
+
+    e = (1..Float::INFINITY).lazy
+                            .tap_each { |x| out << x }
+                            .select(&:even?)
+                            .first(5)
+
+    assert_equal([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], out)
+    assert_equal([2, 4, 6, 8, 10], e)
+  end
+
+  def test_tap_each_is_not_intrusive
+    s = Step.new(1..3)
+
+    assert_equal(2, s.lazy.tap_each { |x| x }.map { |x| x * 2 }.first)
+    assert_equal(1, s.current)
   end
 end

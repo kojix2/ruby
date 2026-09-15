@@ -60,14 +60,12 @@ describe "Hash literal" do
     @h.should == {1000 => :foo}
   end
 
-  ruby_version_is "3.1" do
-    it "checks duplicated float keys on initialization" do
-      -> {
-        @h = eval "{1.0 => :bar, 1.0 => :foo}"
-      }.should complain(/key 1.0 is duplicated|duplicated key/)
-      @h.keys.size.should == 1
-      @h.should == {1.0 => :foo}
-    end
+  it "checks duplicated float keys on initialization" do
+    -> {
+      @h = eval "{1.0 => :bar, 1.0 => :foo}"
+    }.should complain(/key 1.0 is duplicated|duplicated key/)
+    @h.keys.size.should == 1
+    @h.should == {1.0 => :foo}
   end
 
   it "accepts a hanging comma" do
@@ -77,37 +75,37 @@ describe "Hash literal" do
   end
 
   it "recognizes '=' at the end of the key" do
-    eval("{:a==>1}").should == {:"a=" => 1}
-    eval("{:a= =>1}").should == {:"a=" => 1}
-    eval("{:a= => 1}").should == {:"a=" => 1}
+    {:a==>1}.should == {:"a=" => 1}
+    {:a= =>1}.should == {:"a=" => 1}
+    {:a= => 1}.should == {:"a=" => 1}
   end
 
   it "with '==>' in the middle raises SyntaxError" do
-    -> { eval("{:a ==> 1}") }.should raise_error(SyntaxError)
+    -> { eval("{:a ==> 1}") }.should.raise(SyntaxError)
   end
 
   it "recognizes '!' at the end of the key" do
-    eval("{:a! =>1}").should == {:"a!" => 1}
-    eval("{:a! => 1}").should == {:"a!" => 1}
+    {:a! =>1}.should == {:"a!" => 1}
+    {:a! => 1}.should == {:"a!" => 1}
 
-    eval("{a!:1}").should == {:"a!" => 1}
-    eval("{a!: 1}").should == {:"a!" => 1}
+    {a!:1}.should == {:"a!" => 1}
+    {a!: 1}.should == {:"a!" => 1}
   end
 
   it "raises a SyntaxError if there is no space between `!` and `=>`" do
-    -> { eval("{:a!=> 1}") }.should raise_error(SyntaxError)
+    -> { eval("{:a!=> 1}") }.should.raise(SyntaxError)
   end
 
   it "recognizes '?' at the end of the key" do
-    eval("{:a? =>1}").should == {:"a?" => 1}
-    eval("{:a? => 1}").should == {:"a?" => 1}
+    {:a? =>1}.should == {:"a?" => 1}
+    {:a? => 1}.should == {:"a?" => 1}
 
-    eval("{a?:1}").should == {:"a?" => 1}
-    eval("{a?: 1}").should == {:"a?" => 1}
+    {a?:1}.should == {:"a?" => 1}
+    {a?: 1}.should == {:"a?" => 1}
   end
 
   it "raises a SyntaxError if there is no space between `?` and `=>`" do
-    -> { eval("{:a?=> 1}") }.should raise_error(SyntaxError)
+    -> { eval("{:a?=> 1}") }.should.raise(SyntaxError)
   end
 
   it "constructs a new hash with the given elements" do
@@ -129,7 +127,7 @@ describe "Hash literal" do
 
   it "accepts mixed 'key: value', 'key => value' and '\"key\"': value' syntax" do
     h = {:a => 1, :b => 2, "c" => 3, :d => 4}
-    eval('{a: 1, :b => 2, "c" => 3, "d": 4}').should == h
+    {a: 1, :b => 2, "c" => 3, "d": 4}.should == h
   end
 
   it "expands an '**{}' element into the containing Hash literal initialization" do
@@ -149,6 +147,37 @@ describe "Hash literal" do
     {**h, a: 1}.should == {b: 2, c: 3, a: 1}
     {a: 1, **h}.should == {a: 1, b: 2, c: 3}
     {a: 1, **h, c: 4}.should == {a: 1, b: 2, c: 4}
+  end
+
+  ruby_version_is ""..."3.4" do
+    it "does not expand nil using ** into {} and raises TypeError" do
+      h = nil
+      -> { {a: 1, **h} }.should.raise(TypeError, "no implicit conversion of nil into Hash")
+
+      -> { {a: 1, **nil} }.should.raise(TypeError, "no implicit conversion of nil into Hash")
+    end
+  end
+
+  ruby_version_is "3.4" do
+    it "expands nil using ** into {}" do
+      h = nil
+      {**h}.should == {}
+      {a: 1, **h}.should == {a: 1}
+
+      {**nil}.should == {}
+      {a: 1, **nil}.should == {a: 1}
+    end
+
+    it "expands nil using ** into {} and provides a copy to the callable" do
+      ScratchPad.record []
+      insert = -> key, **kw do
+        kw[key] = 1
+        ScratchPad << kw
+      end
+      insert.call(:foo, **nil)
+      insert.call(:bar, **nil)
+      ScratchPad.recorded.should == [{ foo: 1 }, { bar: 1 }]
+    end
   end
 
   it "expands an '**{}' or '**obj' element with the last key/value pair taking precedence" do
@@ -194,13 +223,13 @@ describe "Hash literal" do
     obj = mock("hash splat")
     obj.should_receive(:to_hash).and_return(obj)
 
-    -> { {**obj} }.should raise_error(TypeError)
+    -> { {**obj} }.should.raise(TypeError)
   end
 
   it "raises a TypeError if the object does not respond to #to_hash" do
     obj = 42
-    -> { {**obj} }.should raise_error(TypeError)
-    -> { {a: 1, **obj} }.should raise_error(TypeError)
+    -> { {**obj} }.should.raise(TypeError)
+    -> { {a: 1, **obj} }.should.raise(TypeError)
   end
 
   it "does not change encoding of literal string keys during creation" do
@@ -220,7 +249,7 @@ describe "Hash literal" do
       ScratchPad.record []
       -> {
         eval 'ScratchPad << 1; {:"\xC3" => 1}'
-      }.should raise_error(SyntaxError, /invalid symbol/)
+      }.should.raise(SyntaxError, /invalid symbol/)
       ScratchPad.recorded.should == []
     end
 
@@ -228,7 +257,7 @@ describe "Hash literal" do
       ScratchPad.record []
       -> {
         eval 'ScratchPad << 1; {"\xC3": 1}'
-      }.should raise_error(SyntaxError, /invalid symbol/)
+      }.should.raise(SyntaxError, /invalid symbol/)
       ScratchPad.recorded.should == []
     end
   end
@@ -246,63 +275,59 @@ describe "The ** operator" do
     h.should == { one: 1, two: 2 }
   end
 
-  ruby_bug "#20012", ""..."3.3" do
-    it "makes a copy when calling a method taking a positional Hash" do
-      def m(h)
-        h.delete(:one); h
-      end
-
-      h = { one: 1, two: 2 }
-      m(**h).should == { two: 2 }
-      m(**h).should_not.equal?(h)
-      h.should == { one: 1, two: 2 }
+  it "makes a copy when calling a method taking a positional Hash" do
+    def m(h)
+      h.delete(:one); h
     end
+
+    h = { one: 1, two: 2 }
+    m(**h).should == { two: 2 }
+    m(**h).should_not.equal?(h)
+    h.should == { one: 1, two: 2 }
   end
 
-  ruby_version_is "3.1" do
-    describe "hash with omitted value" do
-      it "accepts short notation 'key' for 'key: value' syntax" do
-        a, b, c = 1, 2, 3
-        h = eval('{a:}')
-        {a: 1}.should == h
-        h = eval('{a:, b:, c:}')
-        {a: 1, b: 2, c: 3}.should == h
-      end
+  describe "hash with omitted value" do
+    it "accepts short notation 'key' for 'key: value' syntax" do
+      a, b, c = 1, 2, 3
+      h = {a:}
+      {a: 1}.should == h
+      h = {a:, b:, c:}
+      {a: 1, b: 2, c: 3}.should == h
+    end
 
-      it "ignores hanging comma on short notation" do
-        a, b, c = 1, 2, 3
-        h = eval('{a:, b:, c:,}')
-        {a: 1, b: 2, c: 3}.should == h
-      end
+    it "ignores hanging comma on short notation" do
+      a, b, c = 1, 2, 3
+      h = {a:, b:, c:,}
+      {a: 1, b: 2, c: 3}.should == h
+    end
 
-      it "accepts mixed syntax" do
-        a, e = 1, 5
-        h = eval('{a:, b: 2, "c" => 3, :d => 4, e:}')
-        eval('{a: 1, :b => 2, "c" => 3, "d": 4, e: 5}').should == h
-      end
+    it "accepts mixed syntax" do
+      a, e = 1, 5
+      h = {a:, b: 2, "c" => 3, :d => 4, e:}
+      {a: 1, :b => 2, "c" => 3, "d": 4, e: 5}.should == h
+    end
 
-      it "works with methods and local vars" do
-        a = Class.new
-        a.class_eval(<<-RUBY)
-          def bar
-            "baz"
-          end
+    it "works with methods and local vars" do
+      a = Class.new
+      a.class_eval(<<-RUBY)
+        def bar
+          "baz"
+        end
 
-          def foo(val)
-            {bar:, val:}
-          end
-        RUBY
+        def foo(val)
+          {bar:, val:}
+        end
+      RUBY
 
-        a.new.foo(1).should == {bar: "baz", val: 1}
-      end
+      a.new.foo(1).should == {bar: "baz", val: 1}
+    end
 
-      it "raises a SyntaxError when the hash key ends with `!`" do
-        -> { eval("{a!:}") }.should raise_error(SyntaxError, /identifier a! is not valid to get/)
-      end
+    it "raises a SyntaxError when the hash key ends with `!`" do
+      -> { eval("{a!:}") }.should.raise(SyntaxError, /identifier a! is not valid to get/)
+    end
 
-      it "raises a SyntaxError when the hash key ends with `?`" do
-        -> { eval("{a?:}") }.should raise_error(SyntaxError, /identifier a\? is not valid to get/)
-      end
+    it "raises a SyntaxError when the hash key ends with `?`" do
+      -> { eval("{a?:}") }.should.raise(SyntaxError, /identifier a\? is not valid to get/)
     end
   end
 end

@@ -19,9 +19,9 @@ describe "Module#deprecate_constant" do
       -> {
         value = @module::PUBLIC1
       }.should complain(/warning: constant .+::PUBLIC1 is deprecated/)
-      value.should equal(@value)
+      value.should.equal?(@value)
 
-      -> { @module::PRIVATE }.should raise_error(NameError)
+      -> { @module::PRIVATE }.should.raise(NameError)
     end
 
     it "warns with a message" do
@@ -44,6 +44,15 @@ describe "Module#deprecate_constant" do
     end
   end
 
+  ruby_bug '#20900', ''...'3.4' do
+    describe "when removing the deprecated module" do
+      it "warns with a message" do
+        @module.deprecate_constant :PUBLIC1
+        -> { @module.module_eval {remove_const :PUBLIC1} }.should complain(/warning: constant .+::PUBLIC1 is deprecated/)
+      end
+    end
+  end
+
   it "accepts multiple symbols and strings as constant names" do
     @module.deprecate_constant "PUBLIC1", :PUBLIC2
 
@@ -52,10 +61,10 @@ describe "Module#deprecate_constant" do
   end
 
   it "returns self" do
-    @module.deprecate_constant(:PUBLIC1).should equal(@module)
+    @module.deprecate_constant(:PUBLIC1).should.equal?(@module)
   end
 
   it "raises a NameError when given an undefined name" do
-    -> { @module.deprecate_constant :UNDEFINED }.should raise_error(NameError)
+    -> { @module.deprecate_constant :UNDEFINED }.should.raise(NameError)
   end
 end

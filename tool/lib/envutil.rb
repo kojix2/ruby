@@ -43,6 +43,16 @@ module EnvUtil
 
   RUBYLIB = ENV["RUBYLIB"]
 
+  # Ruby::Box prints this at startup of every child process when RUBY_BOX=1
+  # is inherited from the environment.
+  BOX_EXPERIMENTAL_WARNING = /^.*: warning: Ruby::Box is experimental, and the behavior may change in the future!\nSee https:\/\/docs\.ruby-lang\.org\/\S+ for known issues, etc\.\n/
+
+  def strip_box_warning(str)
+    # on the bytes, since captured output is not always valid in its encoding
+    str.b.gsub(BOX_EXPERIMENTAL_WARNING, "").force_encoding(str.encoding) if str
+  end
+  module_function :strip_box_warning
+
   class << self
     attr_accessor :timeout_scale
     attr_reader :original_internal_encoding, :original_external_encoding,
@@ -63,6 +73,14 @@ module EnvUtil
     end
   end
 
+  if RUBY_ENGINE == "truffleruby"
+    # Tests relying on timeout have high variance on TruffleRuby due to the highly-optimizing JIT, deoptimization, profiling interpreter, different GC, etc.
+    # Setting a default timeout scale helps avoid transient failures for tests relying on timeouts.
+    # We choose 10 because it is the same number used in CRuby CI on macOS:
+    # https://github.com/ruby/ruby/blob/9d46b0c735877f152a0b4b16b8153c6f395dee28/.github/workflows/macos.yml#L133
+    self.timeout_scale = 10
+  end
+
   def apply_timeout_scale(t)
     if scale = EnvUtil.timeout_scale
       t * scale
@@ -79,6 +97,75 @@ module EnvUtil
   end
   module_function :timeout
 
+  class Debugger
+    @list = []
+
+    attr_accessor :name
+
+    def self.register(name, &block)
+      @list << new(name, &block)
+    end
+
+    def initialize(name, &block)
+      @name = name
+      instance_eval(&block)
+    end
+
+    def usable?; false; end
+
+    def start(pid, *args) end
+
+    def dump(pid, timeout: 60, reprieve: timeout&.div(4))
+      dpid = start(pid, *command_file(File.join(__dir__, "dump.#{name}")), out: :err)
+    rescue Errno::ENOENT
+      return
+    else
+      return unless dpid
+      [[timeout, :TERM], [reprieve, :KILL]].find do |t, sig|
+        begin
+          return EnvUtil.timeout(t) {Process.wait(dpid)}
+        rescue Timeout::Error
+          Process.kill(sig, dpid)
+        end
+      end
+      true
+    end
+
+    # sudo -n: --non-interactive
+    PRECOMMAND = (%[sudo -n] if /darwin/ =~ RUBY_PLATFORM)
+
+    def spawn(*args, **opts)
+      super(*PRECOMMAND, *args, **opts)
+    end
+
+    register("gdb") do
+      class << self
+        def usable?; system(*%w[gdb --batch --quiet --nx -ex exit], out: IO::NULL, err: IO::NULL); end
+        def start(pid, *args, **opts)
+          spawn(*%W[gdb --batch --quiet --pid #{pid}], *args, **opts)
+        end
+        def command_file(file) "--command=#{file}"; end
+      end
+    end
+
+    register("lldb") do
+      class << self
+        def usable?; system(*%w[lldb -Q --no-lldbinit -o exit], out: IO::NULL, err: IO::NULL); end
+        def start(pid, *args, **opts)
+          spawn(*%W[lldb --batch -Q --attach-pid #{pid}], *args, **opts)
+        end
+        def command_file(file) ["--source", file]; end
+      end
+    end
+
+    def self.search
+      # Cache the result even when no debugger is available, not to probe
+      # unusable debuggers repeatedly.
+      return @debugger if defined?(@debugger)
+      @debugger = @list.find(&:usable?)
+    end
+  end
+
   def terminate(pid, signal = :TERM, pgroup = nil, reprieve = 1)
     reprieve = apply_timeout_scale(reprieve) if reprieve
 
@@ -94,17 +181,12 @@ module EnvUtil
       pgroup = pid
     end
 
-    lldb = true if /darwin/ =~ RUBY_PLATFORM
-
+    dumped = false
     while signal = signals.shift
 
-      if lldb and [:ABRT, :KILL].include?(signal)
-        lldb = false
-        # sudo -n: --non-interactive
-        # lldb -p: attach
-        #      -o: run command
-        system(*%W[sudo -n lldb -p #{pid} --batch -o bt\ all -o call\ rb_vmdebug_stack_dump_all_threads() -o quit])
-        true
+      if !dumped and [:ABRT, :KILL].include?(signal)
+        Debugger.search&.dump(pid)
+        dumped = true
       end
 
       begin
@@ -166,8 +248,8 @@ module EnvUtil
 
     args = [args] if args.kind_of?(String)
     # use the same parser as current ruby
-    if args.none? { |arg| arg.start_with?("--parser=") }
-      current_parser = RUBY_DESCRIPTION =~ /prism/i ? "prism" : "parse.y"
+    if (args.none? { |arg| arg.start_with?("--parser=") } and
+        /^ +--parser=/ =~ IO.popen([{"PAGER"=>nil, "RUBY_PAGER"=>nil}, rubybin, "--help", err: %i[child out]], &:read))
       args = ["--parser=#{current_parser}"] + args
     end
     pid = spawn(child_env, *precommand, rubybin, *args, opt)
@@ -194,6 +276,10 @@ module EnvUtil
       out_p.close if capture_stdout
       err_p.close if capture_stderr && capture_stderr != :merge_to_stdout
       status ||= Process.wait2(pid)[1]
+      if ENV["RUBY_BOX"] == "1" and !child_env.key?("RUBY_BOX")
+        stdout = strip_box_warning(stdout) if capture_stderr == :merge_to_stdout
+        stderr = strip_box_warning(stderr)
+      end
       stdout = stdout_filter.call(stdout) if stdout_filter
       stderr = stderr_filter.call(stderr) if stderr_filter
       if timeout_error
@@ -217,6 +303,12 @@ module EnvUtil
   end
   module_function :invoke_ruby
 
+  def current_parser
+    features = RUBY_DESCRIPTION[%r{\)\K [-+*/%._0-9a-zA-Z\[\] ]*(?=\[[-+*/%._0-9a-zA-Z]+\]\z)}]
+    features&.split&.include?("+PRISM") ? "prism" : "parse.y"
+  end
+  module_function :current_parser
+
   def verbose_warning
     class << (stderr = "".dup)
       alias write concat
@@ -232,6 +324,21 @@ module EnvUtil
     EnvUtil.original_warning&.each {|i, v| Warning[i] = v}
   end
   module_function :verbose_warning
+
+  if defined?(Warning.[]=)
+    def deprecation_warning
+      previous_deprecated = Warning[:deprecated]
+      Warning[:deprecated] = true
+      yield
+    ensure
+      Warning[:deprecated] = previous_deprecated
+    end
+  else
+    def deprecation_warning
+      yield
+    end
+  end
+  module_function :deprecation_warning
 
   def default_warning
     $VERBOSE = false
@@ -258,8 +365,6 @@ module EnvUtil
   module_function :under_gc_stress
 
   def under_gc_compact_stress(val = :empty, &block)
-    raise "compaction doesn't work well on s390x. Omit the test in the caller." if RUBY_PLATFORM =~ /s390x/ # https://github.com/ruby/ruby/pull/5077
-
     if GC.respond_to?(:auto_compact)
       auto_compact = GC.auto_compact
       GC.auto_compact = val
@@ -279,7 +384,8 @@ module EnvUtil
   end
   module_function :without_gc
 
-  def with_default_external(enc)
+  def with_default_external(enc = nil, of: nil)
+    enc = of.encoding if defined?(of.encoding)
     suppress_warning { Encoding.default_external = enc }
     yield
   ensure
@@ -287,7 +393,8 @@ module EnvUtil
   end
   module_function :with_default_external
 
-  def with_default_internal(enc)
+  def with_default_internal(enc = nil, of: nil)
+    enc = of.encoding if defined?(of.encoding)
     suppress_warning { Encoding.default_internal = enc }
     yield
   ensure

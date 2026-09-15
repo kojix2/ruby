@@ -24,10 +24,6 @@ module OpenSSL::TestUtils
       @file_cache[[category, name]] ||=
         File.read(File.join(__dir__, "fixtures", category, name + ".pem"))
     end
-
-    def file_path(category, name)
-      File.join(__dir__, "fixtures", category, name)
-    end
   end
 
   module_function
@@ -107,7 +103,7 @@ module OpenSSL::TestUtils
   end
 
   def openssl?(major = nil, minor = nil, fix = nil, patch = 0, status = 0)
-    return false if OpenSSL::OPENSSL_VERSION.include?("LibreSSL")
+    return false if OpenSSL::OPENSSL_VERSION.include?("LibreSSL") || OpenSSL::OPENSSL_VERSION.include?("AWS-LC")
     return true unless major
     OpenSSL::OPENSSL_VERSION_NUMBER >=
       major * 0x10000000 + minor * 0x100000 + fix * 0x1000 + patch * 0x10 +
@@ -118,6 +114,10 @@ module OpenSSL::TestUtils
     version = OpenSSL::OPENSSL_VERSION.scan(/LibreSSL (\d+)\.(\d+)\.(\d+).*/)[0]
     return false unless version
     !major || (version.map(&:to_i) <=> [major, minor, fix]) >= 0
+  end
+
+  def aws_lc?
+    OpenSSL::OPENSSL_VERSION.include?("AWS-LC")
   end
 end
 
@@ -177,119 +177,100 @@ class OpenSSL::SSLTestCase < OpenSSL::TestCase
     @ca  = OpenSSL::X509::Name.parse("/DC=org/DC=ruby-lang/CN=CA")
     @svr = OpenSSL::X509::Name.parse("/DC=org/DC=ruby-lang/CN=localhost")
     @cli = OpenSSL::X509::Name.parse("/DC=org/DC=ruby-lang/CN=localhost")
-    ca_exts = [
+    @ca_exts = [
       ["basicConstraints","CA:TRUE",true],
       ["keyUsage","cRLSign,keyCertSign",true],
     ]
-    ee_exts = [
+    @ee_exts = [
       ["keyUsage","keyEncipherment,digitalSignature",true],
     ]
-    @ca_cert  = issue_cert(@ca, @ca_key, 1, ca_exts, nil, nil)
-    @svr_cert = issue_cert(@svr, @svr_key, 2, ee_exts, @ca_cert, @ca_key)
-    @cli_cert = issue_cert(@cli, @cli_key, 3, ee_exts, @ca_cert, @ca_key)
+    @ca_cert  = issue_cert(@ca, @ca_key, 1, @ca_exts, nil, nil)
+    @svr_cert = issue_cert(@svr, @svr_key, 2, @ee_exts, @ca_cert, @ca_key)
+    @cli_cert = issue_cert(@cli, @cli_key, 3, @ee_exts, @ca_cert, @ca_key)
     @server = nil
   end
 
-  def tls13_supported?
-    return false unless defined?(OpenSSL::SSL::TLS1_3_VERSION)
-    ctx = OpenSSL::SSL::SSLContext.new
-    ctx.min_version = ctx.max_version = OpenSSL::SSL::TLS1_3_VERSION
-    true
-  rescue
-  end
-
-  def readwrite_loop(ctx, ssl)
+  def readwrite_loop(ssl)
     while line = ssl.gets
       ssl.write(line)
     end
+    ssl.close
   end
 
-  def start_server(verify_mode: OpenSSL::SSL::VERIFY_NONE, start_immediately: true,
-                   ctx_proc: nil, server_proc: method(:readwrite_loop),
-                   accept_proc: proc{},
-                   ignore_listener_error: false, &block)
-    IO.pipe {|stop_pipe_r, stop_pipe_w|
-      store = OpenSSL::X509::Store.new
-      store.add_cert(@ca_cert)
-      store.purpose = OpenSSL::X509::PURPOSE_SSL_CLIENT
-      ctx = OpenSSL::SSL::SSLContext.new
-      ctx.cert_store = store
-      ctx.cert = @svr_cert
-      ctx.key = @svr_key
-      ctx.verify_mode = verify_mode
-      ctx_proc.call(ctx) if ctx_proc
+  def make_server_context
+    sctx = OpenSSL::SSL::SSLContext.new
+    sctx.add_certificate(@svr_cert, @svr_key)
+    sctx
+  end
 
-      Socket.do_not_reverse_lookup = true
+  def start_server_proc(server_proc, &block)
+    IO.pipe do |stop_pipe_r, stop_pipe_w|
       tcps = TCPServer.new("127.0.0.1", 0)
+      tcps.setsockopt(:TCP, :NODELAY, 1)
       port = tcps.connect_address.ip_port
 
-      ssls = OpenSSL::SSL::SSLServer.new(tcps, ctx)
-      ssls.start_immediately = start_immediately
-
       threads = []
-      begin
-        server_thread = Thread.new do
-          Thread.current.report_on_exception = false
+      sockets = []
+      server_thread = Thread.new do
+        Thread.current.report_on_exception = false
 
-          begin
-            loop do
-              begin
-                readable, = IO.select([ssls, stop_pipe_r])
-                break if readable.include? stop_pipe_r
-                ssl = ssls.accept
-                accept_proc.call(ssl)
-              rescue OpenSSL::SSL::SSLError, IOError, Errno::EBADF, Errno::EINVAL,
-                     Errno::ECONNABORTED, Errno::ENOTSOCK, Errno::ECONNRESET
-                retry if ignore_listener_error
-                raise
-              end
+        loop do
+          readable, = IO.select([tcps, stop_pipe_r])
+          break if readable.include? stop_pipe_r
+          sockets << sock = tcps.accept
 
-              th = Thread.new do
-                Thread.current.report_on_exception = false
+          th = Thread.new do
+            Thread.current.report_on_exception = false
 
-                begin
-                  server_proc.call(ctx, ssl)
-                ensure
-                  ssl.close
-                end
-                true
-              end
-              threads << th
-            end
-          ensure
-            tcps.close
+            server_proc.call(sock)
           end
+          threads << th
         end
-
-        client_thread = Thread.new do
-          Thread.current.report_on_exception = false
-
-          begin
-            block.call(port)
-          ensure
-            # Stop accepting new connection
-            stop_pipe_w.close
-            server_thread.join
-          end
-        end
-        threads.unshift client_thread
       ensure
-        # Terminate existing connections. If a thread did 'pend', re-raise it.
-        pend = nil
-        threads.each { |th|
-          begin
-            timeout = EnvUtil.apply_timeout_scale(30)
-            th.join(timeout) or
-              th.raise(RuntimeError, "[start_server] thread did not exit in #{timeout} secs")
-          rescue Test::Unit::PendedError
-            pend = $!
-          rescue Exception
-          end
-        }
-        raise pend if pend
-        assert_join_threads(threads)
+        tcps.close
       end
+
+      client_thread = Thread.new do
+        Thread.current.report_on_exception = false
+
+        block.call(port)
+      ensure
+        # Stop accepting new connection
+        stop_pipe_w.close
+        server_thread.join
+      end
+      threads.unshift client_thread
+    ensure
+      # Terminate existing connections. If a thread did 'pend', re-raise it.
+      pend = nil
+      threads.each { |th|
+        begin
+          timeout = EnvUtil.apply_timeout_scale(30)
+          th.join(timeout) or
+            th.raise(RuntimeError, "[start_server] thread did not exit in #{timeout} secs")
+        rescue Test::Unit::PendedError
+          pend = $!
+        rescue Exception
+        end
+      }
+      sockets.each(&:close)
+      raise pend if pend
+      assert_join_threads(threads)
+    end
+  end
+
+  def start_server(ctx = make_server_context, ignore_listener_error: false, &block)
+    server_proc = -> sock {
+      ssl = OpenSSL::SSL::SSLSocket.new(sock, ctx)
+      begin
+        ssl.accept
+      rescue OpenSSL::SSL::SSLError, Errno::ECONNABORTED, Errno::ECONNRESET
+        next if ignore_listener_error
+        raise
+      end
+      readwrite_loop(ssl)
     }
+    start_server_proc(server_proc, &block)
   end
 end
 
@@ -298,6 +279,41 @@ class OpenSSL::PKeyTestCase < OpenSSL::TestCase
     keys.each { |comp|
       assert_equal base.send(comp), test.send(comp)
     }
+  end
+
+  def assert_sign_verify_false_or_error
+    ret = yield
+  rescue => e
+    assert_kind_of(OpenSSL::PKey::PKeyError, e)
+  else
+    assert_equal(false, ret)
+  end
+
+  def der_to_pem(der, pem_header)
+    # RFC 7468
+    <<~EOS
+    -----BEGIN #{pem_header}-----
+    #{[der].pack("m0").scan(/.{1,64}/).join("\n")}
+    -----END #{pem_header}-----
+    EOS
+  end
+
+  def der_to_encrypted_pem(der, pem_header, password)
+    # OpenSSL encryption, non-standard
+    iv = 16.times.to_a.pack("C*")
+    encrypted = OpenSSL::Cipher.new("aes-128-cbc").encrypt.then { |cipher|
+      cipher.key = OpenSSL::Digest.digest("MD5", password + iv[0, 8])
+      cipher.iv = iv
+      cipher.update(der) << cipher.final
+    }
+    <<~EOS
+    -----BEGIN #{pem_header}-----
+    Proc-Type: 4,ENCRYPTED
+    DEK-Info: AES-128-CBC,#{iv.unpack1("H*").upcase}
+
+    #{[encrypted].pack("m0").scan(/.{1,64}/).join("\n")}
+    -----END #{pem_header}-----
+    EOS
   end
 end
 

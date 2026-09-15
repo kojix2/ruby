@@ -4,8 +4,6 @@ require_relative "version"
 require_relative "rubygems_integration"
 require_relative "current_ruby"
 
-autoload :Pathname, "pathname"
-
 module Bundler
   autoload :WINDOWS, File.expand_path("constants", __dir__)
   autoload :FREEBSD, File.expand_path("constants", __dir__)
@@ -25,6 +23,9 @@ module Bundler
     end
 
     def default_lockfile
+      given = ENV["BUNDLE_LOCKFILE"]
+      return Pathname.new(given) if given && !given.empty?
+
       gemfile = default_gemfile
 
       case gemfile.basename.to_s
@@ -57,7 +58,7 @@ module Bundler
 
     def pwd
       Bundler.rubygems.ext_lock.synchronize do
-        Pathname.pwd
+        Dir.pwd
       end
     end
 
@@ -104,7 +105,8 @@ module Bundler
     def filesystem_access(path, action = :write, &block)
       yield(path.dup)
     rescue Errno::EACCES => e
-      raise unless e.message.include?(path.to_s) || action == :create
+      path_basename = File.basename(path.to_s)
+      raise unless e.message.include?(path_basename) || action == :create
 
       raise PermissionError.new(path, action)
     rescue Errno::EAGAIN
@@ -115,28 +117,25 @@ module Bundler
       raise NoSpaceOnDeviceError.new(path, action)
     rescue Errno::ENOTSUP
       raise OperationNotSupportedError.new(path, action)
+    rescue Errno::EPERM
+      raise OperationNotPermittedError.new(path, action)
+    rescue Errno::EROFS
+      raise ReadOnlyFileSystemError.new(path, action)
     rescue Errno::EEXIST, Errno::ENOENT
       raise
     rescue SystemCallError => e
       raise GenericSystemCallError.new(e, "There was an error #{[:create, :write].include?(action) ? "creating" : "accessing"} `#{path}`.")
     end
 
-    def major_deprecation(major_version, message, removed_message: nil, print_caller_location: false)
-      if print_caller_location
-        caller_location = caller_locations(2, 2).first
-        suffix = " (called at #{caller_location.path}:#{caller_location.lineno})"
-        message += suffix
-        removed_message += suffix if removed_message
-      end
+    def feature_deprecated!(message)
+      return unless prints_major_deprecations?
 
-      bundler_major_version = Bundler.bundler_major_version
-      if bundler_major_version > major_version
-        require_relative "errors"
-        raise DeprecatedError, "[REMOVED] #{removed_message || message}"
-      end
-
-      return unless bundler_major_version >= major_version && prints_major_deprecations?
       Bundler.ui.warn("[DEPRECATED] #{message}")
+    end
+
+    def feature_removed!(message)
+      require_relative "errors"
+      raise RemovedError, "[REMOVED] #{message}"
     end
 
     def print_major_deprecations!
@@ -162,10 +161,10 @@ module Bundler
       extra_deps = new_deps - old_deps
       return if extra_deps.empty?
 
-      Bundler.ui.debug "#{spec.full_name} from #{spec.remote} has either corrupted API or lockfile dependencies" \
+      Bundler.ui.debug "#{spec.full_name} from #{spec.remote} has corrupted API dependencies" \
         " (was expecting #{old_deps.map(&:to_s)}, but the real spec has #{new_deps.map(&:to_s)})"
       raise APIResponseMismatchError,
-        "Downloading #{spec.full_name} revealed dependencies not in the API or the lockfile (#{extra_deps.join(", ")})." \
+        "Downloading #{spec.full_name} revealed dependencies not in the API (#{extra_deps.join(", ")})." \
         "\nRunning `bundle update #{spec.name}` should fix the problem."
     end
 
@@ -231,6 +230,21 @@ module Bundler
     rescue ArgumentError
       # on Windows, if source and destination are on different drivers, there's no relative path from one to the other
       destination
+    end
+
+    # Globs for entries matching +glob+ inside of +base_path+, returning
+    # absolute paths. Glob metacharacters in +base_path+ are not treated as
+    # part of the pattern, and matched entries are joined literally, so an
+    # entry starting with `~` is not expanded into the home directory.
+    #
+    # Bundler runs against whatever RubyGems the host provides, so this cannot
+    # delegate to Gem::Util.glob_files_in_dir, which only gained the literal
+    # join in RubyGems 4.1.
+    def glob_files_in_dir(glob, base_path)
+      expanded_path = nil
+      Dir.glob(glob, base: base_path).map! do |f|
+        File.join(expanded_path ||= File.expand_path(base_path), f)
+      end
     end
 
     private
@@ -302,6 +316,7 @@ module Bundler
     def set_bundle_variables
       Bundler::SharedHelpers.set_env "BUNDLE_BIN_PATH", bundle_bin_path
       Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", find_gemfile.to_s
+      Bundler::SharedHelpers.set_env "BUNDLE_LOCKFILE", default_lockfile.to_s
       Bundler::SharedHelpers.set_env "BUNDLER_VERSION", Bundler::VERSION
       Bundler::SharedHelpers.set_env "BUNDLER_SETUP", File.expand_path("setup", __dir__)
     end
@@ -347,7 +362,12 @@ module Bundler
 
     def set_rubyopt
       rubyopt = [ENV["RUBYOPT"]].compact
-      setup_require = "-r#{File.expand_path("setup", __dir__)}"
+      setup_path = File.expand_path("setup", __dir__)
+      # RUBYOPT is split on whitespace with no quoting mechanism, so an
+      # absolute path containing spaces would be torn apart. Fall back to
+      # requiring by feature name; set_rubylib puts our lib directory first
+      # on the child's load path.
+      setup_require = /\s/.match?(setup_path) ? "-rbundler/setup" : "-r#{setup_path}"
       return if !rubyopt.empty? && rubyopt.first.include?(setup_require)
       rubyopt.unshift setup_require
       Bundler::SharedHelpers.set_env "RUBYOPT", rubyopt.join(" ")
@@ -382,7 +402,6 @@ module Bundler
     end
 
     def prints_major_deprecations?
-      require_relative "../bundler"
       return false if Bundler.settings[:silence_deprecations]
       require_relative "deprecate"
       return false if Bundler::Deprecate.skip

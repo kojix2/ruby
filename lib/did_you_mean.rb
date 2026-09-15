@@ -47,9 +47,9 @@ require_relative 'did_you_mean/tree_spell_checker'
 #   #    Did you mean?  :foo
 #
 #
-# == Disabling +did_you_mean+
+# == Disabling \DidYouMean
 #
-# Occasionally, you may want to disable the +did_you_mean+ gem for e.g.
+# Occasionally, you may want to disable the \DidYouMean gem for e.g.
 # debugging issues in the error object itself. You can disable it entirely by
 # specifying +--disable-did_you_mean+ option to the +ruby+ command:
 #
@@ -112,30 +112,6 @@ module DidYouMean
   correct_error NoMethodError, MethodNameChecker
   correct_error LoadError, RequirePathChecker if RUBY_VERSION >= '2.8.0'
   correct_error NoMatchingPatternKeyError, PatternKeyNameChecker if defined?(::NoMatchingPatternKeyError)
-
-  # TODO: Remove on the 3.4 development start:
-  class DeprecatedMapping # :nodoc:
-    def []=(key, value)
-      warn "Calling `DidYouMean::SPELL_CHECKERS[#{key.to_s}] = #{value.to_s}' has been deprecated. " \
-           "Please call `DidYouMean.correct_error(#{key.to_s}, #{value.to_s})' instead."
-
-      DidYouMean.correct_error(key, value)
-    end
-
-    def merge!(hash)
-      warn "Calling `DidYouMean::SPELL_CHECKERS.merge!(error_name => spell_checker)' has been deprecated. " \
-           "Please call `DidYouMean.correct_error(error_name, spell_checker)' instead."
-
-      hash.each do |error_class, spell_checker|
-        DidYouMean.correct_error(error_class, spell_checker)
-      end
-    end
-  end
-
-  # TODO: Remove on the 3.4 development start:
-  SPELL_CHECKERS = DeprecatedMapping.new
-  deprecate_constant :SPELL_CHECKERS
-  private_constant :DeprecatedMapping
 
   # Returns the currently set formatter. By default, it is set to +DidYouMean::Formatter+.
   def self.formatter

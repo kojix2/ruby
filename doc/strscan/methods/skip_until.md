@@ -1,16 +1,14 @@
-call-seq:
-  skip_until(pattern) -> matched_substring_size or nil
-
 Attempts to [match][17] the given `pattern`
-anywhere (at any [position][2]) in the [target substring][3];
-does not modify the positions.
+anywhere (at any [position][2]) in the [target substring][3].
 
 If the match attempt succeeds:
 
 - Sets [match values][9].
+- Sets the [byte position][2] to the end of the matched substring;
+  may adjust the [character position][7].
 - Returns the size of the matched substring.
 
-```
+```rb
 scanner = StringScanner.new(HIRAGANA_TEXT)
 scanner.string           # => "こんにちは"
 scanner.pos = 6
@@ -42,8 +40,9 @@ If the match attempt fails:
 
 - Clears match values.
 - Returns `nil`.
+- Does not update positions.
 
-```
+```rb
 scanner.skip_until(/nope/)     # => nil
 match_values_cleared?(scanner) # => true
 ```

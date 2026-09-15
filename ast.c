@@ -32,16 +32,20 @@ static size_t
 node_memsize(const void *ptr)
 {
     struct ASTNodeData *data = (struct ASTNodeData *)ptr;
-    rb_ast_t *ast = rb_ruby_ast_data_get(data->ast_value);
+    size_t size = sizeof(struct ASTNodeData);
+    if (data->ast_value) {
+        rb_ast_t *ast = rb_ruby_ast_data_get(data->ast_value);
+        size += rb_ast_memsize(ast);
+    }
 
-    return sizeof(struct ASTNodeData) + rb_ast_memsize(ast);
+    return size;
 }
 
 static const rb_data_type_t rb_node_type = {
     "AST/node",
     {node_gc_mark, RUBY_TYPED_DEFAULT_FREE, node_memsize,},
     0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY,
+    RUBY_TYPED_THREAD_SAFE_FREE,
 };
 
 struct ASTLocationData {
@@ -66,7 +70,7 @@ static const rb_data_type_t rb_location_type = {
     "AST/location",
     {location_gc_mark, RUBY_TYPED_DEFAULT_FREE, location_memsize,},
     0, 0,
-    RUBY_TYPED_FREE_IMMEDIATELY,
+    RUBY_TYPED_THREAD_SAFE_FREE,
 };
 
 
@@ -116,6 +120,16 @@ ast_parse_done(VALUE ast_value)
 }
 
 static VALUE
+setup_vparser(VALUE keep_script_lines, VALUE error_tolerant, VALUE keep_tokens)
+{
+    VALUE vparser = ast_parse_new();
+    if (RTEST(keep_script_lines)) rb_parser_set_script_lines(vparser);
+    if (RTEST(error_tolerant)) rb_parser_error_tolerant(vparser);
+    if (RTEST(keep_tokens)) rb_parser_keep_tokens(vparser);
+    return vparser;
+}
+
+static VALUE
 ast_s_parse(rb_execution_context_t *ec, VALUE module, VALUE str, VALUE keep_script_lines, VALUE error_tolerant, VALUE keep_tokens)
 {
     return rb_ast_parse_str(str, keep_script_lines, error_tolerant, keep_tokens);
@@ -124,13 +138,9 @@ ast_s_parse(rb_execution_context_t *ec, VALUE module, VALUE str, VALUE keep_scri
 static VALUE
 rb_ast_parse_str(VALUE str, VALUE keep_script_lines, VALUE error_tolerant, VALUE keep_tokens)
 {
-    VALUE ast_value;
-
+    VALUE ast_value = Qnil;
     StringValue(str);
-    VALUE vparser = ast_parse_new();
-    if (RTEST(keep_script_lines)) rb_parser_set_script_lines(vparser);
-    if (RTEST(error_tolerant)) rb_parser_error_tolerant(vparser);
-    if (RTEST(keep_tokens)) rb_parser_keep_tokens(vparser);
+    VALUE vparser = setup_vparser(keep_script_lines, error_tolerant, keep_tokens);
     ast_value = rb_parser_compile_string_path(vparser, Qnil, str, 1);
     return ast_parse_done(ast_value);
 }
@@ -150,10 +160,7 @@ rb_ast_parse_file(VALUE path, VALUE keep_script_lines, VALUE error_tolerant, VAL
 
     f = rb_file_open_str(path, "r");
     rb_funcall(f, rb_intern("set_encoding"), 2, rb_enc_from_encoding(enc), rb_str_new_cstr("-"));
-    VALUE vparser = ast_parse_new();
-    if (RTEST(keep_script_lines)) rb_parser_set_script_lines(vparser);
-    if (RTEST(error_tolerant))  rb_parser_error_tolerant(vparser);
-    if (RTEST(keep_tokens))  rb_parser_keep_tokens(vparser);
+    VALUE vparser = setup_vparser(keep_script_lines, error_tolerant, keep_tokens);
     ast_value = rb_parser_compile_file_path(vparser, Qnil, f, 1);
     rb_io_close(f);
     return ast_parse_done(ast_value);
@@ -165,25 +172,31 @@ rb_ast_parse_array(VALUE array, VALUE keep_script_lines, VALUE error_tolerant, V
     VALUE ast_value = Qnil;
 
     array = rb_check_array_type(array);
-    VALUE vparser = ast_parse_new();
-    if (RTEST(keep_script_lines)) rb_parser_set_script_lines(vparser);
-    if (RTEST(error_tolerant)) rb_parser_error_tolerant(vparser);
-    if (RTEST(keep_tokens)) rb_parser_keep_tokens(vparser);
+    VALUE vparser = setup_vparser(keep_script_lines, error_tolerant, keep_tokens);
     ast_value = rb_parser_compile_array(vparser, Qnil, array, 1);
     return ast_parse_done(ast_value);
 }
 
 static VALUE node_children(VALUE, const NODE*);
 
-static VALUE
-node_find(VALUE self, const int node_id)
+struct node_find_result {
+    VALUE node;
+    VALUE parent;
+};
+
+static bool
+node_find_with_parent(VALUE self, VALUE parent, const int node_id, struct node_find_result *result)
 {
     VALUE ary;
     long i;
     struct ASTNodeData *data;
     TypedData_Get_Struct(self, struct ASTNodeData, &rb_node_type, data);
 
-    if (nd_node_id(data->node) == node_id) return self;
+    if (nd_node_id(data->node) == node_id) {
+        result->node = self;
+        result->parent = parent;
+        return true;
+    }
 
     ary = node_children(data->ast_value, data->node);
 
@@ -191,15 +204,96 @@ node_find(VALUE self, const int node_id)
         VALUE child = RARRAY_AREF(ary, i);
 
         if (CLASS_OF(child) == rb_cNode) {
-            VALUE result = node_find(child, node_id);
-            if (RTEST(result)) return result;
+            if (node_find_with_parent(child, self, node_id, result)) return true;
         }
     }
 
-    return Qnil;
+    return false;
+}
+
+static VALUE
+node_find(VALUE self, const int node_id)
+{
+    struct node_find_result result = { Qnil, Qnil };
+    node_find_with_parent(self, Qnil, node_id, &result);
+    return result.node;
+}
+
+bool
+rb_ast_node_source_location(VALUE source, VALUE path, int first_lineno,
+                            int node_id, bool block_iseq, int iseq_node_id,
+                            rb_code_location_t *location)
+{
+    StringValue(source);
+    VALUE vparser = setup_vparser(Qfalse, Qfalse, Qfalse);
+    VALUE ast_value = rb_parser_compile_string_path(vparser, path, source, first_lineno);
+    VALUE ast = ast_parse_done(ast_value);
+
+    struct node_find_result result = { Qnil, Qnil };
+    if (!node_find_with_parent(ast, Qnil, node_id, &result)) return false;
+
+    struct ASTNodeData *data;
+    TypedData_Get_Struct(result.node, struct ASTNodeData, &rb_node_type, data);
+    const NODE *node = data->node;
+
+    if (!NIL_P(result.parent)) {
+        struct ASTNodeData *parent_data;
+        TypedData_Get_Struct(result.parent, struct ASTNodeData, &rb_node_type, parent_data);
+        const NODE *parent = parent_data->node;
+
+        /* Prism's call node includes its literal block. */
+        if (nd_type(parent) == NODE_ITER && RNODE_ITER(parent)->nd_iter == node) {
+            node = parent;
+        }
+    }
+
+    /* Prism's block node excludes the call that produced the block. */
+    if (block_iseq && node_id == iseq_node_id && nd_type(node) == NODE_ITER) {
+        const NODE *scope = RNODE_ITER(node)->nd_body;
+        if (scope && nd_type(scope) == NODE_SCOPE) {
+            node = scope;
+        }
+    }
+
+    *location = *nd_code_loc(node);
+    return true;
+}
+
+static VALUE
+ast_node_find(rb_execution_context_t *ec, VALUE self, VALUE root, VALUE node_id)
+{
+    return node_find(root, NUM2INT(node_id));
+}
+
+static VALUE
+ast_node_source_hash(rb_execution_context_t *ec, VALUE self, VALUE node)
+{
+    struct ASTNodeData *data;
+    TypedData_Get_Struct(node, struct ASTNodeData, &rb_node_type, data);
+
+    rb_ast_t *ast = rb_ruby_ast_data_get(data->ast_value);
+    if (!ast->body.has_source_hash) return Qnil;
+    return ULL2NUM(ast->body.source_hash);
 }
 
 extern VALUE rb_e_script;
+
+static VALUE
+iseq_compiled_by_prism_p(rb_execution_context_t *ec, VALUE self)
+{
+    return RBOOL(ISEQ_BODY(rb_iseqw_to_iseq(self))->prism);
+}
+
+static VALUE
+source_hash_of(rb_execution_context_t *ec, VALUE self, VALUE str)
+{
+    StringValue(str);
+
+    rb_source_hash_state_t state;
+    rb_source_hash_init(&state);
+    rb_source_hash_update(&state, (const uint8_t *)RSTRING_PTR(str), (size_t)RSTRING_LEN(str));
+    return ULL2NUM(rb_source_hash_finalize(&state));
+}
 
 static VALUE
 node_id_for_backtrace_location(rb_execution_context_t *ec, VALUE module, VALUE location)
@@ -216,6 +310,18 @@ node_id_for_backtrace_location(rb_execution_context_t *ec, VALUE module, VALUE l
     }
 
     return INT2NUM(node_id);
+}
+
+static VALUE
+iseq_of_backtrace_location(rb_execution_context_t *ec, VALUE module, VALUE location)
+{
+    if (!rb_frame_info_p(location)) {
+        rb_raise(rb_eTypeError, "Thread::Backtrace::Location object expected");
+    }
+
+    const rb_iseq_t *iseq = rb_get_iseq_from_frame_info(location);
+    if (!iseq) return Qnil;
+    return rb_iseqw_new(iseq);
 }
 
 static VALUE
@@ -253,7 +359,7 @@ ast_s_of(rb_execution_context_t *ec, VALUE module, VALUE body, VALUE keep_script
         rb_raise(rb_eRuntimeError, "cannot get AST for ISEQ compiled by prism");
     }
 
-    lines = ISEQ_BODY(iseq)->variable.script_lines;
+    lines = ISEQ_SCRIPT_LINES(iseq);
 
     VALUE path = rb_iseq_path(iseq);
     int e_option = RSTRING_LEN(path) == 2 && memcmp(RSTRING_PTR(path), "-e", 2) == 0;
@@ -400,6 +506,19 @@ rest_arg(VALUE ast_value, const NODE *rest_arg)
     return NODE_NAMED_REST_P(rest_arg) ? NEW_CHILD(ast_value, rest_arg) : no_name_rest();
 }
 
+static ID
+node_colon_name(const NODE *node)
+{
+    switch (nd_type(node)) {
+      case NODE_COLON2:
+        return RNODE_COLON2(node)->nd_mid;
+      case NODE_COLON3:
+        return RNODE_COLON3(node)->nd_mid;
+      default:
+        rb_bug("unexpected node: %s", ruby_node_name(nd_type(node)));
+    }
+}
+
 static VALUE
 node_children(VALUE ast_value, const NODE *node)
 {
@@ -493,7 +612,7 @@ node_children(VALUE ast_value, const NODE *node)
         if (RNODE_CDECL(node)->nd_vid) {
             return rb_ary_new_from_args(2, ID2SYM(RNODE_CDECL(node)->nd_vid), NEW_CHILD(ast_value, RNODE_CDECL(node)->nd_value));
         }
-        return rb_ary_new_from_args(3, NEW_CHILD(ast_value, RNODE_CDECL(node)->nd_else), ID2SYM(RNODE_COLON2(RNODE_CDECL(node)->nd_else)->nd_mid), NEW_CHILD(ast_value, RNODE_CDECL(node)->nd_value));
+        return rb_ary_new_from_args(3, NEW_CHILD(ast_value, RNODE_CDECL(node)->nd_else), ID2SYM(node_colon_name(RNODE_CDECL(node)->nd_else)), NEW_CHILD(ast_value, RNODE_CDECL(node)->nd_value));
       case NODE_OP_ASGN1:
         return rb_ary_new_from_args(4, NEW_CHILD(ast_value, RNODE_OP_ASGN1(node)->nd_recv),
                                     ID2SYM(RNODE_OP_ASGN1(node)->nd_mid),
@@ -681,7 +800,7 @@ node_children(VALUE ast_value, const NODE *node)
                                             : var_name(ainfo->rest_arg)),
                                         (ainfo->no_kwarg ? Qfalse : NEW_CHILD(ast_value, (NODE *)ainfo->kw_args)),
                                         (ainfo->no_kwarg ? Qfalse : NEW_CHILD(ast_value, ainfo->kw_rest_arg)),
-                                        var_name(ainfo->block_arg));
+                                        (ainfo->no_blockarg ? Qfalse : var_name(ainfo->block_arg)));
         }
       case NODE_SCOPE:
         {
@@ -787,7 +906,6 @@ node_locations(VALUE ast_value, const NODE *node)
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_BLOCK_PASS(node)->operator_loc));
-
       case NODE_BREAK:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
@@ -807,6 +925,77 @@ node_locations(VALUE ast_value, const NODE *node)
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_CASE3(node)->case_keyword_loc),
                                     location_new(&RNODE_CASE3(node)->end_keyword_loc));
+      case NODE_CLASS:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_CLASS(node)->class_keyword_loc),
+                                    location_new(&RNODE_CLASS(node)->inheritance_operator_loc),
+                                    location_new(&RNODE_CLASS(node)->end_keyword_loc));
+      case NODE_COLON2:
+        return rb_ary_new_from_args(3,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_COLON2(node)->delimiter_loc),
+                                    location_new(&RNODE_COLON2(node)->name_loc));
+      case NODE_COLON3:
+        return rb_ary_new_from_args(3,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_COLON3(node)->delimiter_loc),
+                                    location_new(&RNODE_COLON3(node)->name_loc));
+      case NODE_DEFINED:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_DEFINED(node)->keyword_loc));
+      case NODE_DOT2:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_DOT2(node)->operator_loc));
+      case NODE_DOT3:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_DOT3(node)->operator_loc));
+      case NODE_EVSTR:
+        return rb_ary_new_from_args(3,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_EVSTR(node)->opening_loc),
+                                    location_new(&RNODE_EVSTR(node)->closing_loc));
+      case NODE_FLIP2:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_FLIP2(node)->operator_loc));
+      case NODE_FLIP3:
+        return rb_ary_new_from_args(2,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_FLIP3(node)->operator_loc));
+      case NODE_FOR:
+        return rb_ary_new_from_args(5,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_FOR(node)->for_keyword_loc),
+                                    location_new(&RNODE_FOR(node)->in_keyword_loc),
+                                    location_new(&RNODE_FOR(node)->do_keyword_loc),
+                                    location_new(&RNODE_FOR(node)->end_keyword_loc));
+      case NODE_LAMBDA:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_LAMBDA(node)->operator_loc),
+                                    location_new(&RNODE_LAMBDA(node)->opening_loc),
+                                    location_new(&RNODE_LAMBDA(node)->closing_loc));
+      case NODE_IF:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_IF(node)->if_keyword_loc),
+                                    location_new(&RNODE_IF(node)->then_keyword_loc),
+                                    location_new(&RNODE_IF(node)->end_keyword_loc));
+      case NODE_IN:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_IN(node)->in_keyword_loc),
+                                    location_new(&RNODE_IN(node)->then_keyword_loc),
+                                    location_new(&RNODE_IN(node)->operator_loc));
+      case NODE_MODULE:
+        return rb_ary_new_from_args(3,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_MODULE(node)->module_keyword_loc),
+                                    location_new(&RNODE_MODULE(node)->end_keyword_loc));
       case NODE_NEXT:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
@@ -828,18 +1017,44 @@ node_locations(VALUE ast_value, const NODE *node)
                                     location_new(&RNODE_OP_ASGN2(node)->call_operator_loc),
                                     location_new(&RNODE_OP_ASGN2(node)->message_loc),
                                     location_new(&RNODE_OP_ASGN2(node)->binary_operator_loc));
+      case NODE_POSTEXE:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_POSTEXE(node)->keyword_loc),
+                                    location_new(&RNODE_POSTEXE(node)->opening_loc),
+                                    location_new(&RNODE_POSTEXE(node)->closing_loc));
       case NODE_REDO:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_REDO(node)->keyword_loc));
+      case NODE_REGX:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_REGX(node)->opening_loc),
+                                    location_new(&RNODE_REGX(node)->content_loc),
+                                    location_new(&RNODE_REGX(node)->closing_loc));
       case NODE_RETURN:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_RETURN(node)->keyword_loc));
+
+      case NODE_SCLASS:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_SCLASS(node)->class_keyword_loc),
+                                    location_new(&RNODE_SCLASS(node)->operator_loc),
+                                    location_new(&RNODE_SCLASS(node)->end_keyword_loc));
+
       case NODE_SPLAT:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_SPLAT(node)->operator_loc));
+      case NODE_SUPER:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_SUPER(node)->keyword_loc),
+                                    location_new(&RNODE_SUPER(node)->lparen_loc),
+                                    location_new(&RNODE_SUPER(node)->rparen_loc));
       case NODE_UNDEF:
         return rb_ary_new_from_args(2,
                                     location_new(nd_code_loc(node)),
@@ -869,6 +1084,12 @@ node_locations(VALUE ast_value, const NODE *node)
                                     location_new(nd_code_loc(node)),
                                     location_new(&RNODE_UNTIL(node)->keyword_loc),
                                     location_new(&RNODE_UNTIL(node)->closing_loc));
+      case NODE_YIELD:
+        return rb_ary_new_from_args(4,
+                                    location_new(nd_code_loc(node)),
+                                    location_new(&RNODE_YIELD(node)->keyword_loc),
+                                    location_new(&RNODE_YIELD(node)->lparen_loc),
+                                    location_new(&RNODE_YIELD(node)->rparen_loc));
       case NODE_ARGS_AUX:
       case NODE_LAST:
         break;

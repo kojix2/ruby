@@ -46,7 +46,7 @@ impl Log {
         }
     }
 
-    pub fn add_block_with_chain_depth(block_id: BlockId, chain_depth: u8) {
+    pub fn add_block_with_chain_depth(block_id: BlockId, chain_depth: u16) {
         if !Self::has_instance() {
             return;
         }
@@ -81,7 +81,7 @@ impl Log {
                     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
                     writeln!(file, "{}", entry).unwrap();
                     file.flush().unwrap();
-                    file.into_raw_fd(); // keep the fd open
+                    let _ = file.into_raw_fd(); // keep the fd open
                 }
 
                 LogOutput::MemoryOnly => () // Don't print or write anything

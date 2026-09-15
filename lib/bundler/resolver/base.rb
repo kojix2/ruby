@@ -5,10 +5,13 @@ require_relative "package"
 module Bundler
   class Resolver
     class Base
-      attr_reader :packages, :requirements, :source_requirements
+      attr_reader :packages, :requirements, :source_requirements, :locked_specs, :overrides
 
       def initialize(source_requirements, dependencies, base, platforms, options)
+        @overrides = options.delete(:overrides) || []
+        @explicit_unlocks = options.delete(:explicit_unlocks) || []
         @source_requirements = source_requirements
+        @locked_specs = options[:locked_specs]
 
         @base = base
 
@@ -16,7 +19,7 @@ module Bundler
           hash[name] = Package.new(name, platforms, **options)
         end
 
-        @requirements = dependencies.map do |dep|
+        @requirements = dependencies.filter_map do |dep|
           dep_platforms = dep.gem_platforms(platforms)
 
           # Dependencies scoped to external platforms are ignored
@@ -27,11 +30,7 @@ module Bundler
           @packages[name] = Package.new(name, dep_platforms, **options.merge(dependency: dep))
 
           dep
-        end.compact
-      end
-
-      def specs_compatible_with(result)
-        @base.specs_compatible_with(result)
+        end
       end
 
       def [](name)
@@ -44,6 +43,14 @@ module Bundler
 
       def get_package(name)
         @packages[name]
+      end
+
+      # Gems the user named on a `bundle update GEM` / `bundle lock --update GEM`
+      # command line. These are the only ones meant to move off their locked
+      # version, so cooldown keeps applying to them while every other locked gem
+      # stays exempt.
+      def explicitly_unlocked?(name)
+        @explicit_unlocks.include?(name)
       end
 
       def base_requirements

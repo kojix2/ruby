@@ -22,6 +22,13 @@ class TestGemCommandsSigninCommand < Gem::TestCase
     super
   end
 
+  def test_sign_in_calls_api_key_without_arguments
+    # Command plugins include Gem::GemcutterUtilities and override #api_key
+    # with no parameters, so sign_in has to keep calling it that way.
+    assert_equal 0, Gem::GemcutterUtilities.instance_method(:api_key).arity
+    assert_empty Gem::GemcutterUtilities.instance_method(:api_key).parameters
+  end
+
   def test_execute_when_not_already_signed_in
     sign_in_ui = util_capture { @cmd.execute }
     assert_match(/Signed in./, sign_in_ui.output)
@@ -121,7 +128,7 @@ class TestGemCommandsSigninCommand < Gem::TestCase
     assert_match "The default access scope is:", key_name_ui.output
     assert_match "index_rubygems: y", key_name_ui.output
     assert_match "Do you want to customise scopes? [yN]", key_name_ui.output
-    assert_equal "name=test-key&index_rubygems=true", fetcher.last_request.body
+    assert_equal "name=test-key&index_rubygems=true&push_rubygem=true", fetcher.last_request.body
 
     credentials = load_yaml_file Gem.configuration.credentials_path
     assert_equal api_key, credentials[:rubygems_api_key]

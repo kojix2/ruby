@@ -1395,3 +1395,48 @@ assert_equal 'ok', %q{
   no_args
   splat_args
 }
+
+assert_equal 'ok', %q{
+  class A
+    private
+    def foo = "ng"
+  end
+
+  class B
+    def initialize(o)
+      @o = o
+    end
+
+    def foo(...) = @o.foo(...)
+    def internal_foo = foo
+  end
+
+  b = B.new(A.new)
+
+  begin
+    b.internal_foo
+  rescue NoMethodError
+    "ok"
+  end
+}
+
+assert_equal 'ok', <<~RUBY
+  def test(*, kw: false)
+    "ok"
+  end
+
+  test
+RUBY
+
+assert_equal '[1, 2, 3]', %q{
+  def target(*args) = args
+  def x = [1]
+  def forwarder(...) = target(*x, 2, ...)
+  forwarder(3).inspect
+}, '[Bug #21832] post-splat args before forwarding'
+
+assert_equal '[nil, nil]', %q{
+  def self_reading(a = a, kw:) = a
+  def through_binding(a = binding.local_variable_get(:a), kw:) = a
+  [self_reading(kw: 1), through_binding(kw: 1)]
+}, 'nil initialization of optional parameters'

@@ -10,7 +10,37 @@
  */
 #include "ruby/ruby.h"
 
-// `GC_IMPL_FN` is an implementation detail of `!USE_SHARED_GC` builds
+#include <stddef.h>
+#include <stdint.h>
+
+enum rb_gc_zjit_fastpath_kind {
+    RB_GC_ZJIT_FASTPATH_DEFAULT = 1,
+    RB_GC_ZJIT_FASTPATH_MMTK = 2,
+};
+
+#define RB_GC_ZJIT_FASTPATH_DATA_WORDS 19
+
+union rb_gc_zjit_fastpath_data {
+    uintptr_t words[RB_GC_ZJIT_FASTPATH_DATA_WORDS];
+};
+
+struct rb_gc_zjit_fastpath {
+    enum rb_gc_zjit_fastpath_kind kind;
+    union rb_gc_zjit_fastpath_data data;
+};
+
+#ifndef RB_GC_OBJECT_METADATA_ENTRY_DEFINED
+# define RB_GC_OBJECT_METADATA_ENTRY_DEFINED
+struct rb_gc_object_metadata_entry {
+    ID name;
+    VALUE val;
+};
+#endif
+
+#ifdef BUILDING_MODULAR_GC
+# define GC_IMPL_FN
+#else
+// `GC_IMPL_FN` is an implementation detail of `!USE_MODULAR_GC` builds
 // to have the default GC in the same translation unit as gc.c for
 // the sake of optimizer visibility. It expands to nothing unless
 // you're the default GC.
@@ -18,23 +48,20 @@
 // For the default GC, do not copy-paste this when implementing
 // these functions. This takes advantage of internal linkage winning
 // when appearing first. See C99 6.2.2p4.
-#ifdef RB_AMALGAMATED_DEFAULT_GC
 # define GC_IMPL_FN static
-#else
-# define GC_IMPL_FN
 #endif
 
 // Bootup
 GC_IMPL_FN void *rb_gc_impl_objspace_alloc(void);
 GC_IMPL_FN void rb_gc_impl_objspace_init(void *objspace_ptr);
-GC_IMPL_FN void rb_gc_impl_objspace_free(void *objspace_ptr);
-GC_IMPL_FN void *rb_gc_impl_ractor_cache_alloc(void *objspace_ptr);
-GC_IMPL_FN void rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache);
+GC_IMPL_FN void *rb_gc_impl_ractor_cache_alloc(void *objspace_ptr, void *ractor);
+GC_IMPL_FN void rb_gc_impl_objspace_retire_gc(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_set_params(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_init(void);
-GC_IMPL_FN size_t *rb_gc_impl_heap_sizes(void *objspace_ptr);
 // Shutdown
 GC_IMPL_FN void rb_gc_impl_shutdown_free_objects(void *objspace_ptr);
+GC_IMPL_FN void rb_gc_impl_objspace_free(void *objspace_ptr);
+GC_IMPL_FN void rb_gc_impl_ractor_cache_free(void *objspace_ptr, void *cache);
 // GC
 GC_IMPL_FN void rb_gc_impl_start(void *objspace_ptr, bool full_mark, bool immediate_mark, bool immediate_sweep, bool compact);
 GC_IMPL_FN bool rb_gc_impl_during_gc_p(void *objspace_ptr);
@@ -42,19 +69,46 @@ GC_IMPL_FN void rb_gc_impl_prepare_heap(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_gc_enable(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_gc_disable(void *objspace_ptr, bool finish_current_gc);
 GC_IMPL_FN bool rb_gc_impl_gc_enabled_p(void *objspace_ptr);
+GC_IMPL_FN bool rb_gc_impl_user_gc_disabled_set(void *objspace_ptr, bool disable);
+GC_IMPL_FN bool rb_gc_impl_user_gc_disabled_p(void *objspace_ptr);
+GC_IMPL_FN void rb_gc_impl_gc_rest(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_stress_set(void *objspace_ptr, VALUE flag);
 GC_IMPL_FN VALUE rb_gc_impl_stress_get(void *objspace_ptr);
 GC_IMPL_FN VALUE rb_gc_impl_config_get(void *objspace_ptr);
 GC_IMPL_FN void rb_gc_impl_config_set(void *objspace_ptr, VALUE hash);
+GC_IMPL_FN struct rb_gc_vm_context *rb_gc_impl_get_vm_context(void *objspace_ptr);
 // Object allocation
-GC_IMPL_FN VALUE rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags, VALUE v1, VALUE v2, VALUE v3, bool wb_protected, size_t alloc_size);
+GC_IMPL_FN VALUE rb_gc_impl_new_obj(void *objspace_ptr, void *cache_ptr, VALUE klass, VALUE flags, bool wb_protected, size_t alloc_size, size_t *actual_alloc_size);
+/* This is an (optional) function that allows the GC implementation to return
+ * metadata for ZJIT's fast path object allocator. Returns `true` if ZJIT can
+ * use the fast path allocator, `false` otherwise.
+ *
+ * The GC is provided `alloc_size`, `flags`, and `class` which describe the
+ * object to be allocated. The GC can use this information to perform
+ * precomputation and fill `fastpath` with GC-specific metadata. ZJIT owns the
+ * generated instruction sequence; see zjit/src/gc_fastpath.rs.
+ */
+GC_IMPL_FN bool rb_gc_impl_zjit_new_obj_fastpath(void *objspace_ptr, size_t alloc_size, VALUE flags, VALUE klass, struct rb_gc_zjit_fastpath *fastpath);
 GC_IMPL_FN size_t rb_gc_impl_obj_slot_size(VALUE obj);
-GC_IMPL_FN size_t rb_gc_impl_heap_id_for_size(void *objspace_ptr, size_t size);
+GC_IMPL_FN size_t rb_gc_impl_size_slot_size(void *objspace_ptr, size_t size);
 GC_IMPL_FN bool rb_gc_impl_size_allocatable_p(size_t size);
+GC_IMPL_FN size_t rb_gc_impl_max_allocation_size(void);
 // Malloc
-GC_IMPL_FN void *rb_gc_impl_malloc(void *objspace_ptr, size_t size);
-GC_IMPL_FN void *rb_gc_impl_calloc(void *objspace_ptr, size_t size);
-GC_IMPL_FN void *rb_gc_impl_realloc(void *objspace_ptr, void *ptr, size_t new_size, size_t old_size);
+/*
+ * BEWARE: These functions may or may not run under GVL.
+ *
+ * You might want to make them thread-safe.
+ * Garbage collecting inside is possible if and only if you
+ * already have GVL.  Also raising exceptions without one is a
+ * total disaster.
+ *
+ * When you absolutely cannot allocate the requested amount of
+ * memory just return NULL (with appropriate errno set).
+ * The caller side takes care of that situation.
+ */
+GC_IMPL_FN void *rb_gc_impl_malloc(void *objspace_ptr, size_t size, bool gc_allowed);
+GC_IMPL_FN void *rb_gc_impl_calloc(void *objspace_ptr, size_t size, bool gc_allowed);
+GC_IMPL_FN void *rb_gc_impl_realloc(void *objspace_ptr, void *ptr, size_t new_size, size_t old_size, bool gc_allowed);
 GC_IMPL_FN void rb_gc_impl_free(void *objspace_ptr, void *ptr, size_t old_size);
 GC_IMPL_FN void rb_gc_impl_adjust_memory_usage(void *objspace_ptr, ssize_t diff);
 // Marking
@@ -62,17 +116,36 @@ GC_IMPL_FN void rb_gc_impl_mark(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_mark_and_move(void *objspace_ptr, VALUE *ptr);
 GC_IMPL_FN void rb_gc_impl_mark_and_pin(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_mark_maybe(void *objspace_ptr, VALUE obj);
-GC_IMPL_FN void rb_gc_impl_mark_weak(void *objspace_ptr, VALUE *ptr);
-GC_IMPL_FN void rb_gc_impl_remove_weak(void *objspace_ptr, VALUE parent_obj, VALUE *ptr);
+// Weak references
+GC_IMPL_FN void rb_gc_impl_declare_weak_references(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN bool rb_gc_impl_handle_weak_references_alive_p(void *objspace_ptr, VALUE obj);
 // Compaction
+GC_IMPL_FN void rb_gc_impl_register_pinning_obj(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN bool rb_gc_impl_object_moved_p(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN bool rb_gc_impl_pinned_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN VALUE rb_gc_impl_location(void *objspace_ptr, VALUE value);
 // Write barriers
 GC_IMPL_FN void rb_gc_impl_writebarrier(void *objspace_ptr, VALUE a, VALUE b);
 GC_IMPL_FN void rb_gc_impl_writebarrier_unprotect(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_writebarrier_remember(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN void rb_gc_impl_obj_became_shareable(void *objspace_ptr, VALUE obj);
 // Heap walking
 GC_IMPL_FN void rb_gc_impl_each_objects(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+GC_IMPL_FN void rb_gc_impl_each_objects_shareable(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+GC_IMPL_FN void rb_gc_impl_each_objects_foreign(void *objspace_ptr, int (*callback)(void *, void *, size_t, void *), void *data);
+/* Whether the impl supports multiple per-Ractor objspaces.  When false the VM shares a single
+ * objspace and passes the per-Ractor objspace machinery (retire, absorb, ...) straight through. */
+GC_IMPL_FN bool rb_gc_impl_multi_objspace_p(void);
+GC_IMPL_FN bool rb_gc_impl_during_global_gc_p(void *objspace_ptr);
+/* Whether the current collection is a dying thread's final collection of its own
+ * objspace, whose torn-down machine context must not be scanned. */
+GC_IMPL_FN bool rb_gc_impl_during_postmortem_p(void *objspace_ptr);
+/* Whether obj is owned by an objspace other than objspace_ptr.  Always false for a single
+ * objspace impl. */
+GC_IMPL_FN bool rb_gc_impl_obj_foreign_p(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN bool rb_gc_impl_shref_marked_p(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN size_t rb_gc_impl_heap_page_count(void *objspace_ptr);
+GC_IMPL_FN void rb_gc_impl_objspace_absorb(void *dst_ptr, void *src_ptr);
 GC_IMPL_FN void rb_gc_impl_each_object(void *objspace_ptr, void (*func)(VALUE obj, void *data), void *data);
 // Finalizers
 GC_IMPL_FN void rb_gc_impl_make_zombie(void *objspace_ptr, VALUE obj, void (*dfree)(void *), void *data);
@@ -80,9 +153,9 @@ GC_IMPL_FN VALUE rb_gc_impl_define_finalizer(void *objspace_ptr, VALUE obj, VALU
 GC_IMPL_FN void rb_gc_impl_undefine_finalizer(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_copy_finalizer(void *objspace_ptr, VALUE dest, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_shutdown_call_finalizer(void *objspace_ptr);
-// Object ID
-GC_IMPL_FN VALUE rb_gc_impl_object_id(void *objspace_ptr, VALUE obj);
-GC_IMPL_FN VALUE rb_gc_impl_object_id_to_ref(void *objspace_ptr, VALUE object_id);
+// Forking
+GC_IMPL_FN void rb_gc_impl_before_fork(void *objspace_ptr);
+GC_IMPL_FN void rb_gc_impl_after_fork(void *objspace_ptr, rb_pid_t pid);
 // Statistics
 GC_IMPL_FN void rb_gc_impl_set_measure_total_time(void *objspace_ptr, VALUE flag);
 GC_IMPL_FN bool rb_gc_impl_get_measure_total_time(void *objspace_ptr);
@@ -91,9 +164,10 @@ GC_IMPL_FN size_t rb_gc_impl_gc_count(void *objspace_ptr);
 GC_IMPL_FN VALUE rb_gc_impl_latest_gc_info(void *objspace_ptr, VALUE key);
 GC_IMPL_FN VALUE rb_gc_impl_stat(void *objspace_ptr, VALUE hash_or_sym);
 GC_IMPL_FN VALUE rb_gc_impl_stat_heap(void *objspace_ptr, VALUE heap_name, VALUE hash_or_sym);
+GC_IMPL_FN const char *rb_gc_impl_active_gc_name(void);
 // Miscellaneous
-GC_IMPL_FN size_t rb_gc_impl_obj_flags(void *objspace_ptr, VALUE obj, ID* flags, size_t max);
-GC_IMPL_FN bool rb_gc_impl_pointer_to_heap_p(void *objspace_ptr, const void *ptr);
+GC_IMPL_FN struct rb_gc_object_metadata_entry *rb_gc_impl_object_metadata(void *objspace_ptr, VALUE obj);
+GC_IMPL_FN bool rb_gc_impl_live_object_p(void *objspace_ptr, const void *ptr);
 GC_IMPL_FN bool rb_gc_impl_garbage_object_p(void *objspace_ptr, VALUE obj);
 GC_IMPL_FN void rb_gc_impl_set_event_hook(void *objspace_ptr, const rb_event_flag_t event);
 GC_IMPL_FN void rb_gc_impl_copy_attributes(void *objspace_ptr, VALUE dest, VALUE obj);

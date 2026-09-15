@@ -465,10 +465,10 @@ class TestHash < Test::Unit::TestCase
   def test_each_value
     res = []
     @cls[].each_value { |v| res << v }
-    assert_equal(0, [].length)
+    assert_equal(0, res.length)
 
     @h.each_value { |v| res << v }
-    assert_equal(0, [].length)
+    assert_equal(@h.size, res.length)
 
     expected = []
     @h.each { |k, v| expected << v }
@@ -617,7 +617,10 @@ class TestHash < Test::Unit::TestCase
   end
 
   def hash_hint hv
-    hv & 0xff
+    hint = hv & 0xff
+    # hash.c's ar_do_hash_hint() substitutes RHASH_AR_CLEARED_HINT (0x00)
+    # with RHASH_AR_SUBSTITUTION_HINT (0x01), so those two alias.
+    hint == 0 ? 1 : hint
   end
 
   def test_rehash
@@ -880,19 +883,20 @@ class TestHash < Test::Unit::TestCase
     assert_equal(quote1, eval(quote1).inspect)
     assert_equal(quote2, eval(quote2).inspect)
     assert_equal(quote3, eval(quote3).inspect)
-    begin
-      enc = Encoding.default_external
-      Encoding.default_external = Encoding::ASCII
+
+    EnvUtil.with_default_external(Encoding::ASCII) do
       utf8_ascii_hash = '{"\\u3042": 1}'
       assert_equal(eval(utf8_ascii_hash).inspect, utf8_ascii_hash)
-      Encoding.default_external = Encoding::UTF_8
+    end
+
+    EnvUtil.with_default_external(Encoding::UTF_8) do
       utf8_hash = "{\u3042: 1}"
       assert_equal(eval(utf8_hash).inspect, utf8_hash)
-      Encoding.default_external = Encoding::Windows_31J
+    end
+
+    EnvUtil.with_default_external(Encoding::Windows_31J) do
       sjis_hash = "{\x87]: 1}".force_encoding('sjis')
       assert_equal(eval(sjis_hash).inspect, sjis_hash)
-    ensure
-      Encoding.default_external = enc
     end
   end
 
@@ -1295,6 +1299,17 @@ class TestHash < Test::Unit::TestCase
     assert_equal(@cls[a: 10, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10], h)
   end
 
+  def test_update_modify_in_block
+    a = @cls[]
+    (1..1337).each {|k| a[k] = k}
+    b = {1=>1338}
+    assert_raise_with_message(RuntimeError, /rehash during iteration/) do
+      a.update(b) {|k, o, n|
+        a.rehash
+      }
+    end
+  end
+
   def test_update_on_identhash
     key = +'a'
     i = @cls[].compare_by_identity
@@ -1313,6 +1328,11 @@ class TestHash < Test::Unit::TestCase
     assert_equal({1=>6, 3=>4, 5=>7}, h1.merge(h2) {|k, v1, v2| k + v1 + v2 })
     assert_equal({1=>1, 2=>4, 3=>4, 5=>7}, h1.merge(h2, h3))
     assert_equal({1=>8, 2=>4, 3=>4, 5=>7}, h1.merge(h2, h3) {|k, v1, v2| k + v1 + v2 })
+  end
+
+  def test_merge_during_gc
+    hash = @cls[a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8]
+    assert_equal(9, EnvUtil.under_gc_stress(0x04) { hash.merge(i: 9) }[:i])
   end
 
   def test_merge_on_identhash
@@ -1851,6 +1871,14 @@ class TestHash < Test::Unit::TestCase
       end
     end
     assert_equal(@cls[a: 2, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10], x)
+
+    x = (1..1337).to_h {|k| [k, k]}
+    assert_raise_with_message(RuntimeError, /rehash during iteration/) do
+      x.transform_values! {|v|
+        x.rehash if v == 1337
+        v * 2
+      }
+    end
   end
 
   def hrec h, n, &b
@@ -1938,10 +1966,23 @@ class TestHashOnly < Test::Unit::TestCase
       end
     end
     obj.hash_calls = 0
-    hash = {obj => 42}
+
+    ar_hash = {obj => 42}
     assert_equal(1, obj.hash_calls)
-    yield hash
+    yield ar_hash
     assert_equal(1, obj.hash_calls)
+
+    st_hash = {a:1, b:2, c:3, d:4, e:5, f:6, g:7, h:8, obj => 42}
+    assert_equal(2, obj.hash_calls)
+    yield st_hash
+    assert_equal(2, obj.hash_calls)
+
+    st_hash.keys.first(8).each do |key|
+      st_hash.delete(key)
+    end
+    assert_equal(2, obj.hash_calls)
+    yield st_hash
+    assert_equal(2, obj.hash_calls)
   end
 
   def test_select_reject_will_not_rehash
@@ -1984,9 +2025,12 @@ class TestHashOnly < Test::Unit::TestCase
     ObjectSpace.count_objects
 
     h = {"abc" => 1}
-    before = ObjectSpace.count_objects[:T_STRING]
-    5.times{ h["abc"] }
-    assert_equal before, ObjectSpace.count_objects[:T_STRING]
+
+    EnvUtil.without_gc do
+      before = ObjectSpace.count_objects[:T_STRING]
+      5.times{ h["abc".freeze] }
+      assert_equal before, ObjectSpace.count_objects[:T_STRING]
+    end
   end
 
   def test_AREF_fstring_key_default_proc
@@ -2084,6 +2128,36 @@ class TestHashOnly < Test::Unit::TestCase
     assert_equal(h2, h1)
   end
 
+  def test_replace_ar_with_st
+    # AR hash
+    h1 = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7 }
+    # ST hash
+    h2 = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }
+    # Replace AR hash with ST hash
+    h1.replace(h2)
+    assert_equal(h2, h1)
+  end
+
+  def test_replace_ar_with_ar
+    # AR hash
+    h1 = { a: 1, b: 2 }
+    # AR hash
+    h2 = { a: 1 }
+    # Replace AR hash with AR hash
+    h1.replace(h2)
+    assert_equal(h2, h1)
+  end
+
+  def test_replace_st_with_st
+    # ST hash
+    h1 = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }
+    # ST hash
+    h2 = { a: 9, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9 }
+    # Replace ST hash with AR hash
+    h1.replace(h2)
+    assert_equal(h2, h1)
+  end
+
   def test_nil_to_h
     h = nil.to_h
     assert_equal({}, h)
@@ -2114,7 +2188,9 @@ class TestHashOnly < Test::Unit::TestCase
 
   def test_iterlevel_in_ivar_bug19589
     h = { a: nil }
-    hash_iter_recursion(h, 200)
+    # Recursion level should be over 127 to actually test iterlevel being set in an instance variable,
+    # but it should be under 131 not to overflow the stack under MN threads/ractors.
+    hash_iter_recursion(h, 130)
     assert true
   end
 
@@ -2331,6 +2407,11 @@ class TestHashOnly < Test::Unit::TestCase
     end
   end
 
+  def test_bug_21357
+    h = {x: []}.merge(x: nil) { |_k, v1, _v2| v1 }
+    assert_equal({x: []}, h)
+  end
+
   def test_any_hash_fixable
     20.times do
       assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
@@ -2386,5 +2467,48 @@ class TestHashOnly < Test::Unit::TestCase
         (0..10).each {|i| $h[Foo.new] ||= {} }
       end
     end;
+  end
+
+  def test_ar_to_st_reserved_value
+    klass = Class.new do
+      attr_reader :hash
+      def initialize(val) = @hash = val
+    end
+
+    values = 0.downto(-16).to_a
+    hash = {}
+    values.each do |val|
+      hash[klass.new(val)] = val
+    end
+    assert_equal values, hash.values, "[ruby-core:121239] [Bug #21170]"
+  end
+
+  def test_ar_find_entry_hint_eql_mutates_hash
+    # ar_find_entry_hint caches bound and hints, then calls #eql? which
+    # can mutate the hash. If #eql? triggers AR->ST conversion the loop
+    # would read st_table memory as ar_table pairs.
+    key_class = Class.new do
+      attr_reader :v
+      def initialize(v, h = nil)
+        @v = v
+        @h = h
+      end
+      def hash; 0; end
+      def eql?(other)
+        if @h
+          # Trigger AR->ST conversion
+          @h[42] = 42
+        end
+        other.is_a?(self.class) && @v == other.v
+      end
+    end
+
+    h = {}
+    8.times { |i| h[key_class.new(i)] = i }
+
+    # Not in the hash, so ar_find_entry_hint checks every entry.
+    lookup_key = key_class.new(-1, h)
+
+    assert_equal nil, h[lookup_key]
   end
 end

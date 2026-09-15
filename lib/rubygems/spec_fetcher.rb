@@ -82,13 +82,17 @@ class Gem::SpecFetcher
   # Find and fetch gem name tuples that match +dependency+.
   #
   # If +matching_platform+ is false, gems for all platforms are returned.
+  #
+  # +type+ overrides the index type derived from +dependency+.  See
+  # #available_specs for the list of types.
 
-  def search_for_dependency(dependency, matching_platform=true)
+  def search_for_dependency(dependency, matching_platform = true, type: nil)
     found = {}
 
     rejected_specs = {}
 
-    list, errors = available_specs(dependency.identity)
+    specs_type = type || dependency.identity
+    list, errors = available_specs(specs_type)
 
     list.each do |source, specs|
       if dependency.name.is_a?(String) && specs.respond_to?(:bsearch)
@@ -97,17 +101,20 @@ class Gem::SpecFetcher
         specs = specs[start_index...end_index] if start_index && end_index
       end
 
+      specs = specs.select {|tup| dependency.match?(tup) }
+      specs = decode_source_content_addressable_tuples(source, specs, latest: specs_type == :latest)
+
       found[source] = specs.select do |tup|
-        if dependency.match?(tup)
-          if matching_platform && !Gem::Platform.match_gem?(tup.platform, tup.name)
-            pm = (
-              rejected_specs[dependency] ||= \
-                Gem::PlatformMismatch.new(tup.name, tup.version))
-            pm.add_platform tup.platform
-            false
-          else
-            true
-          end
+        if matching_platform && !Gem::Platform.match_gem?(tup.platform, tup.name)
+          pm = (
+            rejected_specs[dependency] ||= \
+              Gem::PlatformMismatch.new(tup.name, tup.version))
+          pm.add_platform tup.platform
+          false
+        elsif matching_platform && !ruby_abi_match?(tup)
+          false
+        else
+          true
         end
       end
     end
@@ -130,7 +137,7 @@ class Gem::SpecFetcher
   ##
   # Return all gem name tuples who's names match +obj+
 
-  def detect(type=:complete)
+  def detect(type = :complete)
     tuples = []
 
     list, _ = available_specs(type)
@@ -150,12 +157,13 @@ class Gem::SpecFetcher
   #
   # If +matching_platform+ is false, gems for all platforms are returned.
 
-  def spec_for_dependency(dependency, matching_platform=true)
+  def spec_for_dependency(dependency, matching_platform = true)
     tuples, errors = search_for_dependency(dependency, matching_platform)
 
     specs = []
     tuples.each do |tup, source|
       spec = source.fetch_spec(tup)
+      spec.content_address = tup.content_address if tup.content_address
     rescue Gem::RemoteFetcher::FetchError => e
       errors << Gem::SourceFetchProblem.new(source, e)
     else
@@ -163,6 +171,17 @@ class Gem::SpecFetcher
     end
 
     [specs, errors]
+  end
+
+  ##
+  # Decodes the content-addressable tuples in +spec_tuples+ ([tuple, source]
+  # pairs) to carry their real platform and Ruby ABI via each source.
+
+  def decode_content_addressable_tuples(spec_tuples, latest: false)
+    spec_tuples.group_by {|_, source| source }.flat_map do |source, source_tuples|
+      tuples = source_tuples.map(&:first)
+      decode_source_content_addressable_tuples(source, tuples, latest: latest).map {|tuple| [tuple, source] }
+    end
   end
 
   ##
@@ -182,19 +201,30 @@ class Gem::SpecFetcher
     min_length = gem_name.length - max
     max_length = gem_name.length + max
 
+    gem_name_with_postfix = "#{gem_name}ruby"
+    gem_name_with_prefix = "ruby#{gem_name}"
+
     matches = names.filter_map do |n|
       len = n.name.length
-      # If the length is min_length or shorter, we've done `max` deletions.
-      # If the length is max_length or longer, we've done `max` insertions.
-      # These would both be rejected later, so we skip early for performance.
-      next if len <= min_length || len >= max_length
-
       # If the gem doesn't support the current platform, bail early.
       next unless n.match_platform?
+
+      # If the length is min_length or shorter, we've done `max` deletions.
+      # This would be rejected later, so we skip it for performance.
+      next if len <= min_length
 
       # The candidate name, normalized the same as gem_name.
       normalized_name = n.name.downcase
       normalized_name.tr!("_-", "")
+
+      # If the gem is "{NAME}-ruby" and "ruby-{NAME}", we want to return it.
+      # But we already removed hyphens, so we check "{NAME}ruby" and "ruby{NAME}".
+      next [n.name, 0] if normalized_name == gem_name_with_postfix
+      next [n.name, 0] if normalized_name == gem_name_with_prefix
+
+      # If the length is max_length or longer, we've done `max` insertions.
+      # This would be rejected later, so we skip it for performance.
+      next if len >= max_length
 
       # If we found an exact match (after stripping underscores and hyphens),
       # that's our most likely candidate.
@@ -269,11 +299,27 @@ class Gem::SpecFetcher
   # Retrieves NameTuples from +source+ of the given +type+ (:prerelease,
   # etc.).  If +gracefully_ignore+ is true, errors are ignored.
 
-  def tuples_for(source, type, gracefully_ignore=false) # :nodoc:
+  def tuples_for(source, type, gracefully_ignore = false) # :nodoc:
     @caches[type][source.uri] ||=
       source.load_specs(type).sort_by(&:name)
   rescue Gem::RemoteFetcher::FetchError
     raise unless gracefully_ignore
     []
+  end
+
+  private
+
+  def decode_source_content_addressable_tuples(source, tuples, latest: false) # :nodoc:
+    return tuples unless source.respond_to?(:decode_content_addressable_tuples)
+
+    source.decode_content_addressable_tuples(tuples, latest: latest)
+  end
+
+  def ruby_abi_match?(tuple) # :nodoc:
+    !tuple.ruby_abi || tuple.ruby_abi == current_ruby_abi
+  end
+
+  def current_ruby_abi # :nodoc:
+    @current_ruby_abi ||= Gem.ruby_abi
   end
 end

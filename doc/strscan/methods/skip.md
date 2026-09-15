@@ -1,6 +1,3 @@
-call-seq:
-  skip(pattern) match_size or nil
-
 Attempts to [match][17] the given `pattern`
 at the beginning of the [target substring][3];
 
@@ -11,7 +8,7 @@ If the match succeeds:
 - Sets [match values][9].
 - Returns the size (bytes) of the matched substring.
 
-```
+```rb
 scanner = StringScanner.new(HIRAGANA_TEXT)
 scanner.string                  # => "こんにちは"
 scanner.pos = 6

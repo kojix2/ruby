@@ -34,15 +34,6 @@ class Gem::BasicSpecification
     internal_init
   end
 
-  def self.default_specifications_dir
-    Gem.default_specifications_dir
-  end
-
-  class << self
-    extend Gem::Deprecate
-    rubygems_deprecate :default_specifications_dir, "Gem.default_specifications_dir"
-  end
-
   ##
   # The path to the gem.build_complete file within the extension install
   # directory.
@@ -149,16 +140,28 @@ class Gem::BasicSpecification
   end
 
   ##
-  # Returns the full name (name-version) of this Gem.  Platform information
-  # is included (name-version-platform) if it is specified and not the
+  # Returns the full name (name-version) of this Gem.
+  # Content address is included (name-version-content_address) if the gem
+  # is content-addressed (eligible and has a valid content address).
+  # Platform information is included (name-version-platform) if it is specified and not the
   # default Ruby platform.
 
   def full_name
-    if platform == Gem::Platform::RUBY || platform.nil?
+    if Gem::ContentAddress.content_addressed?(self)
+      "#{name}-#{version}-#{content_address}"
+    elsif platform == Gem::Platform::RUBY || platform.nil?
       "#{name}-#{version}"
     else
       "#{name}-#{version}-#{platform}"
     end
+  end
+
+  ##
+  # The content address of this gem, or +nil+ when it is not
+  # content-addressable.
+
+  def content_address
+    nil
   end
 
   ##
@@ -189,14 +192,6 @@ class Gem::BasicSpecification
 
         full_paths
       end
-  end
-
-  ##
-  # The path to the data directory for this gem.
-
-  def datadir
-    # TODO: drop the extra ", gem_name" which is uselessly redundant
-    File.expand_path(File.join(gems_dir, full_name, "data", name))
   end
 
   ##
@@ -256,6 +251,13 @@ class Gem::BasicSpecification
     raise NotImplementedError
   end
 
+  def installable_on_platform?(target_platform) # :nodoc:
+    return true if [Gem::Platform::RUBY, nil, target_platform].include?(platform)
+    return true if Gem::Platform.new(platform) === target_platform
+
+    false
+  end
+
   def raw_require_paths # :nodoc:
     raise NotImplementedError
   end
@@ -305,9 +307,7 @@ class Gem::BasicSpecification
   # Return all files in this gem that match for +glob+.
 
   def matches_for_glob(glob) # TODO: rename?
-    glob = File.join(lib_dirs_glob, glob)
-
-    Dir[glob]
+    Gem::Util.glob_files_in_dir(File.join(lib_dirs, glob), full_gem_path)
   end
 
   ##
@@ -322,17 +322,7 @@ class Gem::BasicSpecification
   # for this spec.
 
   def lib_dirs_glob
-    dirs = if raw_require_paths
-      if raw_require_paths.size > 1
-        "{#{raw_require_paths.join(",")}}"
-      else
-        raw_require_paths.first
-      end
-    else
-      "lib" # default value for require_paths for bundler/inline
-    end
-
-    "#{full_gem_path}/#{dirs}"
+    "#{full_gem_path}/#{lib_dirs}"
   end
 
   ##
@@ -362,6 +352,22 @@ class Gem::BasicSpecification
   end
 
   private
+
+  ##
+  # Returns the require_paths of this gem as a string usable in Dir.glob,
+  # relative to full_gem_path.
+
+  def lib_dirs
+    if raw_require_paths
+      if raw_require_paths.size > 1
+        "{#{raw_require_paths.join(",")}}"
+      else
+        raw_require_paths.first
+      end
+    else
+      "lib" # default value for require_paths for bundler/inline
+    end
+  end
 
   def have_extensions?
     !extensions.empty?

@@ -34,7 +34,6 @@ class TestFiber < Test::Unit::TestCase
   end
 
   def test_many_fibers
-    omit 'This is unstable on GitHub Actions --jit-wait. TODO: debug it' if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
     max = 1000
     assert_equal(max, max.times{
       Fiber.new{}
@@ -50,7 +49,7 @@ class TestFiber < Test::Unit::TestCase
   end
 
   def test_many_fibers_with_threads
-    assert_normal_exit <<-SRC, timeout: (/solaris/i =~ RUBY_PLATFORM ? 1000 : 60)
+    assert_normal_exit <<-SRC, timeout: 60
       max = 1000
       @cnt = 0
       (1..100).map{|ti|
@@ -250,6 +249,18 @@ class TestFiber < Test::Unit::TestCase
     assert_equal(1,   Thread.current[:v]); }
     assert_equal(nil, Thread.current[:v]); fb.resume
     assert_equal(nil, Thread.current[:v]);
+  end
+
+  def test_fiber_variables
+    assert_equal "bar", Fiber.new {Fiber[:foo] = "bar"; Fiber[:foo]}.resume
+
+    key = :"#{self.class.name}#.#{self.object_id}"
+    Fiber[key] = 42
+    assert_equal 42, Fiber[key]
+
+    key = Object.new
+    def key.to_str; "foo"; end
+    assert_equal "Bar", Fiber.new {Fiber[key] = "Bar"; Fiber[key]}.resume
   end
 
   def test_alive
@@ -486,13 +497,88 @@ class TestFiber < Test::Unit::TestCase
     assert_equal :ok, ret, '[Bug #14642]'
   end
 
+  def test_gc_during_nested_resume_yield
+    assert_normal_exit <<-'RUBY', '[Bug #22196]', timeout: 10
+      parent = child1 = child2 = nil
+
+      parent = Fiber.new do
+        child1 = Fiber.new do
+          parent.resume
+        end
+
+        child2 = Fiber.new do
+          GC.start
+          parent.resume
+        end
+
+        Fiber.yield
+
+        child1 = nil
+
+        Fiber.yield
+      end
+
+      parent.resume
+
+      child = child1
+      child1 = nil
+      child.resume
+      child = nil
+
+      child = child2
+      child2 = nil
+      child.resume
+    RUBY
+  end
+
   def test_machine_stack_gc
-    assert_normal_exit <<-RUBY, '[Bug #14561]', timeout: 10
+    assert_normal_exit <<-RUBY, '[Bug #14561]', timeout: 60
       enum = Enumerator.new { |y| y << 1 }
       thread = Thread.new { enum.peek }
       thread.join
       sleep 5     # pause until thread cache wait time runs out. Native thread exits.
       GC.start
+    RUBY
+  end
+
+  def test_fiber_pool_stack_acquire_failure
+    environment = {
+      "RUBY_SHARED_FIBER_POOL_MINIMUM_COUNT" => "0",
+      "RUBY_SHARED_FIBER_POOL_MAXIMUM_COUNT" => "128"
+    }
+
+    # This program requires, effectively, at most one fiber stack, since the fiber immediately becomes unreachable.
+    assert_separately([environment], <<~RUBY, timeout: 30)
+      GC.disable
+      count_before = GC.count
+
+      # Create more fibers than the pool can handle (but they become immediately unreachable):
+      assert_nothing_raised do
+        256.times do
+          Fiber.new{Fiber.yield}.resume
+        end
+      end
+
+      # Major GC should have happened at least once:
+      assert_operator(GC.count, :>, count_before)
+    RUBY
+  end
+
+  def test_fiber_pool_stack_acquire_failure_at_maximum_count
+    environment = {
+      "RUBY_SHARED_FIBER_POOL_MAXIMUM_COUNT" => "128"
+    }
+
+    assert_separately([environment], <<~RUBY, timeout: 30)
+      GC.disable
+      fibers = []
+      assert_raise(FiberError) do
+        loop do
+          Fiber.new{fibers << Fiber.current; Fiber.yield}.resume
+          raise "expected FiberError before this" if fibers.size > 128
+        end
+      end
+      assert_operator fibers.size, :>=, 128
     RUBY
   end
 end
